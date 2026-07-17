@@ -8,7 +8,7 @@ makedocs(;
     authors="Xuanzhao Gao <xgao@flatironinstitute.org> and contributors",
     sitename="BoxDMK.jl",
     format=Documenter.HTML(;
-        canonical="https://ArrogantGao.github.io/BoxDMK.jl",
+        canonical="https://xuanzhaogao.github.io/BoxDMK.jl",
         edit_link="main",
         assets=String[],
     ),
@@ -18,6 +18,6 @@ makedocs(;
 )
 
 deploydocs(;
-    repo="github.com/ArrogantGao/BoxDMK.jl",
+    repo="github.com/xuanzhaogao/BoxDMK.jl",
     devbranch="main",
 )

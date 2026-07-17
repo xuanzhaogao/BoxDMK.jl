@@ -1,9 +1,9 @@
 # BoxDMK.jl
 
-[![Stable](https://img.shields.io/badge/docs-stable-blue.svg)](https://ArrogantGao.github.io/BoxDMK.jl/stable/)
-[![Dev](https://img.shields.io/badge/docs-dev-blue.svg)](https://ArrogantGao.github.io/BoxDMK.jl/dev/)
-[![Build Status](https://github.com/ArrogantGao/BoxDMK.jl/actions/workflows/CI.yml/badge.svg?branch=main)](https://github.com/ArrogantGao/BoxDMK.jl/actions/workflows/CI.yml?query=branch%3Amain)
-[![Coverage](https://codecov.io/gh/ArrogantGao/BoxDMK.jl/branch/main/graph/badge.svg)](https://codecov.io/gh/ArrogantGao/BoxDMK.jl)
+[![Stable](https://img.shields.io/badge/docs-stable-blue.svg)](https://xuanzhaogao.github.io/BoxDMK.jl/stable/)
+[![Dev](https://img.shields.io/badge/docs-dev-blue.svg)](https://xuanzhaogao.github.io/BoxDMK.jl/dev/)
+[![Build Status](https://github.com/xuanzhaogao/BoxDMK.jl/actions/workflows/CI.yml/badge.svg?branch=main)](https://github.com/xuanzhaogao/BoxDMK.jl/actions/workflows/CI.yml?query=branch%3Amain)
+[![Coverage](https://codecov.io/gh/xuanzhaogao/BoxDMK.jl/branch/main/graph/badge.svg)](https://codecov.io/gh/xuanzhaogao/BoxDMK.jl)
 
 `BoxDMK.jl` evaluates volume potentials on adaptive box trees in 3D based on the `boxdmk` code by Shidong.
 
@@ -40,7 +40,7 @@ The direct Fortran entrypoints remain available for advanced use:
 
 ```julia
 using Pkg
-Pkg.add(url = "https://github.com/ArrogantGao/BoxDMK.jl")
+Pkg.add(url = "https://github.com/xuanzhaogao/BoxDMK.jl")
 ```
 
 Requires Julia `1.10+`.
