@@ -36,6 +36,9 @@ This is a Julia translation of the Fortran BoxDMK library (`/mnt/home/xgao1/code
 tree, fvals = build_tree(f, kernel, basis; ndim=3, norder=6, eps=1e-6, boxlen=1.0, nd=1)
 result = bdmk(tree, fvals, kernel; eps=1e-6, grad=false, hess=false, targets=nothing)
 # result.pot, result.grad, result.hess, result.target_pot
+
+field = PotentialField(tree, result)   # callable handle: field(x) evaluates anywhere
+# evaluate_potential / evaluate_gradient / evaluate_hessian (src/solver/field.jl)
 ```
 
 ### Type Dispatch

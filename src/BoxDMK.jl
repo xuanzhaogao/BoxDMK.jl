@@ -33,6 +33,7 @@ include("solver/planewave.jl")
 include("solver/boxfgt.jl")
 include("solver/local.jl")
 include("solver/solver.jl")
+include("solver/field.jl")
 
 # Fortran integration
 include("fortran/fortran_hotpaths.jl")
@@ -42,6 +43,7 @@ include("fortran/fortran_debug_wrapper.jl")
 export LaplaceKernel, YukawaKernel, SqrtLaplaceKernel
 export LegendreBasis, ChebyshevBasis
 export build_tree, build_interaction_lists, bdmk
+export PotentialField, evaluate_potential, evaluate_gradient, evaluate_hessian
 export load_sog_nodes
 export taylor_coefficients, taylor_coefficients_grad, taylor_coefficients_hess
 export select_porder, build_proxy_data, density_to_proxy!, proxy_to_potential!

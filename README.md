@@ -154,6 +154,29 @@ result.target_pot
 
 For Julia-facing APIs, the physical domain is `[0, boxlen]^3`.
 
+## Evaluable Field Handle
+
+`PotentialField` attaches the solver output to the tree and gives a callable
+handle that can be evaluated anywhere in the domain (leaf-box lookup by tree
+descent + tensor-product polynomial interpolation):
+
+```julia
+result = bdmk(tree, fvals, LaplaceKernel(); eps = 1e-6, grad = true, hess = true)
+
+field = PotentialField(tree, result)
+
+field([0.3, 0.6, 0.4])          # potential at a point (scalar for nd = 1)
+field(rand(3, 1000))            # potential at many points
+
+evaluate_potential(field, x)    # (nd,) vector / (nd, ntarg) matrix
+evaluate_gradient(field, x)     # (nd, ndim) / (nd, ndim, ntarg); needs grad = true
+evaluate_hessian(field, x)      # (nd, nhess) / (nd, nhess, ntarg); needs hess = true
+```
+
+Points on shared box faces are assigned to one of the adjacent leaves; the
+interpolants there agree to solver accuracy (machine precision for the
+potential, discretization error for derivatives).
+
 The raw Fortran reference uses a box centered at the origin. The wrappers handle that coordinate shift internally for `build_tree_fortran(...)` and `bdmk_fortran(...)`.
 
 ## Kernels And Bases
