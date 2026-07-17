@@ -968,6 +968,8 @@ function build_tree(
     f_batch = nothing,
 )
     _ = dpars
+    f === nothing && f_batch === nothing &&
+        throw(ArgumentError("provide a source function f, a batch function f_batch, or both"))
     ndim_int = Int(ndim)
     ndim_int > 0 || throw(ArgumentError("ndim must be positive"))
     nd_int = Int(nd)
@@ -1017,4 +1019,10 @@ function build_tree(
 
     # Materialize into BoxTree + fvals
     return _ftstate_to_boxtree(state, basis, norder_int, boxlen_value)
+end
+
+# Batch-only construction: f is unused when f_batch is provided, so it can
+# be omitted entirely.
+function build_tree(kernel::AbstractKernel, basis::AbstractBasis; kwargs...)
+    return build_tree(nothing, kernel, basis; kwargs...)
 end

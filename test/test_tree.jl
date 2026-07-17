@@ -183,3 +183,37 @@ end
     @test size(fvals) == (1, 16^3, 1129)
     @test all(0.0 .<= tree.centers .<= 1.18)
 end
+
+@testset "Batch-Only Tree Construction" begin
+    kernel = LaplaceKernel()
+    basis = LegendreBasis()
+
+    f_point(x) = [exp(-40 * sum((x .- 0.5) .^ 2))]
+
+    function f_batch!(values::AbstractMatrix, points::AbstractMatrix)
+        @inbounds for i in axes(points, 2)
+            r2 = (points[1, i] - 0.5)^2 + (points[2, i] - 0.5)^2 + (points[3, i] - 0.5)^2
+            values[1, i] = exp(-40 * r2)
+        end
+    end
+
+    kwargs = (ndim = 3, norder = 4, eps = 1e-3, boxlen = 1.0, nd = 1)
+
+    tree_ref, fvals_ref = build_tree(f_point, kernel, basis; kwargs...)
+
+    # f = nothing with a batch function
+    tree_nof, fvals_nof = build_tree(nothing, kernel, basis; f_batch = f_batch!, kwargs...)
+    @test tree_nof.level == tree_ref.level
+    @test tree_nof.centers == tree_ref.centers
+    @test fvals_nof == fvals_ref
+
+    # keyword-only method
+    tree_kw, fvals_kw = build_tree(kernel, basis; f_batch = f_batch!, kwargs...)
+    @test tree_kw.level == tree_ref.level
+    @test tree_kw.centers == tree_ref.centers
+    @test fvals_kw == fvals_ref
+
+    # neither f nor f_batch is an error
+    @test_throws ArgumentError build_tree(nothing, kernel, basis; kwargs...)
+    @test_throws ArgumentError build_tree(kernel, basis; kwargs...)
+end

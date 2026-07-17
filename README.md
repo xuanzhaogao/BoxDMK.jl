@@ -128,11 +128,14 @@ function my_f_batch!(values::AbstractMatrix, points::AbstractMatrix)
 end
 
 tree, fvals = build_tree(
-    f, LaplaceKernel(), LegendreBasis();
+    LaplaceKernel(), LegendreBasis();
     ndim=3, norder=16, eps=1e-6, boxlen=1.0, nd=1,
     f_batch = my_f_batch!,
 )
 ```
+
+When `f_batch` is provided, the point-by-point `f` is never called and can be
+omitted (as above) or passed as `nothing`.
 
 With these practices, Julia tree construction runs within **1.1x** of a pure Fortran tree builder with a native Fortran callback.
 
