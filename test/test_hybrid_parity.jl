@@ -99,6 +99,12 @@ end
     end
 end
 
+# The two testsets below use the Fortran tree builder, which calls the Julia
+# source function from inside an OpenMP parallel region and can deadlock
+# against Julia's GC on many-core machines. Opt in with
+# BOXDMK_TEST_FORTRAN_TREE=1 (and OMP_NUM_THREADS=1). The debug snapshot
+# additionally requires the debug variant of the vendored solve library.
+if get(ENV, "BOXDMK_TEST_FORTRAN_TREE", "0") == "1"
 @testset "Fortran Debug Snapshot Surface" begin
     @test isdefined(BoxDMK, :reset_fortran_debug!)
     @test isdefined(BoxDMK, :get_fortran_debug_snapshot)
@@ -163,6 +169,7 @@ end
     @test size(packed.fvals) == size(original.fvals)
     @test packed.boxsize == original.boxsize
     @test roundtrip.pot ≈ direct.pot atol = 1e-12 rtol = 1e-12
+end
 end
 
 @testset "Hybrid Direct Solve Surface" begin

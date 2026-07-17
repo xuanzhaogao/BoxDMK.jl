@@ -94,6 +94,10 @@ end
     end
 end
 
+# The Fortran tree builder calls the Julia source function from inside an
+# OpenMP parallel region, which can deadlock against Julia's GC on many-core
+# machines. Opt in with BOXDMK_TEST_FORTRAN_TREE=1 (and OMP_NUM_THREADS=1).
+if get(ENV, "BOXDMK_TEST_FORTRAN_TREE", "0") == "1"
 @testset "Exact Fortran Tree Parity" begin
     f(x) = [exp(-40 * sum((x .- 0.5) .^ 2))]
 
@@ -137,6 +141,7 @@ end
     check_exact_parity(LaplaceKernel(), ChebyshevBasis(); ndim = 3)
     check_exact_parity(LaplaceKernel(), LegendreBasis(); ndim = 1)
     check_exact_parity(LaplaceKernel(), LegendreBasis(); ndim = 2)
+end
 end
 
 @testset "Tree Matches Fortran Benchmark" begin

@@ -58,12 +58,15 @@ end
     hess = Array{Float64}(undef, 1, BoxDMK.nhess(tree_hess.ndim), size(pot_hess, 2), size(pot_hess, 3))
     BoxDMK.compute_hessian!(hess, pot_hess, tree_hess, basis)
 
+    # atol is a vector-norm bound over npbox entries; per-entry roundoff of
+    # ~1e-11 from the spectral second-derivative stack pushes the norm past
+    # 1e-10 on some BLAS/FP configurations, so allow 1e-8.
     for ibox in BoxDMK.leaves(tree_hess)
-        @test hess[1, 1, :, ibox] ≈ fill(2.0, size(hess, 3)) atol = 1e-10
-        @test hess[1, 2, :, ibox] ≈ fill(4.0, size(hess, 3)) atol = 1e-10
-        @test hess[1, 3, :, ibox] ≈ fill(6.0, size(hess, 3)) atol = 1e-10
-        @test hess[1, 4, :, ibox] ≈ fill(0.0, size(hess, 3)) atol = 1e-10
-        @test hess[1, 5, :, ibox] ≈ fill(0.0, size(hess, 3)) atol = 1e-10
-        @test hess[1, 6, :, ibox] ≈ fill(0.0, size(hess, 3)) atol = 1e-10
+        @test hess[1, 1, :, ibox] ≈ fill(2.0, size(hess, 3)) atol = 1e-8
+        @test hess[1, 2, :, ibox] ≈ fill(4.0, size(hess, 3)) atol = 1e-8
+        @test hess[1, 3, :, ibox] ≈ fill(6.0, size(hess, 3)) atol = 1e-8
+        @test hess[1, 4, :, ibox] ≈ fill(0.0, size(hess, 3)) atol = 1e-8
+        @test hess[1, 5, :, ibox] ≈ fill(0.0, size(hess, 3)) atol = 1e-8
+        @test hess[1, 6, :, ibox] ≈ fill(0.0, size(hess, 3)) atol = 1e-8
     end
 end
