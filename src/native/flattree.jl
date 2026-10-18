@@ -1,0 +1,150 @@
+# Level-ordered flat tree plus the box-DMK interaction lists
+# (Fortran `bdmk_find_all_pwexp_boxes`, `bdmk_compute_all_listpw`,
+# `bdmk_compute_all_modified_list1`).
+
+struct FlatTree
+    nboxes::Int
+    nlevels::Int
+    laddr::Matrix{Int}          # (2, nlevels+1): first/last box of each level
+    level::Vector{Int}
+    parent::Vector{Int}         # 0 for the root
+    nchild::Vector{Int}
+    child::Matrix{Int}          # (8, nboxes), slot = 1 + sx + 2sy + 4sz; 0 = none
+    ncoll::Vector{Int}
+    coll::Matrix{Int}           # (27, nboxes)
+    centers::Matrix{Float64}    # (3, nboxes)
+    boxsize::Vector{Float64}    # boxsize[ilev+1]
+    perm::Vector{Int}           # flat box -> BoxTree box
+end
+
+levelboxes(ft::FlatTree, ilev::Int) = ft.laddr[1, ilev + 1]:ft.laddr[2, ilev + 1]
+isleafbox(ft::FlatTree, ibox::Int) = ft.nchild[ibox] == 0
+
+function FlatTree(tree::BoxTree)
+    tree.ndim == 3 || throw(ArgumentError("the native solver supports ndim = 3 only"))
+    nb = nboxes(tree)
+    nl = tree.nlevels
+    perm = sortperm(collect(1:nb); by = ibox -> (tree.level[ibox], ibox))
+    inv = zeros(Int, nb)
+    for (new, old) in pairs(perm)
+        inv[old] = new
+    end
+
+    laddr = zeros(Int, 2, nl + 1)
+    level = tree.level[perm]
+    for ilev in 0:nl
+        r = searchsorted(level, ilev)
+        laddr[1, ilev + 1] = first(r)
+        laddr[2, ilev + 1] = last(r)
+    end
+
+    centers = Matrix{Float64}(tree.centers[:, perm])
+    parent = zeros(Int, nb)
+    nchild = zeros(Int, nb)
+    child = zeros(Int, 8, nb)
+    ncoll = zeros(Int, nb)
+    coll = zeros(Int, 27, nb)
+    for new in 1:nb
+        old = perm[new]
+        p = tree.parent[old]
+        parent[new] = p == 0 ? 0 : inv[p]
+        for c in @view tree.children[:, old]
+            c == 0 && continue
+            cn = inv[c]
+            slot = 1
+            centers[1, cn] > centers[1, new] && (slot += 1)
+            centers[2, cn] > centers[2, new] && (slot += 2)
+            centers[3, cn] > centers[3, new] && (slot += 4)
+            child[slot, new] = cn
+            nchild[new] += 1
+        end
+        cl = tree.colleagues[old]
+        ncoll[new] = length(cl)
+        for (j, c) in enumerate(cl)
+            coll[j, new] = inv[c]
+        end
+    end
+    boxsize = Float64.(tree.boxsize)
+    return FlatTree(nb, nl, laddr, level, parent, nchild, child, ncoll, coll, centers, boxsize, perm)
+end
+
+# Boxes that need plane-wave expansions: the root, every nonleaf box, and
+# every leaf with a nonleaf colleague.
+function find_pwexp_boxes(ft::FlatTree)
+    ifpwexp = falses(ft.nboxes)
+    ifpwexp[1] = true
+    for ilev in 1:ft.nlevels, ibox in levelboxes(ft, ilev)
+        if ft.nchild[ibox] == 0
+            for j in 1:ft.ncoll[ibox]
+                if ft.nchild[ft.coll[j, ibox]] > 0
+                    ifpwexp[ibox] = true
+                    break
+                end
+            end
+        else
+            ifpwexp[ibox] = true
+        end
+    end
+    return ifpwexp
+end
+
+# Plane-wave interaction list: colleagues other than the box itself, unless
+# both boxes are leaves.
+function compute_listpw(ft::FlatTree)
+    nlistpw = zeros(Int, ft.nboxes)
+    listpw = zeros(Int, 27, ft.nboxes)
+    for ibox in 1:ft.nboxes, i in 1:ft.ncoll[ibox]
+        jbox = ft.coll[i, ibox]
+        if jbox != ibox && (ft.nchild[jbox] > 0 || ft.nchild[ibox] > 0)
+            nlistpw[ibox] += 1
+            listpw[nlistpw[ibox], ibox] = jbox
+        end
+    end
+    return nlistpw, listpw
+end
+
+# Modified list 1 (near field) of each leaf, in CSR form.
+function compute_list1(ft::FlatTree)
+    nb = ft.nboxes
+    lists = [Int[] for _ in 1:nb]
+    if ft.nchild[1] == 0
+        push!(lists[1], 1)
+    else
+        for ilev in 0:ft.nlevels, ibox in levelboxes(ft, ilev)
+            ft.nchild[ibox] == 0 || continue
+            list = lists[ibox]
+            for i in 1:ft.ncoll[ibox]
+                jbox = ft.coll[i, ibox]
+                if ft.nchild[jbox] == 0
+                    push!(list, jbox)
+                else
+                    distest = 1.05 * (ft.boxsize[ilev + 1] + ft.boxsize[ilev + 2]) / 2
+                    for j in 1:8
+                        kbox = ft.child[j, jbox]
+                        (kbox > 0 && ft.nchild[kbox] == 0) || continue
+                        _within(ft, kbox, ibox, distest) && push!(list, kbox)
+                    end
+                end
+            end
+            dad = ft.parent[ibox]
+            for i in 1:ft.ncoll[dad]
+                jbox = ft.coll[i, dad]
+                ft.nchild[jbox] == 0 || continue
+                distest = 1.05 * (ft.boxsize[ilev + 1] + ft.boxsize[ilev]) / 2
+                _within(ft, jbox, ibox, distest) && push!(list, jbox)
+            end
+        end
+    end
+    ptr = ones(Int, nb + 1)
+    for ibox in 1:nb
+        ptr[ibox + 1] = ptr[ibox] + length(lists[ibox])
+    end
+    return ptr, reduce(vcat, lists; init = Int[])
+end
+
+@inline function _within(ft::FlatTree, a::Int, b::Int, distest::Float64)
+    for k in 1:3
+        abs(ft.centers[k, a] - ft.centers[k, b]) >= distest && return false
+    end
+    return true
+end
