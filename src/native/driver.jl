@@ -347,46 +347,155 @@ end
 @inline _loctab_slot(t::Float64, c::Float64, bs::Float64) = round(Int, (t - c) / bs) + NLOCTAB + 1
 
 function step7_local!(pot, grad, hess, s::DMKSetup, fv)
-    ft, n, nd, ifpgh = s.ft, s.n, s.nd, s.ifpgh
-    nde = length(s.deltas)
-    wss = [LocalWork(n) for _ in 1:_nthreads()]
-    parallel_foreach(leafboxes(ft), wss) do ibox, lw
-        ilev = ft.level[ibox]
-        iend = nde - s.idelta[ilev + 1]
-        tabsl = s.loctabs[ilev + 1]
-        for jj in s.list1_ptr[ibox]:(s.list1_ptr[ibox + 1] - 1)
-            jbox = s.list1[jj]
-            jlev = ft.level[jbox]
-            bs = ft.boxsize[jlev + 1] / 4
-            sx = _loctab_slot(ft.centers[1, ibox], ft.centers[1, jbox], bs)
-            sy = _loctab_slot(ft.centers[2, ibox], ft.centers[2, jbox], bs)
-            sz = _loctab_slot(ft.centers[3, ibox], ft.centers[3, jbox], bs)
-            jstart = if s.ifpwexp[jbox] && jbox == ibox
-                ipwstart(s, jlev + 1)
-            elseif jlev < ilev
-                ipwstart(s, ilev)
-            else
-                ipwstart(s, jlev)
-            end
-            for id in jstart:iend
-                T = tabsl[id]::LocTab1D
-                wd = s.wdeltas[id]
-                inds = (view(T.ind, :, :, sx), view(T.ind, :, :, sy), view(T.ind, :, :, sz))
-                for ind in 1:nd
-                    f = view(fv, :, :, :, ind, jbox)
-                    if ifpgh == 1
-                        tabs = (view(T.tab, :, :, sx), view(T.tab, :, :, sy), view(T.tab, :, :, sz))
-                        tabsT = (view(T.tabT, :, :, sx), view(T.tabT, :, :, sy), view(T.tabT, :, :, sz))
-                        local_pot!(view(pot, :, :, :, ind, ibox), f, wd, tabs, tabsT, inds, n, lw)
-                    else
-                        tabs = ntuple(3) do d
-                            A = d == 1 ? T.tab : (d == 2 ? T.tabx : T.tabxx)
-                            (view(A, :, :, sx), view(A, :, :, sy), view(A, :, :, sz))
+    ft, n = s.ft, s.n
+    wss = [(LocalWork(n), zeros(n^3), zeros(n^3), zeros(Int, 27), Int[]) for _ in 1:_nthreads()]
+    parallel_foreach(leafboxes(ft), wss) do ibox, ws
+        if s.ifpgh == 1
+            _local_pot_box!(pot, s, fv, ibox, ws)
+        else
+            _local_pgh_box!(pot, grad, hess, s, fv, ibox, ws[1])
+        end
+    end
+    return nothing
+end
+
+@inline _ldelta(s::DMKSetup, ilev::Int) = length(s.deltas) - s.idelta[ilev + 1]
+
+@inline function _local_jstart(s::DMKSetup, ibox::Int, jbox::Int, ilev::Int, jlev::Int)
+    if s.ifpwexp[jbox] && jbox == ibox
+        return ipwstart(s, jlev + 1)
+    elseif jlev < ilev
+        return ipwstart(s, ilev)
+    else
+        return ipwstart(s, jlev)
+    end
+end
+
+@inline _slot_klen(T::LocTab1D, slot::Int, n::Int) = max(0, T.ind[2, n + 1, slot] - T.ind[1, n + 1, slot] + 1)
+
+# Fortran evaluates a (source, Gaussian) pair densely iff every 1D pattern is
+# nonempty and their lengths sum to at least n; otherwise sparsely (or not at all).
+@inline function _pair_mode(T::LocTab1D, sx::Int, sy::Int, sz::Int, n::Int)
+    nx = _slot_klen(T, sx, n); ny = _slot_klen(T, sy, n); nz = _slot_klen(T, sz, n)
+    (nx == 0 || ny == 0 || nz == 0) && return 0
+    return nx + ny + nz >= n ? 2 : 1
+end
+
+# Potential-only near field of one leaf. Same-level dense interactions are
+# evaluated target-centrically: pot += w Σ_dz Tz(Σ_dy Ty(Σ_dx Tx f_s)), which
+# shares the y and z stages among the sources; everything else per pair.
+function _local_pot_box!(pot, s::DMKSetup, fv, ibox::Int, (lw, Abuf, Bbuf, stencil, others))
+    ft, n, nd = s.ft, s.n, s.nd
+    ilev = ft.level[ibox]
+    iend = _ldelta(s, ilev)
+    tabsl = s.loctabs[ilev + 1]
+    bsl = ft.boxsize[ilev + 1]
+    fill!(stencil, 0)
+    empty!(others)
+    for jj in s.list1_ptr[ibox]:(s.list1_ptr[ibox + 1] - 1)
+        jbox = s.list1[jj]
+        if ft.level[jbox] == ilev
+            dx = round(Int, (ft.centers[1, jbox] - ft.centers[1, ibox]) / bsl)
+            dy = round(Int, (ft.centers[2, jbox] - ft.centers[2, ibox]) / bsl)
+            dz = round(Int, (ft.centers[3, jbox] - ft.centers[3, ibox]) / bsl)
+            stencil[1 + (dx + 1) + 3 * (dy + 1) + 9 * (dz + 1)] = jbox
+        else
+            push!(others, jbox)
+        end
+    end
+    selfpw_end = s.ifpwexp[ibox] ? ipwstart(s, ilev + 1) : 0
+    nn = n * n
+    for id in ipwstart(s, ilev):iend
+        T = tabsl[id]::LocTab1D
+        wd = s.wdeltas[id]
+        for ind in 1:nd
+            potb = view(pot, :, :, :, ind, ibox)
+            GC.@preserve potb fv T Abuf Bbuf begin
+                pA = pointer(Abuf); pB = pointer(Bbuf)
+                for kz in 1:3
+                    # slot of the table: source at -d relative offset -> slot 7 - 4d
+                    sz = NLOCTAB + 1 - 4 * (kz - 2)
+                    haveB = false
+                    for ky in 1:3
+                        sy = NLOCTAB + 1 - 4 * (ky - 2)
+                        haveA = false
+                        for kx in 1:3
+                            jbox = stencil[kx + 3 * (ky - 1) + 9 * (kz - 1)]
+                            jbox == 0 && continue
+                            (jbox == ibox && id < selfpw_end) && continue
+                            sx = NLOCTAB + 1 - 4 * (kx - 2)
+                            mode = _pair_mode(T, sx, sy, sz, n)
+                            mode == 0 && continue
+                            if mode == 1
+                                f = view(fv, :, :, :, ind, jbox)
+                                tabs = (view(T.tab, :, :, sx), view(T.tab, :, :, sy), view(T.tab, :, :, sz))
+                                tabsT = (view(T.tabT, :, :, sx), view(T.tabT, :, :, sy), view(T.tabT, :, :, sz))
+                                inds = (view(T.ind, :, :, sx), view(T.ind, :, :, sy), view(T.ind, :, :, sz))
+                                local_pot!(potb, f, wd, tabs, tabsT, inds, n, lw)
+                                continue
+                            end
+                            # stage x: A += Tx' f
+                            gemm!(pA, n, pointer(T.tabT, (sx - 1) * nn + 1), n,
+                                  pointer(fv, 1 + nn * n * ((ind - 1) + nd * (jbox - 1))), n,
+                                  n, nn, n, 1.0, haveA)
+                            haveA = true
                         end
-                        outs = _box_outs(pot, grad, hess, ind, ibox, ifpgh)
-                        local_pgh!(outs, f, wd, tabs, inds, n, ifpgh, lw)
+                        haveA || continue
+                        # stage y: B[:, :, k] += A[:, :, k] * Ty
+                        gemm_batch!(pB, n, nn, pA, n, nn, pointer(T.tab, (sy - 1) * nn + 1), n,
+                                    n, n, n, n, 1.0, haveB)
+                        haveB = true
                     end
+                    haveB || continue
+                    # stage z: pot += w B * Tz
+                    gemm!(pointer(potb), nn, pB, nn, pointer(T.tab, (sz - 1) * nn + 1), n, nn, n, n, wd, true)
                 end
+            end
+        end
+    end
+    # Coarser/finer neighbours and Gaussians not handled above, pair by pair.
+    for jbox in others
+        jlev = ft.level[jbox]
+        bs = ft.boxsize[jlev + 1] / 4
+        sx = _loctab_slot(ft.centers[1, ibox], ft.centers[1, jbox], bs)
+        sy = _loctab_slot(ft.centers[2, ibox], ft.centers[2, jbox], bs)
+        sz = _loctab_slot(ft.centers[3, ibox], ft.centers[3, jbox], bs)
+        for id in _local_jstart(s, ibox, jbox, ilev, jlev):iend
+            T = tabsl[id]::LocTab1D
+            tabs = (view(T.tab, :, :, sx), view(T.tab, :, :, sy), view(T.tab, :, :, sz))
+            tabsT = (view(T.tabT, :, :, sx), view(T.tabT, :, :, sy), view(T.tabT, :, :, sz))
+            inds = (view(T.ind, :, :, sx), view(T.ind, :, :, sy), view(T.ind, :, :, sz))
+            for ind in 1:nd
+                local_pot!(view(pot, :, :, :, ind, ibox), view(fv, :, :, :, ind, jbox), s.wdeltas[id],
+                           tabs, tabsT, inds, n, lw)
+            end
+        end
+    end
+    return nothing
+end
+
+function _local_pgh_box!(pot, grad, hess, s::DMKSetup, fv, ibox::Int, lw::LocalWork)
+    ft, n, nd, ifpgh = s.ft, s.n, s.nd, s.ifpgh
+    ilev = ft.level[ibox]
+    iend = _ldelta(s, ilev)
+    tabsl = s.loctabs[ilev + 1]
+    for jj in s.list1_ptr[ibox]:(s.list1_ptr[ibox + 1] - 1)
+        jbox = s.list1[jj]
+        jlev = ft.level[jbox]
+        bs = ft.boxsize[jlev + 1] / 4
+        sx = _loctab_slot(ft.centers[1, ibox], ft.centers[1, jbox], bs)
+        sy = _loctab_slot(ft.centers[2, ibox], ft.centers[2, jbox], bs)
+        sz = _loctab_slot(ft.centers[3, ibox], ft.centers[3, jbox], bs)
+        for id in _local_jstart(s, ibox, jbox, ilev, jlev):iend
+            T = tabsl[id]::LocTab1D
+            inds = (view(T.ind, :, :, sx), view(T.ind, :, :, sy), view(T.ind, :, :, sz))
+            tabs = ntuple(3) do d
+                A = d == 1 ? T.tab : (d == 2 ? T.tabx : T.tabxx)
+                (view(A, :, :, sx), view(A, :, :, sy), view(A, :, :, sz))
+            end
+            for ind in 1:nd
+                local_pgh!(_box_outs(pot, grad, hess, ind, ibox, ifpgh), view(fv, :, :, :, ind, jbox),
+                           s.wdeltas[id], tabs, inds, n, ifpgh, lw)
             end
         end
     end
@@ -562,7 +671,17 @@ STEPS 2–9 (Fortran `tottimeinfo` order) plus target evaluation.
 function bdmk_native(tree::BoxTree, fvals::AbstractArray{<:Real,3}, kernel::AbstractKernel;
                      eps = 1e-6, grad::Bool = false, hess::Bool = false, targets = nothing,
                      timings::Union{Nothing,Vector{Float64}} = nothing)
-    eps = Float64(eps)
+    old_ftz = get_zero_subnormals()
+    set_zero_subnormals(true)
+    try
+        return _bdmk_native(tree, fvals, kernel, Float64(eps), grad, hess, targets, timings)
+    finally
+        set_zero_subnormals(old_ftz)
+    end
+end
+
+function _bdmk_native(tree::BoxTree, fvals::AbstractArray{<:Real,3}, kernel::AbstractKernel, eps::Float64,
+                      grad::Bool, hess::Bool, targets, timings)
     nd, np = _check_solver_inputs(tree, fvals)
     ifpgh = hess ? 3 : (grad ? 2 : 1)
     tm = timings === nothing ? zeros(10) : timings

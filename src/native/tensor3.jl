@@ -71,8 +71,14 @@ function parallel_foreach(f::F, items, workspaces::Vector) where {F}
     nt = min(length(workspaces), n)
     if nt == 1
         ws = workspaces[1]
-        for i in 1:n
-            f(items[i], ws)
+        old = get_zero_subnormals()
+        set_zero_subnormals(true)
+        try
+            for i in 1:n
+                f(items[i], ws)
+            end
+        finally
+            set_zero_subnormals(old)
         end
         return nothing
     end
@@ -83,11 +89,20 @@ function parallel_foreach(f::F, items, workspaces::Vector) where {F}
     return nothing
 end
 
+# Subnormals are flushed to zero while working: products of the rapidly
+# decaying tables and densities otherwise underflow into slow subnormal
+# arithmetic, at no accuracy benefit.
 function _worker(f::F, items, ws, counter, n) where {F}
-    while true
-        i = Threads.atomic_add!(counter, 1)
-        i > n && break
-        f(items[i], ws)
+    old = get_zero_subnormals()
+    set_zero_subnormals(true)
+    try
+        while true
+            i = Threads.atomic_add!(counter, 1)
+            i > n && break
+            f(items[i], ws)
+        end
+    finally
+        set_zero_subnormals(old)
     end
     return nothing
 end

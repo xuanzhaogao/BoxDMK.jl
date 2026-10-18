@@ -131,3 +131,17 @@ function gemm!(C::StridedMatrix{Float64}, A::StridedMatrix{Float64}, B::StridedM
                              M, N, K, α, add)
     return C
 end
+
+"""
+    gemm_batch!(pC, ldc, sC, pA, lda, sA, pB, ldb, M, N, K, nbatch, α, add)
+
+`nbatch` independent products C_k (+)= α A_k B with C_k = pC + k*sC and
+A_k = pA + k*sA (strides in elements); B is shared.
+"""
+function gemm_batch!(pC::Ptr{Float64}, ldc::Int, sC::Int, pA::Ptr{Float64}, lda::Int, sA::Int,
+                     pB::Ptr{Float64}, ldb::Int, M::Int, N::Int, K::Int, nbatch::Int, α::Float64, add::Bool)
+    for k in 0:(nbatch - 1)
+        gemm!(pC + 8 * k * sC, ldc, pA + 8 * k * sA, lda, pB, ldb, M, N, K, α, add)
+    end
+    return nothing
+end
