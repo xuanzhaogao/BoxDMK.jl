@@ -7,26 +7,54 @@
 # symmetric, so every complex contraction is done on half the frequencies
 # with real GEMMs.
 
+# Conversion tables between plane waves and a tensor-product basis of order m
+# (proxy coefficients, m = porder, or leaf grid values, m = norder).
+struct PWTables
+    m::Int
+    # basis -> outgoing PW (table T = conj(P0))
+    B1::Matrix{Float64}             # (m, npw) = [Re T_h' Im T_h']   (z and y stages)
+    Ax::Matrix{Float64}             # (npw, m) = [Re T_h; Im T_h]    (x stage)
+    # incoming PW -> basis, derivative order d = 0, 1, 2
+    A1::NTuple{3,Matrix{Float64}}   # (m, npw) = [Re P_h' Im P_h']   (x stage)
+    Bv::NTuple{3,Matrix{Float64}}   # (npw, m) = [Re P_h; Im P_h]    (y stage)
+    Bc::NTuple{3,Matrix{Float64}}   # (npw, m) = [2Re P_h; -2Im P_h] (z stage)
+end
+
+# Tables for the proxy basis composed with `fin` (proxy coefficients from an
+# input basis, m×porder ... here porder × m) on the formation side and `fout`
+# (output basis from proxy coefficients, m × porder) on the evaluation side.
+function PWTables(P0::Matrix{ComplexF64}, ts::Vector{Float64}, fin::Matrix{Float64}, fout::Matrix{Float64})
+    npw, porder = size(P0)
+    nh = npw ÷ 2
+    Ps = (P0, [im * ts[j] * P0[j, i] for j in 1:npw, i in 1:porder],
+          [-ts[j]^2 * P0[j, i] for j in 1:npw, i in 1:porder])
+    Th = conj.(P0[1:nh, :]) * fin
+    B1 = Matrix(hcat(transpose(real.(Th)), transpose(imag.(Th))))
+    Ax = vcat(real.(Th), imag.(Th))
+    Ph = ntuple(d -> Ps[d][1:nh, :] * transpose(fout), 3)
+    A1 = ntuple(d -> Matrix(hcat(transpose(real.(Ph[d])), transpose(imag.(Ph[d])))), 3)
+    Bv = ntuple(d -> vcat(real.(Ph[d]), imag.(Ph[d])), 3)
+    Bc = ntuple(d -> vcat(2 .* real.(Ph[d]), -2 .* imag.(Ph[d])), 3)
+    return PWTables(size(fin, 2), B1, Ax, A1, Bv, Bc)
+end
+
 struct PWLevel
     npw::Int
     nh::Int
     nexp::Int
     ts::Vector{Float64}
     ws::Vector{Float64}
-    # proxy coefficients -> outgoing PW (table conj(P0))
-    B1::Matrix{Float64}             # (p, npw) = [Re T_h' Im T_h']   (z and y stages)
-    Ax::Matrix{Float64}             # (npw, p) = [Re T_h; Im T_h]    (x stage)
-    # incoming PW -> proxy coefficients, derivative order d = 0, 1, 2
-    A1::NTuple{3,Matrix{Float64}}   # (p, npw) = [Re P_h' Im P_h']   (x stage)
-    Bv::NTuple{3,Matrix{Float64}}   # (npw, p) = [Re P_h; Im P_h]    (y stage)
-    Bc::NTuple{3,Matrix{Float64}}   # (npw, p) = [2Re P_h; -2Im P_h] (z stage)
+    prox::PWTables                  # proxy coefficients <-> PW
+    leaf::Union{Nothing,PWTables}   # leaf grid values <-> PW (fused with the proxy maps)
     kernelft::Vector{Float64}       # (nexp)
     shift_re::Matrix{Float64}       # (npw, 3): exp(i t_j xmin k), k = -1:1
     shift_im::Matrix{Float64}
 end
 
+# `leafmaps = (den2pc * sc³ᐟ³, poteval)` adds the fused leaf tables.
 function PWLevel(eps::Float64, ilev::Int, porder::Int, bsize::Float64, bs0::Float64,
-                 deltas::AbstractVector{Float64}, wdeltas::AbstractVector{Float64}, prox::Ortho1D)
+                 deltas::AbstractVector{Float64}, wdeltas::AbstractVector{Float64}, prox::Ortho1D,
+                 leafmaps = nothing)
     npw = pw_terms(eps, ilev)
     ts, ws = pw_nodes(eps, ilev, npw, bs0)
     nh = npw ÷ 2
@@ -35,14 +63,9 @@ function PWLevel(eps::Float64, ilev::Int, porder::Int, bsize::Float64, bs0::Floa
     # P0[j, i] = Σ_k exp(i t_j x_k dsq) U[i, k]
     tmp = [cis(ts[j] * prox.x[k] * dsq) for j in 1:npw, k in 1:porder]
     P0 = tmp * transpose(prox.U)
-    Ps = (P0, [im * ts[j] * P0[j, i] for j in 1:npw, i in 1:porder],
-          [-ts[j]^2 * P0[j, i] for j in 1:npw, i in 1:porder])
-    Th = conj.(P0[1:nh, :])
-    B1 = hcat(transpose(real.(Th)), transpose(imag.(Th)))
-    Ax = vcat(real.(Th), imag.(Th))
-    A1 = ntuple(d -> Matrix(hcat(transpose(real.(Ps[d][1:nh, :])), transpose(imag.(Ps[d][1:nh, :])))), 3)
-    Bv = ntuple(d -> vcat(real.(Ps[d][1:nh, :]), imag.(Ps[d][1:nh, :])), 3)
-    Bc = ntuple(d -> vcat(2 .* real.(Ps[d][1:nh, :]), -2 .* imag.(Ps[d][1:nh, :])), 3)
+    eye = Matrix{Float64}(I, porder, porder)
+    ptab = PWTables(P0, ts, eye, eye)
+    ltab = leafmaps === nothing ? nothing : PWTables(P0, ts, leafmaps[1], leafmaps[2])
     kft = zeros(nexp)
     for k in eachindex(deltas)
         delta = deltas[k]
@@ -54,7 +77,7 @@ function PWLevel(eps::Float64, ilev::Int, porder::Int, bsize::Float64, bs0::Floa
         end
     end
     sh = [cis(ts[j] * bsize * k) for j in 1:npw, k in -1:1]
-    return PWLevel(npw, nh, nexp, ts, ws, Matrix(B1), Matrix(Ax), A1, Bv, Bc, kft, real.(sh), imag.(sh))
+    return PWLevel(npw, nh, nexp, ts, ws, ptab, ltab, kft, real.(sh), imag.(sh))
 end
 
 struct PWWork
@@ -86,14 +109,15 @@ end
 # multiplied by the kernel's Fourier transform (kmul).
 #
 # The expansion entry (u, col) is stored at pwr[off0 + (col-1)*cs + u].
-function proxy2pw!(pwr::AbstractVector{Float64}, pwi::AbstractVector{Float64}, q::AbstractVector{Float64},
-                   L::PWLevel, p::Int, w::PWWork, off0::Int = 0, cs::Int = L.npw, kmul::Bool = false)
+function proxy2pw!(pwr::AbstractVector{Float64}, pwi::AbstractVector{Float64}, q::AbstractArray{Float64},
+                   L::PWLevel, tb::PWTables, w::PWWork, off0::Int = 0, cs::Int = L.npw, kmul::Bool = false)
     npw, nh = L.npw, L.nh
+    p = tb.m
     pp = p * p
     ncol = npw * nh
-    GC.@preserve pwr pwi q L w begin
+    GC.@preserve pwr pwi q tb w begin
         pF1 = pointer(w.F1); pU = pointer(w.U); pV = pointer(w.V)
-        pB1 = pointer(L.B1)
+        pB1 = pointer(tb.B1)
         # z: F1[xy, 1:nh] = Re, F1[xy, nh+1:npw] = Im of Σ_z q[xy, z] T[c, z]
         gemm!(pF1, pp, pointer(q), pp, pB1, p, pp, npw, p, 1.0, false)
         # y (per c): [U Ui] = F1r_c * B1, [V Vi] = F1i_c * B1
@@ -117,8 +141,8 @@ function proxy2pw!(pwr::AbstractVector{Float64}, pwi::AbstractVector{Float64}, q
             end
         end
         # x: R = Ax * F2, then assemble both halves in u
-        gemm!(pointer(w.R1), npw, pointer(L.Ax), npw, pointer(F2r), p, npw, ncol, p, 1.0, false)
-        gemm!(pointer(w.R2), npw, pointer(L.Ax), npw, pointer(F2i), p, npw, ncol, p, 1.0, false)
+        gemm!(pointer(w.R1), npw, pointer(tb.Ax), npw, pointer(F2r), p, npw, ncol, p, 1.0, false)
+        gemm!(pointer(w.R2), npw, pointer(tb.Ax), npw, pointer(F2i), p, npw, ncol, p, 1.0, false)
         R1 = w.R1; R2 = w.R2
         kft = L.kernelft
         @inbounds for col in 0:(ncol - 1)
@@ -174,13 +198,14 @@ _ncombos(ifpgh::Int) = ifpgh == 1 ? 1 : (ifpgh == 2 ? 4 : 10)
 
 # outs[m] (porder^3) += 2 Re( Σ P_dx[u,x] P_dy[v,y] P_dz[c,z] pw[u,v,c] ) for combo m.
 function pw2proxy!(outs, pwr::AbstractVector{Float64}, pwi::AbstractVector{Float64},
-                   L::PWLevel, p::Int, ifpgh::Int, w::PWWork, off0::Int = 0, cs::Int = L.npw)
+                   L::PWLevel, tb::PWTables, ifpgh::Int, w::PWWork, off0::Int = 0, cs::Int = L.npw)
     npw, nh = L.npw, L.nh
+    p = tb.m
     pp = p * p
     ncol = npw * nh
     nd1 = ifpgh == 1 ? 1 : (ifpgh == 2 ? 2 : 3)
     nxy = ifpgh == 1 ? 1 : (ifpgh == 2 ? 3 : 6)
-    GC.@preserve outs pwr pwi L w begin
+    GC.@preserve outs pwr pwi tb w begin
         # x: stacked B_r = [S_r; -D_i], B_i = [S_i; D_r] with S/D = pw[u] ± pw[u'] (u ≤ nh)
         Br = w.R1; Bi = w.R2
         @inbounds for col in 0:(ncol - 1)
@@ -196,15 +221,15 @@ function pw2proxy!(outs, pwr::AbstractVector{Float64}, pwi::AbstractVector{Float
             end
         end
         for d in 1:nd1
-            gemm!(pointer(w.G1r[d]), p, pointer(L.A1[d]), p, pointer(Br), npw, p, ncol, npw, 1.0, false)
-            gemm!(pointer(w.G1i[d]), p, pointer(L.A1[d]), p, pointer(Bi), npw, p, ncol, npw, 1.0, false)
+            gemm!(pointer(w.G1r[d]), p, pointer(tb.A1[d]), p, pointer(Br), npw, p, ncol, npw, 1.0, false)
+            gemm!(pointer(w.G1i[d]), p, pointer(tb.A1[d]), p, pointer(Bi), npw, p, ncol, npw, 1.0, false)
         end
         # y (per c): G2[:, c] = [S2_r -D2_i] * Bv, G2[:, nh+c] = [S2_i D2_r] * Bv
         Xr = w.U; Xi = w.V
         for m in 1:nxy
             dx, dy = _PGH_XY[m]
             G1r = w.G1r[dx + 1]; G1i = w.G1i[dx + 1]
-            pBv = pointer(L.Bv[dy + 1])
+            pBv = pointer(tb.Bv[dy + 1])
             pG2 = pointer(w.G2[m])
             for c in 1:nh
                 base = (c - 1) * npw * p
@@ -229,59 +254,109 @@ function pw2proxy!(outs, pwr::AbstractVector{Float64}, pwi::AbstractVector{Float
         for m in 1:_ncombos(ifpgh)
             dz = _PGH_COMBOS[m][3]
             out = outs[m]
-            gemm!(pointer(out), pp, pointer(w.G2[_PGH_XYIDX[m]]), pp, pointer(L.Bc[dz + 1]), npw, pp, p, npw, 1.0, true)
+            gemm!(pointer(out), pp, pointer(w.G2[_PGH_XYIDX[m]]), pp, pointer(tb.Bc[dz + 1]), npw, pp, p, npw, 1.0, true)
         end
     end
     return nothing
 end
 
-# Sources of the plane-wave translation at one level, CSR by target:
-# srck = source column, srcd = 1 + (dx+1) + 3(dy+1) + 9(dz+1) for the
-# offset target - source (self included with offset 0).
+# Sources of the plane-wave translation at one level, CSR by target and
+# sorted by x-offset: k = source column, (kx, ky, kz) = offset index in 1:3
+# of target - source (self included), nkx[:, t] = sources per kx.
 struct M2LList
     ptr::Vector{Int}
     k::Vector{Int}
-    d::Vector{Int}
+    ky::Vector{Int}
+    kz::Vector{Int}
+    nkx::Matrix{Int}
+end
+
+function M2LList(srcs::Vector{Vector{NTuple{4,Int}}})
+    ptr = ones(Int, length(srcs) + 1)
+    k = Int[]; ky = Int[]; kz = Int[]
+    nkx = zeros(Int, 3, length(srcs))
+    for (t, list) in enumerate(srcs)
+        for (ks, dx, dy, dz) in sort(list; by = x -> x[2])
+            push!(k, ks); push!(ky, dy + 2); push!(kz, dz + 2)
+            nkx[dx + 2, t] += 1
+        end
+        ptr[t + 1] = length(k) + 1
+    end
+    return M2LList(ptr, k, ky, kz, nkx)
 end
 
 # loc[:, ind, t, col] = Σ_sources shift(t - s) ⊙ mp[:, ind, s, col] for the
 # frequency columns `cols` (a column is the npw x-frequencies at fixed (v, c));
 # expansions are stored as (npw, nd, nboxes, ncols) so that a column of all
 # boxes is contiguous. Shift factors are grouped by dx:
-# loc = Σ_dx wx_dx ⊙ (Σ_{s: dx} (wy wz)_s mp_s).
-function m2l_columns!(locr, loci, mpr, mpi, lst::M2LList, L::PWLevel, nd::Int, ntarg::Int,
-                      cols::UnitRange{Int}, acc::Vector{Float64})
+# loc = Σ_dx wx_dx ⊙ (Σ_{s: dx} (wy wz)_s mp_s), evaluated in blocks of 8
+# frequencies held in registers. `scr` holds per-source scalars.
+function m2l_columns!(locr::Array{Float64,4}, loci::Array{Float64,4}, mpr::Array{Float64,4}, mpi::Array{Float64,4},
+                      lst::M2LList, L::PWLevel, nd::Int, ntarg::Int, cols::UnitRange{Int}, scr::Vector{Float64})
     npw = L.npw
     Sr, Si = L.shift_re, L.shift_im
-    @inbounds for col in cols
-        v = (col - 1) % npw + 1
-        cz = (col - 1) ÷ npw + 1
-        for t in 1:ntarg, ind in 1:nd
-            fill!(acc, 0.0)
-            for q in lst.ptr[t]:(lst.ptr[t + 1] - 1)
-                ks = lst.k[q]
-                dd = lst.d[q] - 1
-                kx = dd % 3; ky = (dd ÷ 3) % 3 + 1; kz = dd ÷ 9 + 1
-                yr = Sr[v, ky]; yi = Si[v, ky]; zr = Sr[cz, kz]; zi = Si[cz, kz]
-                sr = yr * zr - yi * zi
-                si = yr * zi + yi * zr
-                ab = 2 * npw * kx
-                @simd for u in 1:npw
-                    mr = mpr[u, ind, ks, col]; mi = mpi[u, ind, ks, col]
-                    acc[ab + u] = muladd(sr, mr, muladd(-si, mi, acc[ab + u]))
-                    acc[ab + npw + u] = muladd(sr, mi, muladd(si, mr, acc[ab + npw + u]))
+    cstr = npw * nd * size(mpr, 3)            # column stride
+    bstr = npw * nd                           # box stride
+    GC.@preserve locr loci mpr mpi scr Sr Si begin
+        pmr = pointer(mpr); pmi = pointer(mpi); plr = pointer(locr); pli = pointer(loci)
+        pS = pointer(scr); pSr = pointer(Sr); pSi = pointer(Si)
+        for col in cols
+            v = (col - 1) % npw + 1
+            cz = (col - 1) ÷ npw + 1
+            cbase = (col - 1) * cstr
+            for t in 1:ntarg
+                q0 = lst.ptr[t]
+                nq = lst.ptr[t + 1] - q0
+                @inbounds for i in 0:(nq - 1)
+                    q = q0 + i
+                    ky = lst.ky[q]; kz = lst.kz[q]
+                    yr = Sr[v, ky]; yi = Si[v, ky]; zr = Sr[cz, kz]; zi = Si[cz, kz]
+                    scr[2i + 1] = yr * zr - yi * zi
+                    scr[2i + 2] = yr * zi + yi * zr
                 end
-            end
-            @simd for u in 1:npw
-                lr = 0.0; li = 0.0
-                for kx in 0:2
-                    ar = acc[2 * npw * kx + u]; ai = acc[2 * npw * kx + npw + u]
-                    wr = Sr[u, kx + 1]; wi = Si[u, kx + 1]
-                    lr = muladd(wr, ar, muladd(-wi, ai, lr))
-                    li = muladd(wr, ai, muladd(wi, ar, li))
+                n1 = lst.nkx[1, t]; n2 = lst.nkx[2, t]
+                for ind in 1:nd
+                    ib = cbase + npw * (ind - 1)
+                    u0 = 0
+                    while u0 < npw
+                        # 16 frequencies per pass (two vectors, masked at the end);
+                        # the sr and si products use separate accumulators so that
+                        # no FMA waits on another.
+                        m1 = _rowmask(npw - u0)
+                        m2 = _rowmask(npw - u0 - 8)
+                        lr1 = zero(V8); li1 = zero(V8); lr2 = zero(V8); li2 = zero(V8)
+                        i = 0
+                        for kxg in 0:2
+                            iend = kxg == 0 ? n1 : (kxg == 1 ? n1 + n2 : nq)
+                            a1 = zero(V8); b1 = zero(V8); c1 = zero(V8); d1 = zero(V8)
+                            a2 = zero(V8); b2 = zero(V8); c2 = zero(V8); d2 = zero(V8)
+                            while i < iend
+                                sr = V8(unsafe_load(pS, 2i + 1))
+                                si = V8(unsafe_load(pS, 2i + 2))
+                                o = ib + bstr * (@inbounds(lst.k[q0 + i]) - 1) + u0
+                                mr1 = vload(V8, pmr + 8o, m1); mi1 = vload(V8, pmi + 8o, m1)
+                                mr2 = vload(V8, pmr + 8(o + 8), m2); mi2 = vload(V8, pmi + 8(o + 8), m2)
+                                a1 = muladd(sr, mr1, a1); b1 = muladd(si, mi1, b1)
+                                c1 = muladd(sr, mi1, c1); d1 = muladd(si, mr1, d1)
+                                a2 = muladd(sr, mr2, a2); b2 = muladd(si, mi2, b2)
+                                c2 = muladd(sr, mi2, c2); d2 = muladd(si, mr2, d2)
+                                i += 1
+                            end
+                            ar1 = a1 - b1; ai1 = c1 + d1; ar2 = a2 - b2; ai2 = c2 + d2
+                            pw = 8 * (u0 + kxg * npw)
+                            wr1 = vload(V8, pSr + pw, m1); wi1 = vload(V8, pSi + pw, m1)
+                            wr2 = vload(V8, pSr + pw + 64, m2); wi2 = vload(V8, pSi + pw + 64, m2)
+                            lr1 = muladd(wr1, ar1, muladd(-wi1, ai1, lr1))
+                            li1 = muladd(wr1, ai1, muladd(wi1, ar1, li1))
+                            lr2 = muladd(wr2, ar2, muladd(-wi2, ai2, lr2))
+                            li2 = muladd(wr2, ai2, muladd(wi2, ar2, li2))
+                        end
+                        o = ib + bstr * (t - 1) + u0
+                        vstore(lr1, plr + 8o, m1); vstore(li1, pli + 8o, m1)
+                        vstore(lr2, plr + 8(o + 8), m2); vstore(li2, pli + 8(o + 8), m2)
+                        u0 += 16
+                    end
                 end
-                locr[u, ind, t, col] = lr
-                loci[u, ind, t, col] = li
             end
         end
     end
