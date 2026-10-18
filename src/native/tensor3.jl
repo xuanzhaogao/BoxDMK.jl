@@ -145,13 +145,16 @@ function parent2children!(outs::F, phi::AbstractArray{Float64}, A::NTuple{2,Matr
                         gemm_batch!(pY, mo, moo, pX, mo, mo * mi, pointer(Bt[sy]), mi, mo, mo, mi, mi, 1.0, false)
                         haveY = true
                     end
-                    GC.@preserve o gemm!(pointer(o), moo, pY, moo, pointer(Ct[sz]), mi, moo, mo, mi, 1.0, true)
+                    GC.@preserve o gemm!(_ptr(o), moo, pY, moo, pointer(Ct[sz]), mi, moo, mo, mi, 1.0, true)
                 end
             end
         end
     end
     return nothing
 end
+
+@inline _ptr(x::Ptr{Float64}) = x
+@inline _ptr(x::AbstractArray{Float64}) = pointer(x)
 
 # Per-task workspaces, each allocated (and first touched) on its own thread.
 function make_workspaces(f::F) where {F}

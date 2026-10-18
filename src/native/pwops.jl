@@ -270,8 +270,7 @@ function pw2proxy!(outs, pwr::AbstractVector{Float64}, pwi::AbstractVector{Float
         # z: out[xy, z] += G2 * Bc
         for m in 1:_ncombos(ifpgh)
             dz = _PGH_COMBOS[m][3]
-            out = outs[m]
-            gemm!(pointer(out), pp, pointer(w.G2[_PGH_XYIDX[m]]), pp, pointer(tb.Bc[dz + 1]), npw, pp, p, npw, 1.0, true)
+            gemm!(outptr(outs, m), pp, pointer(w.G2[_PGH_XYIDX[m]]), pp, pointer(tb.Bc[dz + 1]), npw, pp, p, npw, 1.0, true)
         end
     end
     return nothing

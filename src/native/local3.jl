@@ -62,7 +62,7 @@ function local_sparse!(outs, f::AbstractArray{Float64,3}, w::Float64, T::LocTab1
         for m in 1:ncomb
             dz = _PGH_COMBOS[m][3]
             pq = pointer(lw.gxy[_PGH_XYIDX[m]])
-            po = pointer(outs[m])
+            po = outptr(outs, m)
             pB = pointer(T.tabZ[dz + 1]) + 8 * (sl(sz) + (jzl - 1) + (kzl - 1) * n)
             for k2 in kyl:kyh
                 gemm!(po + 8 * ((kxl - 1) + (k2 - 1) * n + (kzl - 1) * nn), nn,

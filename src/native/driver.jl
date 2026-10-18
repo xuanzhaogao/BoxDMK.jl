@@ -247,6 +247,8 @@ struct ProxyOuts{A}
 end
 @inline Base.getindex(o::ProxyOuts, m::Int) = view(o.pp, :, o.ind, m, o.k)
 
+# Output m (1 = pot, 2:4 = grad, 5:10 = hess) of one box and density, as a
+# pointer to its n³ contiguous values (type stable, unlike a tuple of views).
 struct BoxOuts{A,G,H}
     pot::A
     grad::G
@@ -254,7 +256,16 @@ struct BoxOuts{A,G,H}
     ind::Int
     ibox::Int
 end
-@inline Base.getindex(o::BoxOuts, m::Int) = _outview(o.pot, o.grad, o.hess, o.ind, m, o.ibox)
+
+@inline function outptr(o::BoxOuts, m::Int)
+    n3 = size(o.pot, 1) * size(o.pot, 2) * size(o.pot, 3)
+    nd = size(o.pot, 4)
+    m == 1 && return pointer(o.pot) + 8 * n3 * ((o.ind - 1) + nd * (o.ibox - 1))
+    m <= 4 && return pointer(o.grad) + 8 * n3 * ((o.ind - 1) + nd * ((m - 2) + 3 * (o.ibox - 1)))
+    return pointer(o.hess) + 8 * n3 * ((o.ind - 1) + nd * ((m - 5) + 6 * (o.ibox - 1)))
+end
+@inline outptr(o::ProxyOuts, m::Int) = pointer(o.pp, 1 + size(o.pp, 1) * ((o.ind - 1) + size(o.pp, 2) * ((m - 1) + size(o.pp, 3) * (o.k - 1))))
+@inline outptr(o::Tuple{AbstractArray{Float64}}, m::Int) = pointer(o[1])
 
 function step3_upward!(pc, nodeidx, s::DMKSetup, fv)
     ft, n, nd, p = s.ft, s.n, s.nd, s.porder
@@ -374,7 +385,7 @@ function steps456_planewave!(pot, grad, hess, pp, pc, nodeidx, s::DMKSetup, fv)
             for ind in 1:nd, c in 1:ncomb
                 phi = view(pp, :, ind, c, nodeidx[ibox])
                 on = slot -> (ch = ft.child[slot, ibox]; (ch == 0 || nodeidx[ch] == 0) ? nothing : view(pp, :, ind, c, nodeidx[ch]))
-                ol = slot -> (ch = ft.child[slot, ibox]; (ch == 0 || nodeidx[ch] > 0) ? nothing : _outview(pot, grad, hess, ind, c, ch))
+                ol = slot -> (ch = ft.child[slot, ibox]; (ch == 0 || nodeidx[ch] > 0) ? nothing : outptr(BoxOuts(pot, grad, hess, ind, ch), c))
                 parent2children!(on, phi, s.p2c, s.p2cT, s.p2cT, p, p, w.w1, w.w2)
                 parent2children!(ol, phi, s.p2cf, s.p2cfT, s.p2cfT, p, s.n, w.w1, w.w2)
             end
@@ -546,7 +557,7 @@ function _local_pgh_box!(pot, grad, hess, s::DMKSetup, fv, ibox::Int, lw::LocalW
         for id in _local_jstart(s, ibox, jbox, ilev, jlev):iend
             T = tabsl[id]::LocTab1D
             for ind in 1:nd
-                local_sparse!(_box_outs(pot, grad, hess, ind, ibox, ifpgh), view(fv, :, :, :, ind, jbox),
+                local_sparse!(BoxOuts(pot, grad, hess, ind, ibox), view(fv, :, :, :, ind, jbox),
                               s.wdeltas[id], T, sx, sy, sz, n, ncomb, lw)
             end
         end
@@ -554,13 +565,6 @@ function _local_pgh_box!(pot, grad, hess, s::DMKSetup, fv, ibox::Int, lw::LocalW
     return nothing
 end
 
-@inline function _box_outs(pot, grad, hess, ind, ibox, ifpgh)
-    o1 = view(pot, :, :, :, ind, ibox)
-    g = ntuple(d -> view(grad, :, :, :, ind, d, ibox), 3)
-    ifpgh == 2 && return (o1, g...)
-    h = ntuple(m -> view(hess, :, :, :, ind, m, ibox), 6)
-    return (o1, g..., h...)
-end
 
 function _asym_coefs(s::DMKSetup, nas::Int)
     nde = length(s.deltas)
