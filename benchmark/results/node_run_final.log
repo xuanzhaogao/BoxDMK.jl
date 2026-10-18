@@ -1,0 +1,54 @@
+CPU(s):                                  96
+Model name:                              AMD EPYC 9474F 48-Core Processor
+Socket(s):                               2
+CPU(s) scaling MHz:                      90%
+NUMA node(s):                            2
+   native steps: pre 0.003  s2 0.003  s3 0.004  pw 0.064  s7 0.021  s8 0.014  s9 0.005  out 0.000
+   native steps: pre 0.056  s2 0.020  s3 0.213  pw 2.657  s7 0.522  s8 0.682  s9 0.194  out 0.000
+   native steps: pre 0.004  s2 0.012  s3 0.005  pw 0.028  s7 0.116  s8 0.007  s9 0.006  out 0.000
+   native steps: pre 0.009  s2 0.018  s3 0.028  pw 0.304  s7 0.525  s8 0.079  s9 0.030  out 0.000
+   native steps: pre 0.040  s2 0.033  s3 0.173  pw 1.899  s7 2.226  s8 0.523  s9 0.175  out 0.000
+   native steps: pre 0.051  s2 0.049  s3 0.504  pw 5.467  s7 3.798  s8 1.519  s9 0.502  out 0.000
+   native steps: pre 0.009  s2 0.056  s3 0.027  pw 0.516  s7 1.813  s8 0.195  s9 0.120  out 0.020
+   native steps: pre 0.015  s2 0.140  s3 0.030  pw 0.887  s7 3.726  s8 0.377  s9 0.298  out 0.112
+   native steps: pre 0.002  s2 0.001  s3 0.001  pw 0.018  s7 0.004  s8 0.003  s9 0.001  out 0.000
+   native steps: pre 0.032  s2 0.005  s3 0.035  pw 0.460  s7 0.095  s8 0.112  s9 0.033  out 0.000
+   native steps: pre 0.001  s2 0.002  s3 0.001  pw 0.008  s7 0.016  s8 0.001  s9 0.002  out 0.000
+   native steps: pre 0.004  s2 0.003  s3 0.006  pw 0.071  s7 0.072  s8 0.015  s9 0.006  out 0.000
+   native steps: pre 0.023  s2 0.006  s3 0.036  pw 0.325  s7 0.303  s8 0.084  s9 0.036  out 0.000
+   native steps: pre 0.033  s2 0.010  s3 0.083  pw 0.863  s7 0.515  s8 0.232  s9 0.080  out 0.000
+   native steps: pre 0.008  s2 0.010  s3 0.006  pw 0.112  s7 0.272  s8 0.034  s9 0.025  out 0.019
+   native steps: pre 0.012  s2 0.023  s3 0.006  pw 0.170  s7 0.577  s8 0.061  s9 0.056  out 0.030
+   native steps: pre 0.002  s2 0.001  s3 0.001  pw 0.012  s7 0.002  s8 0.002  s9 0.001  out 0.000
+   native steps: pre 0.030  s2 0.004  s3 0.020  pw 0.294  s7 0.049  s8 0.062  s9 0.019  out 0.000
+   native steps: pre 0.002  s2 0.001  s3 0.001  pw 0.007  s7 0.009  s8 0.001  s9 0.001  out 0.000
+   native steps: pre 0.005  s2 0.002  s3 0.005  pw 0.048  s7 0.040  s8 0.010  s9 0.006  out 0.000
+   native steps: pre 0.013  s2 0.004  s3 0.028  pw 0.203  s7 0.158  s8 0.051  s9 0.028  out 0.000
+   native steps: pre 0.032  s2 0.006  s3 0.051  pw 0.487  s7 0.268  s8 0.126  s9 0.050  out 0.000
+   native steps: pre 0.007  s2 0.006  s3 0.005  pw 0.073  s7 0.138  s8 0.021  s9 0.020  out 0.020
+   native steps: pre 0.009  s2 0.012  s3 0.005  pw 0.117  s7 0.308  s8 0.037  s9 0.043  out 0.026
+   native steps: pre 0.040  s2 0.002  s3 0.001  pw 0.013  s7 0.002  s8 0.001  s9 0.001  out 0.000
+   native steps: pre 0.045  s2 0.004  s3 0.013  pw 0.216  s7 0.026  s8 0.049  s9 0.013  out 0.000
+   native steps: pre 0.002  s2 0.001  s3 0.001  pw 0.006  s7 0.006  s8 0.001  s9 0.001  out 0.000
+   native steps: pre 0.005  s2 0.002  s3 0.005  pw 0.037  s7 0.020  s8 0.008  s9 0.005  out 0.000
+   native steps: pre 0.024  s2 0.003  s3 0.026  pw 0.150  s7 0.080  s8 0.037  s9 0.026  out 0.000
+   native steps: pre 0.049  s2 0.005  s3 0.039  pw 0.309  s7 0.136  s8 0.075  s9 0.036  out 0.000
+   native steps: pre 0.008  s2 0.004  s3 0.004  pw 0.057  s7 0.071  s8 0.016  s9 0.018  out 0.028
+   native steps: pre 0.011  s2 0.007  s3 0.005  pw 0.096  s7 0.146  s8 0.027  s9 0.041  out 0.059
+   native steps: pre 0.003  s2 0.002  s3 0.002  pw 0.013  s7 0.002  s8 0.002  s9 0.002  out 0.000
+   native steps: pre 0.052  s2 0.005  s3 0.011  pw 0.205  s7 0.019  s8 0.056  s9 0.012  out 0.000
+   native steps: pre 0.002  s2 0.002  s3 0.001  pw 0.007  s7 0.004  s8 0.001  s9 0.001  out 0.000
+   native steps: pre 0.003  s2 0.002  s3 0.005  pw 0.041  s7 0.015  s8 0.010  s9 0.006  out 0.000
+   native steps: pre 0.026  s2 0.005  s3 0.025  pw 0.139  s7 0.054  s8 0.038  s9 0.026  out 0.000
+   native steps: pre 0.054  s2 0.005  s3 0.034  pw 0.261  s7 0.091  s8 0.062  s9 0.032  out 0.000
+   native steps: pre 0.006  s2 0.003  s3 0.005  pw 0.060  s7 0.048  s8 0.016  s9 0.018  out 0.025
+   native steps: pre 0.012  s2 0.006  s3 0.006  pw 0.093  s7 0.104  s8 0.026  s9 0.040  out 0.049
+   native steps: pre 0.020  s2 0.005  s3 0.004  pw 0.025  s7 0.005  s8 0.005  s9 0.003  out 0.000
+   native steps: pre 0.053  s2 0.009  s3 0.015  pw 0.209  s7 0.018  s8 0.054  s9 0.011  out 0.000
+   native steps: pre 0.002  s2 0.002  s3 0.002  pw 0.014  s7 0.005  s8 0.003  s9 0.002  out 0.000
+   native steps: pre 0.006  s2 0.004  s3 0.006  pw 0.053  s7 0.013  s8 0.013  s9 0.005  out 0.000
+   native steps: pre 0.027  s2 0.011  s3 0.025  pw 0.150  s7 0.036  s8 0.049  s9 0.025  out 0.000
+   native steps: pre 0.058  s2 0.011  s3 0.037  pw 0.245  s7 0.055  s8 0.063  s9 0.032  out 0.000
+   native steps: pre 0.007  s2 0.004  s3 0.006  pw 0.070  s7 0.029  s8 0.020  s9 0.018  out 0.031
+   native steps: pre 0.013  s2 0.007  s3 0.005  pw 0.100  s7 0.061  s8 0.027  s9 0.038  out 0.049
+results in benchmark/results/bench_worker7157_final.md

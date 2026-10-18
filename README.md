@@ -200,7 +200,39 @@ ftree = build_tree_fortran(f, LaplaceKernel(), LegendreBasis(); ndim=3, norder=8
 
 ## Performance
 
-PERFORMANCE_PLACEHOLDER
+Wall time of `bdmk` vs `bdmk_fortran` on the same tree (Laplace kernel,
+best of 3, Fortran built with `-O3 -march=native` + OpenBLAS + OpenMP). The
+density is `f = -Δu/(4π)` for a sum of three Gaussians in a box of size 1.18,
+so the exact potential is `u`; both codes reach the same error against `u`
+and agree with each other to ~1e-13 (`benchmark/native_vs_fortran.jl`; full
+tables in `benchmark/results/`).
+
+Rusty genoa node (2× AMD EPYC 9474F, 96 cores), seconds:
+
+| norder | eps | outputs | boxes | 1 thread F / Julia | 16 threads F / Julia | 48 threads F / Julia | 96 threads F / Julia |
+|---|---|---|---|---|---|---|---|
+| 8  | 1e-6 | pot | 14265 | 15.5 / 3.47 (4.5×) | 5.27 / 0.40 (13×) | 4.60 / 0.29 (16×) | 4.66 / 0.30 (15×) |
+| 16 | 1e-3 | pot | 849   | 0.59 / 0.16 (3.6×) | 0.13 / 0.020 (6.3×) | 0.12 / 0.016 (7.3×) | 0.12 / 0.025 (4.8×) |
+| 16 | 1e-6 | pot | 1225  | 3.05 / 0.88 (3.4×) | 0.52 / 0.10 (5.1×) | 0.45 / 0.066 (6.8×) | 0.46 / 0.082 (5.6×) |
+| 16 | 1e-9 | pot | 2129  | 16.9 / 4.37 (3.9×) | 2.29 / 0.41 (5.7×) | 1.87 / 0.25 (7.5×) | 1.87 / 0.25 (7.5×) |
+| 12 | 1e-9 | pot | 6553  | 41.6 / 9.87 (4.2×) | 6.80 / 0.84 (8.1×) | 5.57 / 0.45 (13×) | 5.56 / 0.41 (14×) |
+| 16 | 1e-6 | pot+grad+hess | 1225 | 28.4 / 4.91 (5.8×) | 2.59 / 0.48 (5.4×) | 1.15 / 0.27 (4.3×) | 0.78 / 0.23 (3.3×) |
+
+Workstation (2× Xeon Gold 6234, 16 cores), seconds:
+
+| norder | eps | outputs | 1 thread F / Julia | 16 threads F / Julia |
+|---|---|---|---|---|
+| 8  | 1e-6 | pot | 23.7 / 5.88 (4.0×) | 6.01 / 0.64 (9.3×) |
+| 16 | 1e-6 | pot | 5.54 / 1.02 (5.4×) | 0.83 / 0.14 (6.1×) |
+| 16 | 1e-9 | pot | 25.0 / 5.23 (4.8×) | 3.89 / 0.63 (6.2×) |
+| 16 | 1e-6 | pot+grad | 28.1 / 2.70 (10×) | 2.43 / 0.31 (7.7×) |
+| 16 | 1e-6 | pot+grad+hess | 47.1 / 5.29 (8.9×) | 4.18 / 0.58 (7.2×) |
+
+Part of the single-thread gain is flushing subnormals to zero (see below):
+run with FTZ as well, the Fortran solve of the 2081-box n=16, eps=1e-6
+problem takes 7.3 s instead of 13.3 s on the workstation; Julia takes 2.0 s.
+Repeated solves reuse the internal buffers; call `BoxDMK.release_memory!()`
+to return them to the OS.
 
 ## Implementation Notes
 
