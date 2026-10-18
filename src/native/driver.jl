@@ -215,11 +215,8 @@ _childsides(slot::Int) = (((slot - 1) & 1) + 1, (((slot - 1) >> 1) & 1) + 1, (((
 struct TPWork
     w1::Vector{Float64}
     w2::Vector{Float64}
-    w3::Vector{Float64}             # scratch for nested tensor products
-    w4::Vector{Float64}
-    tmp::Vector{Vector{Float64}}    # one p³ buffer per child slot
 end
-TPWork(m::Int, ar::Arena) = (u = () -> alloc(ar, m); TPWork(u(), u(), u(), u(), [u() for _ in 1:8]))
+TPWork(m::Int, ar::Arena) = TPWork(alloc(ar, m), alloc(ar, m))
 
 # Proxy data is stored only for nonleaf boxes (and the root): leaves form and
 # evaluate plane waves directly from/to their grid values, and their proxy
@@ -267,9 +264,8 @@ end
 @inline outptr(o::ProxyOuts, m::Int) = pointer(o.pp, 1 + size(o.pp, 1) * ((o.ind - 1) + size(o.pp, 2) * ((m - 1) + size(o.pp, 3) * (o.k - 1))))
 @inline outptr(o::Tuple{AbstractArray{Float64}}, m::Int) = pointer(o[1])
 
-function step3_upward!(pc, nodeidx, s::DMKSetup, fv)
+function step3_upward!(pc, nodeidx, s::DMKSetup, fv, wss::Vector{TPWork})
     ft, n, nd, p = s.ft, s.n, s.nd, s.porder
-    wss = make_workspaces(() -> TPWork(max(p, n)^3, s.arena))
     for ilev in ft.nlevels:-1:0
         boxes = [ibox for ibox in levelboxes(ft, ilev) if nodeidx[ibox] > 0]
         sc3 = ilev < ft.nlevels ? (ft.boxsize[ilev + 2] / 2)^3 : 0.0
@@ -295,7 +291,7 @@ end
 
 @inline function _leaf_charge!(out, s::DMKSetup, fv, ind::Int, ibox::Int, w::TPWork)
     sc3 = (s.ft.boxsize[s.ft.level[ibox] + 1] / 2)^3
-    tp3!(out, view(fv, :, :, :, ind, ibox), s.den2pc, s.den2pcT, s.den2pcT, w.w3, w.w4, sc3, false)
+    tp3!(out, view(fv, :, :, :, ind, ibox), s.den2pc, s.den2pcT, s.den2pcT, w.w1, w.w2, sc3, false)
 end
 
 # proxy potential (component c) of a leaf -> values on its grid
@@ -303,7 +299,7 @@ end
     tp3!(out, phi, s.poteval, s.potevalT, s.potevalT, w.w1, w.w2, 1.0, true)
 end
 
-function steps456_planewave!(pot, grad, hess, pp, pc, nodeidx, s::DMKSetup, fv)
+function steps456_planewave!(pot, grad, hess, pp, pc, nodeidx, s::DMKSetup, fv, tpw::Vector{TPWork})
     ft, nd, p, ifpgh, eps = s.ft, s.nd, s.porder, s.ifpgh, s.eps
     ncomb = _ncombos(ifpgh)
     bs0 = ft.boxsize[1]
@@ -312,7 +308,7 @@ function steps456_planewave!(pot, grad, hess, pp, pc, nodeidx, s::DMKSetup, fv)
         r = ipwrange(s, ilev)
         isempty(r) && continue
         L = PWLevel(eps, ilev, p, bs0, bs0, @view(s.deltas[r]), @view(s.wdeltas[r]), s.prox)
-        w = PWWork(L.npw, max(p, s.n), s.arena)
+        w = PWWork(L.npw, max(p, s.n), s.arena, ifpgh, true)
         for ind in 1:nd
             proxy2pw!(w.locr, w.loci, view(pc, :, ind, nodeidx[1]), L, L.prox, w, 0, PWLayout(L), true)
             pw2proxy!(ProxyOuts(pp, ind, nodeidx[1]), w.locr, w.loci, L, L.prox, ifpgh, w)
@@ -320,7 +316,6 @@ function steps456_planewave!(pot, grad, hess, pp, pc, nodeidx, s::DMKSetup, fv)
     end
 
     mpidx = zeros(Int, ft.nboxes)
-    tpw = make_workspaces(() -> TPWork(p^3, s.arena))
     # Workspaces and expansion storage are sized once for the busiest level
     # (all levels >= 0 share the same number of plane waves).
     npw = pw_terms(eps, 0)
@@ -334,7 +329,7 @@ function steps456_planewave!(pot, grad, hess, pp, pc, nodeidx, s::DMKSetup, fv)
     locr = alloc(s.arena, npw, cb, nd, maxboxes, nblk)
     loci = alloc(s.arena, npw, cb, nd, maxboxes, nblk)
     lay = PWLayout(npw, cb, npw * cb * nd * maxboxes)
-    wss = make_workspaces(() -> PWWork(npw, max(p, s.n), s.arena))
+    wss = make_workspaces(() -> PWWork(npw, max(p, s.n), s.arena, ifpgh))
     accs = [zeros(2 * 64) for _ in 1:_nthreads()]
     for ilev in 0:ft.nlevels
         boxes = [ibox for ibox in levelboxes(ft, ilev) if s.ifpwexp[ibox]]
@@ -582,10 +577,9 @@ function _asym_coefs(s::DMKSetup, nas::Int)
 end
 
 # Leaves with stored proxy potential (only a leaf root): proxy -> grid values.
-function step9_proxy2pot!(pot, grad, hess, pp, nodeidx, s::DMKSetup)
+function step9_proxy2pot!(pot, grad, hess, pp, nodeidx, s::DMKSetup, wss::Vector{TPWork})
     ft, n, nd, p = s.ft, s.n, s.nd, s.porder
     ncomb = _ncombos(s.ifpgh)
-    wss = make_workspaces(() -> TPWork(max(n, p)^3, s.arena))
     leaves = [ibox for ibox in 1:ft.nboxes if ft.nchild[ibox] == 0 && nodeidx[ibox] > 0]
     parallel_foreach(leaves, wss) do ibox, w
         for ind in 1:nd, c in 1:ncomb
@@ -738,12 +732,13 @@ function _bdmk_steps(s::DMKSetup, tree::BoxTree, fvals, nd::Int, np::Int, ifpgh:
     t0 = time_ns()
     nodeidx, nnode = node_index(s)
     pc = alloc(s.arena, p^3, nd, nnode)
-    step3_upward!(pc, nodeidx, s, fv)
+    tpw = make_workspaces(() -> TPWork(max(p, n)^3, s.arena))
+    step3_upward!(pc, nodeidx, s, fv, tpw)
     tm[3] = (time_ns() - t0) / 1e9
 
     t0 = time_ns()
     pp = pfill!(alloc(s.arena, p^3, nd, _ncombos(ifpgh), nnode))
-    steps456_planewave!(pot, gradv, hessv, pp, pc, nodeidx, s, fv)
+    steps456_planewave!(pot, gradv, hessv, pp, pc, nodeidx, s, fv, tpw)
     tm[4] = (time_ns() - t0) / 1e9
 
     t0 = time_ns()
@@ -752,7 +747,7 @@ function _bdmk_steps(s::DMKSetup, tree::BoxTree, fvals, nd::Int, np::Int, ifpgh:
 
 
     t0 = time_ns()
-    step9_proxy2pot!(pot, gradv, hessv, pp, nodeidx, s)
+    step9_proxy2pot!(pot, gradv, hessv, pp, nodeidx, s, tpw)
     tm[9] = (time_ns() - t0) / 1e9
 
     t0 = time_ns()

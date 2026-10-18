@@ -95,14 +95,19 @@ struct PWWork
     loci::Vector{Float64}
 end
 
-function PWWork(npw::Int, porder::Int, ar::Arena)
+# Buffers for derivative combos up to ifpgh; `loc` only for standalone
+# expansions (fat Gaussians).
+function PWWork(npw::Int, porder::Int, ar::Arena, ifpgh::Int = 3, loc::Bool = false)
     nh = npw ÷ 2
     p = porder
     u(m) = alloc(ar, m)     # every buffer is written before it is read
+    nd1 = ifpgh == 1 ? 1 : (ifpgh == 2 ? 2 : 3)
+    nxy = ifpgh == 1 ? 1 : (ifpgh == 2 ? 3 : 6)
+    nl = loc ? npw * npw * nh : 0
     PWWork(u(p * p * npw), u(p * npw), u(p * npw),
            u(p * npw * nh), u(p * npw * nh), u(npw * npw * nh), u(npw * npw * nh),
-           [u(p * npw * nh) for _ in 1:3], [u(p * npw * nh) for _ in 1:3],
-           [u(p * p * npw) for _ in 1:6], u(npw * npw * nh), u(npw * npw * nh))
+           [u(p * npw * nh) for _ in 1:nd1], [u(p * npw * nh) for _ in 1:nd1],
+           [u(p * p * npw) for _ in 1:nxy], u(nl), u(nl))
 end
 
 # Storage layout of expansions: frequency column col (0-based) of a box lives
