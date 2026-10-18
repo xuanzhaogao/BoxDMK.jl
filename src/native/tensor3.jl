@@ -22,42 +22,19 @@ function tp3!(out::AbstractArray{Float64}, inp::AbstractArray{Float64},
     return out
 end
 
-# out (+)= α (D applied along dimension `dim` of the n×n×n tensor inp).
+# out (+)= α (D applied along dimension `dim` of the n×n×n tensor inp);
+# DT = transpose(D).
 function apply_dim!(out::AbstractArray{Float64}, inp::AbstractArray{Float64}, D::Matrix{Float64},
-                    dim::Int, n::Int, α::Float64, add::Bool)
-    if !add
-        @inbounds for i in 1:(n^3)
-            out[i] = 0.0
-        end
-    end
-    if dim == 1
-        @inbounds for jk in 0:(n * n - 1)
-            b = jk * n
-            for i in 1:n
-                s = α * inp[b + i]
-                @simd for a in 1:n
-                    out[b + a] = muladd(D[a, i], s, out[b + a])
-                end
-            end
-        end
-    elseif dim == 2
-        @inbounds for k in 0:(n - 1), bb in 1:n, j in 1:n
-            s = α * D[bb, j]
-            ob = (k * n + bb - 1) * n
-            ib = (k * n + j - 1) * n
-            @simd for a in 1:n
-                out[ob + a] = muladd(s, inp[ib + a], out[ob + a])
-            end
-        end
-    else
-        nn = n * n
-        @inbounds for c in 1:n, k in 1:n
-            s = α * D[c, k]
-            ob = (c - 1) * nn
-            ib = (k - 1) * nn
-            @simd for ab in 1:nn
-                out[ob + ab] = muladd(s, inp[ib + ab], out[ob + ab])
-            end
+                    DT::Matrix{Float64}, dim::Int, n::Int, α::Float64, add::Bool)
+    nn = n * n
+    GC.@preserve out inp D DT begin
+        po = pointer(out); pi = pointer(inp)
+        if dim == 1
+            gemm!(po, n, pointer(D), n, pi, n, n, nn, n, α, add)
+        elseif dim == 2
+            gemm_batch!(po, n, nn, pi, n, nn, pointer(DT), n, n, n, n, n, α, add)
+        else
+            gemm!(po, nn, pi, nn, pointer(DT), n, nn, n, n, α, add)
         end
     end
     return out
@@ -103,6 +80,63 @@ function _worker(f::F, items, ws, counter, n) where {F}
         end
     finally
         set_zero_subnormals(old)
+    end
+    return nothing
+end
+
+# Children -> parent anterpolation, sharing stages among the 8 children:
+# out (+)= Σ_children (A[sx] ⊗ B[sy] ⊗ C[sz]) q_child with the z stage applied
+# per child, the y stage per (sx, sy) and the x stage per sx.
+# qs(slot) returns the child's p³ data (or nothing), slot = 1 + sx' + 2sy' + 4sz'.
+function children2parent!(out::AbstractArray{Float64}, qs::F, A::NTuple{2,Matrix{Float64}},
+                          Bt::NTuple{2,Matrix{Float64}}, Ct::NTuple{2,Matrix{Float64}}, p::Int,
+                          Z::Vector{Float64}, Y::Vector{Float64}, add::Bool) where {F}
+    pp = p * p
+    started = add
+    GC.@preserve out Z Y A Bt Ct begin
+        pZ = pointer(Z); pY = pointer(Y)
+        for sx in 1:2
+            haveY = false
+            for sy in 1:2
+                haveZ = false
+                for sz in 1:2
+                    q = qs(1 + (sx - 1) + 2 * (sy - 1) + 4 * (sz - 1))
+                    q === nothing && continue
+                    GC.@preserve q gemm!(pZ, pp, pointer(q), pp, pointer(Ct[sz]), p, pp, p, p, 1.0, haveZ)
+                    haveZ = true
+                end
+                haveZ || continue
+                gemm_batch!(pY, p, pp, pZ, p, pp, pointer(Bt[sy]), p, p, p, p, p, 1.0, haveY)
+                haveY = true
+            end
+            haveY || continue
+            gemm!(pointer(out), p, pointer(A[sx]), p, pY, p, p, pp, p, 1.0, started)
+            started = true
+        end
+        started || fill!(out, 0.0)
+    end
+    return out
+end
+
+# Parent -> children interpolation, sharing stages: x per sx, y per (sx, sy),
+# z per child. outs(slot) returns the child's p³ output (or nothing); added to.
+function parent2children!(outs::F, phi::AbstractArray{Float64}, A::NTuple{2,Matrix{Float64}},
+                          Bt::NTuple{2,Matrix{Float64}}, Ct::NTuple{2,Matrix{Float64}}, p::Int,
+                          X::Vector{Float64}, Y::Vector{Float64}) where {F}
+    pp = p * p
+    GC.@preserve phi X Y A Bt Ct begin
+        pX = pointer(X); pY = pointer(Y)
+        for sx in 1:2
+            gemm!(pX, p, pointer(A[sx]), p, pointer(phi), p, p, pp, p, 1.0, false)
+            for sy in 1:2
+                gemm_batch!(pY, p, pp, pX, p, pp, pointer(Bt[sy]), p, p, p, p, p, 1.0, false)
+                for sz in 1:2
+                    o = outs(1 + (sx - 1) + 2 * (sy - 1) + 4 * (sz - 1))
+                    o === nothing && continue
+                    GC.@preserve o gemm!(pointer(o), pp, pY, pp, pointer(Ct[sz]), p, pp, p, p, 1.0, true)
+                end
+            end
+        end
     end
     return nothing
 end

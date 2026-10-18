@@ -139,7 +139,11 @@ function compute_list1(ft::FlatTree)
     for ibox in 1:nb
         ptr[ibox + 1] = ptr[ibox] + length(lists[ibox])
     end
-    return ptr, reduce(vcat, lists; init = Int[])
+    flat = Vector{Int}(undef, ptr[end] - 1)
+    for ibox in 1:nb
+        copyto!(flat, ptr[ibox], lists[ibox], 1, length(lists[ibox]))
+    end
+    return ptr, flat
 end
 
 @inline function _within(ft::FlatTree, a::Int, b::Int, distest::Float64)

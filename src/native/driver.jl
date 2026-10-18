@@ -23,6 +23,8 @@ struct DMKSetup
     inp::Ortho1D                # input basis tables (order n)
     D1::Matrix{Float64}         # values -> first derivative values on [-1,1]
     D2::Matrix{Float64}
+    D1T::Matrix{Float64}
+    D2T::Matrix{Float64}
     den2pc::Matrix{Float64}     # values -> proxy coefficients (porder × n)
     den2pcT::Matrix{Float64}
     poteval::Matrix{Float64}    # proxy coefficients -> values (n × porder)
@@ -127,7 +129,7 @@ function DMKSetup(tree::BoxTree, nd::Int, kernel::AbstractKernel, eps::Float64, 
     D2 = inp.Vpp * inp.U
 
     return DMKSetup(ft, nd, n, porder, ifpgh, eps, deltas, wdeltas, r0, ipwaddr, idelta, ifpwexp,
-                    nlistpw, listpw, list1_ptr, list1, inp, D1, D2, den2pc, Matrix(transpose(den2pc)),
+                    nlistpw, listpw, list1_ptr, list1, inp, D1, D2, Matrix(transpose(D1)), Matrix(transpose(D2)), den2pc, Matrix(transpose(den2pc)),
                     poteval, Matrix(transpose(poteval)), p2c, map(m -> Matrix(transpose(m)), p2c),
                     c2p, map(m -> Matrix(transpose(m)), c2p), prox,
                     loctabs, pwlevels, taylor)
@@ -145,10 +147,11 @@ end
 
 leafboxes(ft::FlatTree) = [ibox for ibox in 1:ft.nboxes if ft.nchild[ibox] == 0]
 
-function _laplacian!(out, f, D2, n, sc2)
-    apply_dim!(out, f, D2, 1, n, sc2, false)
-    apply_dim!(out, f, D2, 2, n, sc2, true)
-    apply_dim!(out, f, D2, 3, n, sc2, true)
+function _laplacian!(out, f, s::DMKSetup, sc2)
+    n = s.n
+    apply_dim!(out, f, s.D2, s.D2T, 1, n, sc2, false)
+    apply_dim!(out, f, s.D2, s.D2T, 2, n, sc2, true)
+    apply_dim!(out, f, s.D2, s.D2T, 3, n, sc2, true)
     return out
 end
 
@@ -172,8 +175,8 @@ function step2_taylor!(pot, grad, hess, s::DMKSetup, fv)
             f = view(fv, :, :, :, ind, ibox)
             fl = view(flv, :, :, :, ind, ibox)
             fl2 = view(fl2v, :, :, :, ind, ibox)
-            _laplacian!(fl, f, s.D2, n, sc2)
-            _laplacian!(fl2, fl, s.D2, n, sc2)
+            _laplacian!(fl, f, s, sc2)
+            _laplacian!(fl2, fl, s, sc2)
             pb = view(pot, :, :, :, ind, ibox)
             @inbounds @simd for i in eachindex(pb)
                 pb[i] = c0 * f[i] + c1 * fl[i] + c2 * fl2[i]
@@ -182,8 +185,8 @@ function step2_taylor!(pot, grad, hess, s::DMKSetup, fv)
                 for d in 1:3
                     gd = view(g, :, :, :, ind, d, ibox)
                     gld = view(gl, :, :, :, ind, d, ibox)
-                    apply_dim!(gd, f, s.D1, d, n, sc, false)
-                    _laplacian!(gld, gd, s.D2, n, sc2)
+                    apply_dim!(gd, f, s.D1, s.D1T, d, n, sc, false)
+                    _laplacian!(gld, gd, s, sc2)
                     gb = view(grad, :, :, :, ind, d, ibox)
                     @inbounds @simd for i in eachindex(gb)
                         gb[i] = c0 * gd[i] + c1 * gld[i]
@@ -196,12 +199,12 @@ function step2_taylor!(pot, grad, hess, s::DMKSetup, fv)
                     hm = view(h, :, :, :, ind, m, ibox)
                     hlm = view(hl, :, :, :, ind, m, ibox)
                     if d1 == d2
-                        apply_dim!(hm, f, s.D2, d1, n, sc2, false)
+                        apply_dim!(hm, f, s.D2, s.D2T, d1, n, sc2, false)
                     else
-                        apply_dim!(tmp, f, s.D1, d1, n, sc, false)
-                        apply_dim!(hm, tmp, s.D1, d2, n, sc, false)
+                        apply_dim!(tmp, f, s.D1, s.D1T, d1, n, sc, false)
+                        apply_dim!(hm, tmp, s.D1, s.D1T, d2, n, sc, false)
                     end
-                    _laplacian!(hlm, hm, s.D2, n, sc2)
+                    _laplacian!(hlm, hm, s, sc2)
                     hb = view(hess, :, :, :, ind, m, ibox)
                     @inbounds @simd for i in eachindex(hb)
                         hb[i] = c0 * hm[i] + c1 * hlm[i]
@@ -218,28 +221,58 @@ _childsides(slot::Int) = (((slot - 1) & 1) + 1, (((slot - 1) >> 1) & 1) + 1, (((
 struct TPWork
     w1::Vector{Float64}
     w2::Vector{Float64}
+    w3::Vector{Float64}             # scratch for nested tensor products
+    w4::Vector{Float64}
+    tmp::Vector{Vector{Float64}}    # one p³ buffer per child slot
 end
-TPWork(m::Int) = TPWork(zeros(m), zeros(m))
+TPWork(m::Int) = TPWork(zeros(m), zeros(m), zeros(m), zeros(m), [zeros(m) for _ in 1:8])
 
-function step3_upward!(pc, s::DMKSetup, fv)
+# Proxy data is stored only for boxes with plane-wave expansions (every
+# nonleaf box and the leaves next to one); pwidx maps a box to its column.
+function pw_index(s::DMKSetup)
+    pwidx = zeros(Int, s.ft.nboxes)
+    k = 0
+    for ibox in 1:s.ft.nboxes
+        s.ifpwexp[ibox] && (pwidx[ibox] = (k += 1))
+    end
+    return pwidx, k
+end
+
+# Box output component c: 1 = pot, 2:4 = grad, 5:10 = hess.
+@inline function _outview(pot, grad, hess, ind, c, ibox)
+    c == 1 && return view(pot, :, :, :, ind, ibox)
+    c <= 4 && return view(grad, :, :, :, ind, c - 1, ibox)
+    return view(hess, :, :, :, ind, c - 4, ibox)
+end
+
+struct ProxyOuts{A}
+    pp::A
+    ind::Int
+    k::Int
+end
+@inline Base.getindex(o::ProxyOuts, m::Int) = view(o.pp, :, o.ind, m, o.k)
+
+function step3_upward!(pc, pwidx, s::DMKSetup, fv)
     ft, n, nd, p = s.ft, s.n, s.nd, s.porder
-    m = max(p, n)^3
-    wss = [TPWork(m) for _ in 1:_nthreads()]
+    wss = [TPWork(max(p, n)^3) for _ in 1:_nthreads()]
     for ilev in ft.nlevels:-1:0
-        sc3 = (ft.boxsize[ilev + 1] / 2)^3
-        parallel_foreach(collect(levelboxes(ft, ilev)), wss) do ibox, w
+        boxes = [ibox for ibox in levelboxes(ft, ilev) if pwidx[ibox] > 0]
+        parallel_foreach(boxes, wss) do ibox, w
+            k = pwidx[ibox]
             for ind in 1:nd
-                out = view(pc, :, ind, ibox)
+                out = view(pc, :, ind, k)
                 if ft.nchild[ibox] == 0
-                    tp3!(out, view(fv, :, :, :, ind, ibox), s.den2pc, s.den2pcT, s.den2pcT, w.w1, w.w2, sc3, false)
+                    _leaf_charge!(out, s, fv, ind, ibox, w)
                 else
-                    fill!(out, 0.0)
-                    for slot in 1:8
-                        jbox = ft.child[slot, ibox]
-                        jbox == 0 && continue
-                        sx, sy, sz = _childsides(slot)
-                        tp3!(out, view(pc, :, ind, jbox), s.c2p[sx], s.c2pT[sy], s.c2pT[sz], w.w1, w.w2, 1.0, true)
+                    qs = function (slot)
+                        c = ft.child[slot, ibox]
+                        c == 0 && return nothing
+                        pwidx[c] > 0 && return view(pc, :, ind, pwidx[c])
+                        t = w.tmp[slot]
+                        _leaf_charge!(t, s, fv, ind, c, w)
+                        return t
                     end
+                    children2parent!(out, qs, s.c2p, s.c2pT, s.c2pT, s.porder, w.w1, w.w2, false)
                 end
             end
         end
@@ -247,18 +280,19 @@ function step3_upward!(pc, s::DMKSetup, fv)
     return pc
 end
 
-# Proxy outputs of one box/density for the derivative combos.
-@inline function _proxy_outs(ppot, pgrad, phess, ind, ibox, ifpgh)
-    o1 = view(ppot, :, ind, ibox)
-    ifpgh == 1 && return (o1,)
-    g = ntuple(d -> view(pgrad, :, ind, d, ibox), 3)
-    ifpgh == 2 && return (o1, g...)
-    h = ntuple(m -> view(phess, :, ind, m, ibox), 6)
-    return (o1, g..., h...)
+@inline function _leaf_charge!(out, s::DMKSetup, fv, ind::Int, ibox::Int, w::TPWork)
+    sc3 = (s.ft.boxsize[s.ft.level[ibox] + 1] / 2)^3
+    tp3!(out, view(fv, :, :, :, ind, ibox), s.den2pc, s.den2pcT, s.den2pcT, w.w3, w.w4, sc3, false)
 end
 
-function steps456_planewave!(ppot, pgrad, phess, s::DMKSetup, pc)
+# proxy potential (component c) of a leaf -> values on its grid
+@inline function _proxy_eval!(out, phi, s::DMKSetup, w::TPWork)
+    tp3!(out, phi, s.poteval, s.potevalT, s.potevalT, w.w1, w.w2, 1.0, true)
+end
+
+function steps456_planewave!(pot, grad, hess, pp, pc, pwidx, s::DMKSetup)
     ft, nd, p, ifpgh, eps = s.ft, s.nd, s.porder, s.ifpgh, s.eps
+    ncomb = _ncombos(ifpgh)
     bs0 = ft.boxsize[1]
     # Fat Gaussians (coarser than the root box) act on the root only.
     for ilev in _NLEVSTART:-1
@@ -267,15 +301,23 @@ function steps456_planewave!(ppot, pgrad, phess, s::DMKSetup, pc)
         L = PWLevel(eps, ilev, p, bs0, bs0, @view(s.deltas[r]), @view(s.wdeltas[r]), s.prox)
         w = PWWork(L.npw, p)
         for ind in 1:nd
-            proxy2pw!(w.locr, w.loci, view(pc, :, ind, 1), L, p, w)
+            proxy2pw!(w.locr, w.loci, view(pc, :, ind, pwidx[1]), L, p, w)
             w.locr .*= L.kernelft
             w.loci .*= L.kernelft
-            pw2proxy!(_proxy_outs(ppot, pgrad, phess, ind, 1, ifpgh), w.locr, w.loci, L, p, ifpgh, w)
+            pw2proxy!(ProxyOuts(pp, ind, pwidx[1]), w.locr, w.loci, L, p, ifpgh, w)
         end
     end
 
     mpidx = zeros(Int, ft.nboxes)
     tpw = [TPWork(p^3) for _ in 1:_nthreads()]
+    # Workspaces and expansion storage are sized once for the busiest level
+    # (all levels >= 0 share the same number of plane waves).
+    npw = pw_terms(eps, 0)
+    nexp = npw * npw * (npw ÷ 2)
+    maxboxes = maximum(ilev -> count(ibox -> s.ifpwexp[ibox], levelboxes(ft, ilev)), 0:ft.nlevels)
+    mpr_all = Vector{Float64}(undef, nexp * nd * maxboxes)
+    mpi_all = Vector{Float64}(undef, nexp * nd * maxboxes)
+    wss = [PWWork(npw, p) for _ in 1:_nthreads()]
     for ilev in 0:ft.nlevels
         boxes = [ibox for ibox in levelboxes(ft, ilev) if s.ifpwexp[ibox]]
         isempty(boxes) && continue
@@ -284,13 +326,12 @@ function steps456_planewave!(ppot, pgrad, phess, s::DMKSetup, pc)
             for (k, ibox) in enumerate(boxes)
                 mpidx[ibox] = k
             end
-            mpr = Array{Float64}(undef, L.nexp, nd, length(boxes))
-            mpi = Array{Float64}(undef, L.nexp, nd, length(boxes))
-            wss = [PWWork(L.npw, p) for _ in 1:_nthreads()]
+            mpr = reshape(view(mpr_all, 1:(L.nexp * nd * length(boxes))), L.nexp, nd, length(boxes))
+            mpi = reshape(view(mpi_all, 1:(L.nexp * nd * length(boxes))), L.nexp, nd, length(boxes))
             parallel_foreach(boxes, wss) do ibox, w
                 k = mpidx[ibox]
                 for ind in 1:nd
-                    proxy2pw!(view(mpr, :, ind, k), view(mpi, :, ind, k), view(pc, :, ind, ibox), L, p, w)
+                    proxy2pw!(view(mpr, :, ind, k), view(mpi, :, ind, k), view(pc, :, ind, pwidx[ibox]), L, p, w)
                 end
             end
             xmin = ft.boxsize[ilev + 1]
@@ -313,30 +354,29 @@ function steps456_planewave!(ppot, pgrad, phess, s::DMKSetup, pc)
                         locr[e] *= kft[e]
                         loci[e] *= kft[e]
                     end
-                    pw2proxy!(_proxy_outs(ppot, pgrad, phess, ind, ibox, ifpgh), locr, loci, L, p, ifpgh, w)
+                    pw2proxy!(ProxyOuts(pp, ind, pwidx[ibox]), locr, loci, L, p, ifpgh, w)
                 end
             end
         end
-        # Downward pass: parent proxy potential -> children.
+        # Downward pass: parent proxy potential -> children. Children without
+        # plane-wave expansions are leaves whose proxy potential is complete
+        # now, so it is evaluated on their grid directly.
         parents = [ibox for ibox in boxes if ft.nchild[ibox] > 0]
         parallel_foreach(parents, tpw) do ibox, w
-            for slot in 1:8
-                jbox = ft.child[slot, ibox]
-                jbox == 0 && continue
-                sx, sy, sz = _childsides(slot)
-                A, B, C = s.p2c[sx], s.p2cT[sy], s.p2cT[sz]
-                for ind in 1:nd
-                    tp3!(view(ppot, :, ind, jbox), view(ppot, :, ind, ibox), A, B, C, w.w1, w.w2, 1.0, true)
-                    if ifpgh >= 2
-                        for d in 1:3
-                            tp3!(view(pgrad, :, ind, d, jbox), view(pgrad, :, ind, d, ibox), A, B, C, w.w1, w.w2, 1.0, true)
-                        end
-                    end
-                    if ifpgh >= 3
-                        for m in 1:6
-                            tp3!(view(phess, :, ind, m, jbox), view(phess, :, ind, m, ibox), A, B, C, w.w1, w.w2, 1.0, true)
-                        end
-                    end
+            for ind in 1:nd, c in 1:ncomb
+                outs = function (slot)
+                    ch = ft.child[slot, ibox]
+                    ch == 0 && return nothing
+                    pwidx[ch] > 0 && return view(pp, :, ind, c, pwidx[ch])
+                    t = w.tmp[slot]
+                    fill!(t, 0.0)
+                    return t
+                end
+                parent2children!(outs, view(pp, :, ind, c, pwidx[ibox]), s.p2c, s.p2cT, s.p2cT, p, w.w1, w.w2)
+                for slot in 1:8
+                    ch = ft.child[slot, ibox]
+                    (ch == 0 || pwidx[ch] > 0) && continue
+                    _proxy_eval!(_outview(pot, grad, hess, ind, c, ch), w.tmp[slot], s, w)
                 end
             end
         end
@@ -572,24 +612,15 @@ function _asym_box!(pot, grad, hess, s::DMKSetup, fv, dd::DensityDerivs, (c0, c2
     return nothing
 end
 
-function step9_proxy2pot!(pot, grad, hess, s::DMKSetup, ppot, pgrad, phess)
-    ft, n, nd, p, ifpgh = s.ft, s.n, s.nd, s.porder, s.ifpgh
-    PE = s.poteval
-    PET = s.potevalT
+# Leaves with plane-wave expansions: proxy potential -> grid values.
+function step9_proxy2pot!(pot, grad, hess, pp, pwidx, s::DMKSetup)
+    ft, n, nd, p = s.ft, s.n, s.nd, s.porder
+    ncomb = _ncombos(s.ifpgh)
     wss = [TPWork(max(n, p)^3) for _ in 1:_nthreads()]
-    parallel_foreach(leafboxes(ft), wss) do ibox, w
-        for ind in 1:nd
-            tp3!(view(pot, :, :, :, ind, ibox), view(ppot, :, ind, ibox), PE, PET, PET, w.w1, w.w2, 1.0, true)
-            if ifpgh >= 2
-                for d in 1:3
-                    tp3!(view(grad, :, :, :, ind, d, ibox), view(pgrad, :, ind, d, ibox), PE, PET, PET, w.w1, w.w2, 1.0, true)
-                end
-            end
-            if ifpgh >= 3
-                for m in 1:6
-                    tp3!(view(hess, :, :, :, ind, m, ibox), view(phess, :, ind, m, ibox), PE, PET, PET, w.w1, w.w2, 1.0, true)
-                end
-            end
+    leaves = [ibox for ibox in 1:ft.nboxes if ft.nchild[ibox] == 0 && pwidx[ibox] > 0]
+    parallel_foreach(leaves, wss) do ibox, w
+        for ind in 1:nd, c in 1:ncomb
+            _proxy_eval!(_outview(pot, grad, hess, ind, c, ibox), view(pp, :, ind, c, pwidx[ibox]), s, w)
         end
     end
     return nothing
@@ -711,15 +742,14 @@ function _bdmk_native(tree::BoxTree, fvals::AbstractArray{<:Real,3}, kernel::Abs
     tm[2] = (time_ns() - t0) / 1e9
 
     t0 = time_ns()
-    pc = zeros(p^3, nd, nb)
-    step3_upward!(pc, s, fv)
+    pwidx, npwbox = pw_index(s)
+    pc = Array{Float64}(undef, p^3, nd, npwbox)
+    step3_upward!(pc, pwidx, s, fv)
     tm[3] = (time_ns() - t0) / 1e9
 
     t0 = time_ns()
-    ppot = zeros(p^3, nd, nb)
-    pgrad = zeros(p^3, nd, 3, ng)
-    phess = zeros(p^3, nd, 6, nh)
-    steps456_planewave!(ppot, pgrad, phess, s, pc)
+    pp = zeros(p^3, nd, _ncombos(ifpgh), npwbox)
+    steps456_planewave!(pot, gradv, hessv, pp, pc, pwidx, s)
     tm[4] = (time_ns() - t0) / 1e9
 
     t0 = time_ns()
@@ -731,7 +761,7 @@ function _bdmk_native(tree::BoxTree, fvals::AbstractArray{<:Real,3}, kernel::Abs
     tm[8] = (time_ns() - t0) / 1e9
 
     t0 = time_ns()
-    step9_proxy2pot!(pot, gradv, hessv, s, ppot, pgrad, phess)
+    step9_proxy2pot!(pot, gradv, hessv, pp, pwidx, s)
     tm[9] = (time_ns() - t0) / 1e9
 
     t0 = time_ns()
