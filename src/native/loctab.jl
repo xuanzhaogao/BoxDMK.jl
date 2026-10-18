@@ -13,6 +13,12 @@ struct LocTab1D
     tabx::Array{Float64,3}
     tabxx::Array{Float64,3}
     ind::Array{Int,3}           # (2, n+1, 13) sparse pattern (Fortran ind_loc)
+    # Sparse path: tables (derivative order 0:2) with the entries outside the
+    # pattern set to zero, their transposes, and per slot the target range K
+    # and the source envelope J (krange[:, slot] = (klo, khi, jlo, jhi)).
+    tabZ::NTuple{3,Array{Float64,3}}
+    tabZT::NTuple{3,Array{Float64,3}}
+    krange::Matrix{Int}
 end
 
 const _SQRTPIH = 0.886226925452757940959713778283913
@@ -285,5 +291,21 @@ function mk_loctab_all(eps::Float64, basis::AbstractBasis, n::Int, delta::Float6
         _merged_pattern!(ind, sk, eps, n, tab, tabx, tabxx, scratch)
     end
     tabT = permutedims(tab, (2, 1, 3))
-    return LocTab1D(tab, tabT, tabx, tabxx, ind)
+    krange = zeros(Int, 4, NLOCTAB2)
+    tabZ = (zeros(n, n, NLOCTAB2), zeros(n, n, NLOCTAB2), zeros(n, n, NLOCTAB2))
+    for slot in 1:NLOCTAB2
+        klo, khi = ind[1, n + 1, slot], ind[2, n + 1, slot]
+        jlo, jhi = n + 1, 0
+        for k in max(klo, 1):khi
+            lo, hi = ind[1, k, slot], ind[2, k, slot]
+            (lo >= 1 && hi >= lo) || continue
+            jlo = min(jlo, lo); jhi = max(jhi, hi)
+            for (Z, A) in zip(tabZ, (tab, tabx, tabxx)), j in lo:hi
+                Z[j, k, slot] = A[j, k, slot]
+            end
+        end
+        krange[:, slot] .= (klo, khi, jlo, jhi)
+    end
+    tabZT = map(Z -> permutedims(Z, (2, 1, 3)), tabZ)
+    return LocTab1D(tab, tabT, tabx, tabxx, ind, tabZ, tabZT, krange)
 end

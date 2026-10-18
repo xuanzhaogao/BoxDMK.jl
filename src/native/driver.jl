@@ -484,11 +484,7 @@ function _local_pot_box!(pot, s::DMKSetup, fv, ibox::Int, (lw, Abuf, Bbuf, stenc
                             mode = _pair_mode(T, sx, sy, sz, n)
                             mode == 0 && continue
                             if mode == 1
-                                f = view(fv, :, :, :, ind, jbox)
-                                tabs = (view(T.tab, :, :, sx), view(T.tab, :, :, sy), view(T.tab, :, :, sz))
-                                tabsT = (view(T.tabT, :, :, sx), view(T.tabT, :, :, sy), view(T.tabT, :, :, sz))
-                                inds = (view(T.ind, :, :, sx), view(T.ind, :, :, sy), view(T.ind, :, :, sz))
-                                local_pot!(potb, f, wd, tabs, tabsT, inds, n, lw)
+                                local_sparse!((potb,), view(fv, :, :, :, ind, jbox), wd, T, sx, sy, sz, n, 1, lw)
                                 continue
                             end
                             # stage x: A += Tx' f
@@ -519,12 +515,17 @@ function _local_pot_box!(pot, s::DMKSetup, fv, ibox::Int, (lw, Abuf, Bbuf, stenc
         sz = _loctab_slot(ft.centers[3, ibox], ft.centers[3, jbox], bs)
         for id in _local_jstart(s, ibox, jbox, ilev, jlev):iend
             T = tabsl[id]::LocTab1D
-            tabs = (view(T.tab, :, :, sx), view(T.tab, :, :, sy), view(T.tab, :, :, sz))
-            tabsT = (view(T.tabT, :, :, sx), view(T.tabT, :, :, sy), view(T.tabT, :, :, sz))
-            inds = (view(T.ind, :, :, sx), view(T.ind, :, :, sy), view(T.ind, :, :, sz))
+            mode = _pair_mode(T, sx, sy, sz, n)
+            mode == 0 && continue
             for ind in 1:nd
-                local_pot!(view(pot, :, :, :, ind, ibox), view(fv, :, :, :, ind, jbox), s.wdeltas[id],
-                           tabs, tabsT, inds, n, lw)
+                potb = view(pot, :, :, :, ind, ibox)
+                f = view(fv, :, :, :, ind, jbox)
+                if mode == 2
+                    tp3!(potb, f, view(T.tabT, :, :, sx), view(T.tab, :, :, sy), view(T.tab, :, :, sz),
+                         lw.w1, lw.w2, s.wdeltas[id], true)
+                else
+                    local_sparse!((potb,), f, s.wdeltas[id], T, sx, sy, sz, n, 1, lw)
+                end
             end
         end
     end
@@ -533,6 +534,7 @@ end
 
 function _local_pgh_box!(pot, grad, hess, s::DMKSetup, fv, ibox::Int, lw::LocalWork)
     ft, n, nd, ifpgh = s.ft, s.n, s.nd, s.ifpgh
+    ncomb = _ncombos(ifpgh)
     ilev = ft.level[ibox]
     iend = _ldelta(s, ilev)
     tabsl = s.loctabs[ilev + 1]
@@ -545,14 +547,9 @@ function _local_pgh_box!(pot, grad, hess, s::DMKSetup, fv, ibox::Int, lw::LocalW
         sz = _loctab_slot(ft.centers[3, ibox], ft.centers[3, jbox], bs)
         for id in _local_jstart(s, ibox, jbox, ilev, jlev):iend
             T = tabsl[id]::LocTab1D
-            inds = (view(T.ind, :, :, sx), view(T.ind, :, :, sy), view(T.ind, :, :, sz))
-            tabs = ntuple(3) do d
-                A = d == 1 ? T.tab : (d == 2 ? T.tabx : T.tabxx)
-                (view(A, :, :, sx), view(A, :, :, sy), view(A, :, :, sz))
-            end
             for ind in 1:nd
-                local_pgh!(_box_outs(pot, grad, hess, ind, ibox, ifpgh), view(fv, :, :, :, ind, jbox),
-                           s.wdeltas[id], tabs, inds, n, ifpgh, lw)
+                local_sparse!(_box_outs(pot, grad, hess, ind, ibox, ifpgh), view(fv, :, :, :, ind, jbox),
+                              s.wdeltas[id], T, sx, sy, sz, n, ncomb, lw)
             end
         end
     end
