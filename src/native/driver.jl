@@ -33,6 +33,11 @@ struct DMKSetup
     p2cT::NTuple{2,Matrix{Float64}}
     c2p::NTuple{2,Matrix{Float64}}
     c2pT::NTuple{2,Matrix{Float64}}
+    # leaf children: c2p ∘ den2pc (porder × n) and poteval ∘ p2c (n × porder)
+    c2pf::NTuple{2,Matrix{Float64}}
+    c2pfT::NTuple{2,Matrix{Float64}}
+    p2cf::NTuple{2,Matrix{Float64}}
+    p2cfT::NTuple{2,Matrix{Float64}}
     prox::Ortho1D
     loctabs::Vector{Vector{Union{Nothing,LocTab1D}}}   # [ilev+1][id]
     pwlevels::Vector{Union{Nothing,PWLevel}}            # [ilev+1]
@@ -132,7 +137,9 @@ function DMKSetup(tree::BoxTree, nd::Int, kernel::AbstractKernel, eps::Float64, 
     return DMKSetup(ft, nd, n, porder, ifpgh, eps, deltas, wdeltas, r0, ipwaddr, idelta, ifpwexp,
                     nlistpw, listpw, list1_ptr, list1, inp, D1, D2, Matrix(transpose(D1)), Matrix(transpose(D2)), den2pc, Matrix(transpose(den2pc)),
                     poteval, Matrix(transpose(poteval)), p2c, map(m -> Matrix(transpose(m)), p2c),
-                    c2p, map(m -> Matrix(transpose(m)), c2p), prox,
+                    c2p, map(m -> Matrix(transpose(m)), c2p),
+                    map(m -> m * den2pc, c2p), map(m -> Matrix(transpose(m * den2pc)), c2p),
+                    map(m -> poteval * m, p2c), map(m -> Matrix(transpose(poteval * m)), p2c), prox,
                     loctabs, pwlevels, taylor)
 end
 
@@ -269,6 +276,7 @@ function step3_upward!(pc, nodeidx, s::DMKSetup, fv)
     wss = make_workspaces(() -> TPWork(max(p, n)^3))
     for ilev in ft.nlevels:-1:0
         boxes = [ibox for ibox in levelboxes(ft, ilev) if nodeidx[ibox] > 0]
+        sc3 = ilev < ft.nlevels ? (ft.boxsize[ilev + 2] / 2)^3 : 0.0
         parallel_foreach(boxes, wss) do ibox, w
             k = nodeidx[ibox]
             for ind in 1:nd
@@ -276,15 +284,12 @@ function step3_upward!(pc, nodeidx, s::DMKSetup, fv)
                 if ft.nchild[ibox] == 0
                     _leaf_charge!(out, s, fv, ind, ibox, w)
                 else
-                    qs = function (slot)
-                        c = ft.child[slot, ibox]
-                        c == 0 && return nothing
-                        nodeidx[c] > 0 && return view(pc, :, ind, nodeidx[c])
-                        t = w.tmp[slot]
-                        _leaf_charge!(t, s, fv, ind, c, w)
-                        return t
-                    end
-                    children2parent!(out, qs, s.c2p, s.c2pT, s.c2pT, s.porder, w.w1, w.w2, false)
+                    # nonleaf children from their proxy charges, leaf children
+                    # straight from their grid values
+                    qn = slot -> (c = ft.child[slot, ibox]; (c == 0 || nodeidx[c] == 0) ? nothing : view(pc, :, ind, nodeidx[c]))
+                    ql = slot -> (c = ft.child[slot, ibox]; (c == 0 || nodeidx[c] > 0) ? nothing : view(fv, :, :, :, ind, c))
+                    children2parent!(out, qn, s.c2p, s.c2pT, s.c2pT, p, p, w.w1, w.w2, false)
+                    children2parent!(out, ql, s.c2pf, s.c2pfT, s.c2pfT, n, p, w.w1, w.w2, true, sc3)
                 end
             end
         end
@@ -380,20 +385,11 @@ function steps456_planewave!(pot, grad, hess, pp, pc, nodeidx, s::DMKSetup, fv)
         parents = [ibox for ibox in boxes if ft.nchild[ibox] > 0]
         parallel_foreach(parents, tpw) do ibox, w
             for ind in 1:nd, c in 1:ncomb
-                outs = function (slot)
-                    ch = ft.child[slot, ibox]
-                    ch == 0 && return nothing
-                    nodeidx[ch] > 0 && return view(pp, :, ind, c, nodeidx[ch])
-                    t = w.tmp[slot]
-                    fill!(t, 0.0)
-                    return t
-                end
-                parent2children!(outs, view(pp, :, ind, c, nodeidx[ibox]), s.p2c, s.p2cT, s.p2cT, p, w.w1, w.w2)
-                for slot in 1:8
-                    ch = ft.child[slot, ibox]
-                    (ch == 0 || nodeidx[ch] > 0) && continue
-                    _proxy_eval!(_outview(pot, grad, hess, ind, c, ch), w.tmp[slot], s, w)
-                end
+                phi = view(pp, :, ind, c, nodeidx[ibox])
+                on = slot -> (ch = ft.child[slot, ibox]; (ch == 0 || nodeidx[ch] == 0) ? nothing : view(pp, :, ind, c, nodeidx[ch]))
+                ol = slot -> (ch = ft.child[slot, ibox]; (ch == 0 || nodeidx[ch] > 0) ? nothing : _outview(pot, grad, hess, ind, c, ch))
+                parent2children!(on, phi, s.p2c, s.p2cT, s.p2cT, p, p, w.w1, w.w2)
+                parent2children!(ol, phi, s.p2cf, s.p2cfT, s.p2cfT, p, s.n, w.w1, w.w2)
             end
         end
     end

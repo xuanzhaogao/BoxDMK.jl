@@ -85,13 +85,15 @@ function _worker(f::F, items, ws, counter, n) where {F}
 end
 
 # Children -> parent anterpolation, sharing stages among the 8 children:
-# out (+)= Σ_children (A[sx] ⊗ B[sy] ⊗ C[sz]) q_child with the z stage applied
-# per child, the y stage per (sx, sy) and the x stage per sx.
-# qs(slot) returns the child's p³ data (or nothing), slot = 1 + sx' + 2sy' + 4sz'.
+# out (+)= α Σ_children (A[sx] ⊗ B[sy] ⊗ C[sz]) q_child with the z stage applied
+# per child, the y stage per (sx, sy) and the x stage per sx. Children are of
+# order mi, the parent of order mo: A[s] (mo × mi), Bt[s] = B[s]' and
+# Ct[s] = C[s]' (mi × mo). qs(slot) returns a child's data or nothing,
+# slot = 1 + sx' + 2sy' + 4sz'. Z, Y need mi*mi*mo and mi*mo*mo entries.
 function children2parent!(out::AbstractArray{Float64}, qs::F, A::NTuple{2,Matrix{Float64}},
-                          Bt::NTuple{2,Matrix{Float64}}, Ct::NTuple{2,Matrix{Float64}}, p::Int,
-                          Z::Vector{Float64}, Y::Vector{Float64}, add::Bool) where {F}
-    pp = p * p
+                          Bt::NTuple{2,Matrix{Float64}}, Ct::NTuple{2,Matrix{Float64}}, mi::Int, mo::Int,
+                          Z::Vector{Float64}, Y::Vector{Float64}, add::Bool, α::Float64 = 1.0) where {F}
+    mii = mi * mi
     started = add
     GC.@preserve out Z Y A Bt Ct begin
         pZ = pointer(Z); pY = pointer(Y)
@@ -102,15 +104,15 @@ function children2parent!(out::AbstractArray{Float64}, qs::F, A::NTuple{2,Matrix
                 for sz in 1:2
                     q = qs(1 + (sx - 1) + 2 * (sy - 1) + 4 * (sz - 1))
                     q === nothing && continue
-                    GC.@preserve q gemm!(pZ, pp, pointer(q), pp, pointer(Ct[sz]), p, pp, p, p, 1.0, haveZ)
+                    GC.@preserve q gemm!(pZ, mii, pointer(q), mii, pointer(Ct[sz]), mi, mii, mo, mi, 1.0, haveZ)
                     haveZ = true
                 end
                 haveZ || continue
-                gemm_batch!(pY, p, pp, pZ, p, pp, pointer(Bt[sy]), p, p, p, p, p, 1.0, haveY)
+                gemm_batch!(pY, mi, mi * mo, pZ, mi, mii, pointer(Bt[sy]), mi, mi, mo, mi, mo, 1.0, haveY)
                 haveY = true
             end
             haveY || continue
-            gemm!(pointer(out), p, pointer(A[sx]), p, pY, p, p, pp, p, 1.0, started)
+            gemm!(pointer(out), mo, pointer(A[sx]), mo, pY, mi, mo, mo * mo, mi, α, started)
             started = true
         end
         started || fill!(out, 0.0)
@@ -119,21 +121,31 @@ function children2parent!(out::AbstractArray{Float64}, qs::F, A::NTuple{2,Matrix
 end
 
 # Parent -> children interpolation, sharing stages: x per sx, y per (sx, sy),
-# z per child. outs(slot) returns the child's p³ output (or nothing); added to.
+# z per child. Parent of order mi, children of order mo; A[s] (mo × mi),
+# Bt[s], Ct[s] (mi × mo). outs(slot) returns a child's output (added to) or
+# nothing. X, Y need mo*mi*mi and mo*mo*mi entries.
 function parent2children!(outs::F, phi::AbstractArray{Float64}, A::NTuple{2,Matrix{Float64}},
-                          Bt::NTuple{2,Matrix{Float64}}, Ct::NTuple{2,Matrix{Float64}}, p::Int,
+                          Bt::NTuple{2,Matrix{Float64}}, Ct::NTuple{2,Matrix{Float64}}, mi::Int, mo::Int,
                           X::Vector{Float64}, Y::Vector{Float64}) where {F}
-    pp = p * p
+    moo = mo * mo
     GC.@preserve phi X Y A Bt Ct begin
         pX = pointer(X); pY = pointer(Y)
         for sx in 1:2
-            gemm!(pX, p, pointer(A[sx]), p, pointer(phi), p, p, pp, p, 1.0, false)
+            computed = false
             for sy in 1:2
-                gemm_batch!(pY, p, pp, pX, p, pp, pointer(Bt[sy]), p, p, p, p, p, 1.0, false)
+                haveY = false
                 for sz in 1:2
                     o = outs(1 + (sx - 1) + 2 * (sy - 1) + 4 * (sz - 1))
                     o === nothing && continue
-                    GC.@preserve o gemm!(pointer(o), pp, pY, pp, pointer(Ct[sz]), p, pp, p, p, 1.0, true)
+                    if !computed
+                        gemm!(pX, mo, pointer(A[sx]), mo, pointer(phi), mi, mo, mi * mi, mi, 1.0, false)
+                        computed = true
+                    end
+                    if !haveY
+                        gemm_batch!(pY, mo, moo, pX, mo, mo * mi, pointer(Bt[sy]), mi, mo, mo, mi, mi, 1.0, false)
+                        haveY = true
+                    end
+                    GC.@preserve o gemm!(pointer(o), moo, pY, moo, pointer(Ct[sz]), mi, moo, mo, mi, 1.0, true)
                 end
             end
         end
