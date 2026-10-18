@@ -53,16 +53,15 @@ end
         boxlen = 1.0,
         nd = 1,
     )
-    # Native solver lists, mapped back to BoxTree box numbers.
+    # Native solver lists (BoxTree box numbering).
     ft = BoxDMK.FlatTree(tree)
     ptr, flat = BoxDMK.compute_list1(ft)
     nlistpw, listpw = BoxDMK.compute_listpw(ft)
     nboxes = size(tree.centers, 2)
     lists = (list1 = [Int[] for _ in 1:nboxes], listpw = [Int[] for _ in 1:nboxes])
-    for k in 1:nboxes
-        ibox = ft.perm[k]
-        append!(lists.list1[ibox], ft.perm[flat[ptr[k]:(ptr[k + 1] - 1)]])
-        append!(lists.listpw[ibox], ft.perm[listpw[1:nlistpw[k], k]])
+    for ibox in 1:nboxes
+        append!(lists.list1[ibox], flat[ptr[ibox]:(ptr[ibox + 1] - 1)])
+        append!(lists.listpw[ibox], listpw[1:nlistpw[ibox], ibox])
     end
     @test sum(length, lists.list1) > 0
 

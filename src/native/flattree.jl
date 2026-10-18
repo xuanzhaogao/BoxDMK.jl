@@ -2,10 +2,13 @@
 # (Fortran `bdmk_find_all_pwexp_boxes`, `bdmk_compute_all_listpw`,
 # `bdmk_compute_all_modified_list1`).
 
+# Boxes keep the BoxTree numbering (box 1 is the root); `levelorder` lists
+# them sorted by level and laddr gives each level's range in it.
 struct FlatTree
     nboxes::Int
     nlevels::Int
-    laddr::Matrix{Int}          # (2, nlevels+1): first/last box of each level
+    levelorder::Vector{Int}
+    laddr::Matrix{Int}          # (2, nlevels+1): range of each level in levelorder
     level::Vector{Int}
     parent::Vector{Int}         # 0 for the root
     nchild::Vector{Int}
@@ -14,58 +17,50 @@ struct FlatTree
     coll::Matrix{Int}           # (27, nboxes)
     centers::Matrix{Float64}    # (3, nboxes)
     boxsize::Vector{Float64}    # boxsize[ilev+1]
-    perm::Vector{Int}           # flat box -> BoxTree box
 end
 
-levelboxes(ft::FlatTree, ilev::Int) = ft.laddr[1, ilev + 1]:ft.laddr[2, ilev + 1]
+levelboxes(ft::FlatTree, ilev::Int) = view(ft.levelorder, ft.laddr[1, ilev + 1]:ft.laddr[2, ilev + 1])
 isleafbox(ft::FlatTree, ibox::Int) = ft.nchild[ibox] == 0
 
 function FlatTree(tree::BoxTree)
     tree.ndim == 3 || throw(ArgumentError("the native solver supports ndim = 3 only"))
     nb = nboxes(tree)
     nl = tree.nlevels
-    perm = sortperm(collect(1:nb); by = ibox -> (tree.level[ibox], ibox))
-    inv = zeros(Int, nb)
-    for (new, old) in pairs(perm)
-        inv[old] = new
-    end
-
+    tree.level[1] == 0 || throw(ArgumentError("box 1 must be the root"))
+    order = sortperm(collect(1:nb); by = ibox -> (tree.level[ibox], ibox))
     laddr = zeros(Int, 2, nl + 1)
-    level = tree.level[perm]
+    sorted_levels = tree.level[order]
     for ilev in 0:nl
-        r = searchsorted(level, ilev)
+        r = searchsorted(sorted_levels, ilev)
         laddr[1, ilev + 1] = first(r)
         laddr[2, ilev + 1] = last(r)
     end
 
-    centers = Matrix{Float64}(tree.centers[:, perm])
-    parent = zeros(Int, nb)
+    centers = Matrix{Float64}(tree.centers)
+    level = copy(tree.level)
+    parent = copy(tree.parent)
     nchild = zeros(Int, nb)
     child = zeros(Int, 8, nb)
     ncoll = zeros(Int, nb)
     coll = zeros(Int, 27, nb)
-    for new in 1:nb
-        old = perm[new]
-        p = tree.parent[old]
-        parent[new] = p == 0 ? 0 : inv[p]
-        for c in @view tree.children[:, old]
+    for ibox in 1:nb
+        for c in @view tree.children[:, ibox]
             c == 0 && continue
-            cn = inv[c]
             slot = 1
-            centers[1, cn] > centers[1, new] && (slot += 1)
-            centers[2, cn] > centers[2, new] && (slot += 2)
-            centers[3, cn] > centers[3, new] && (slot += 4)
-            child[slot, new] = cn
-            nchild[new] += 1
+            centers[1, c] > centers[1, ibox] && (slot += 1)
+            centers[2, c] > centers[2, ibox] && (slot += 2)
+            centers[3, c] > centers[3, ibox] && (slot += 4)
+            child[slot, ibox] = c
+            nchild[ibox] += 1
         end
-        cl = tree.colleagues[old]
-        ncoll[new] = length(cl)
+        cl = tree.colleagues[ibox]
+        ncoll[ibox] = length(cl)
         for (j, c) in enumerate(cl)
-            coll[j, new] = inv[c]
+            coll[j, ibox] = c
         end
     end
     boxsize = Float64.(tree.boxsize)
-    return FlatTree(nb, nl, laddr, level, parent, nchild, child, ncoll, coll, centers, boxsize, perm)
+    return FlatTree(nb, nl, order, laddr, level, parent, nchild, child, ncoll, coll, centers, boxsize)
 end
 
 # Boxes that need plane-wave expansions: the root, every nonleaf box, and

@@ -143,16 +143,6 @@ function DMKSetup(tree::BoxTree, nd::Int, kernel::AbstractKernel, eps::Float64, 
                     loctabs, pwlevels, taylor)
 end
 
-# Density derivative data on the leaves (STEP 2 inputs reused by STEP 8).
-struct DensityDerivs
-    flv::Array{Float64,5}           # Δf
-    fl2v::Array{Float64,5}          # Δ²f
-    g::Array{Float64,6}             # ∇f      (n,n,n,nd,3,nb) or empty
-    gl::Array{Float64,6}            # Δ∇f
-    h::Array{Float64,6}             # ∇∇f     (n,n,n,nd,6,nb) or empty
-    hl::Array{Float64,6}            # Δ∇∇f
-end
-
 leafboxes(ft::FlatTree) = [ibox for ibox in 1:ft.nboxes if ft.nchild[ibox] == 0]
 
 function _laplacian!(out, f, s::DMKSetup, sc2)
@@ -165,64 +155,58 @@ end
 
 const _HESS_DIRS = ((1, 1), (2, 2), (3, 3), (1, 2), (1, 3), (2, 3))
 
-function step2_taylor!(pot, grad, hess, s::DMKSetup, fv)
+# STEPS 2 and 8 together: the local Taylor correction c0 f + c1 Δf + c2 Δ²f
+# and the asymptotic expansion of the narrowest Gaussians, a0 f + a2 Δf + a4 Δ²f
+# (gradient/hessian: first two terms of each), are both linear in the same
+# derivatives of the density, so they are applied in one pass per leaf.
+function step2_local_expansions!(pot, grad, hess, s::DMKSetup, fv)
     ft, n, nd, ifpgh = s.ft, s.n, s.nd, s.ifpgh
-    nb = ft.nboxes
     c0, c1, c2 = s.taylor
-    # only leaf entries are written and read
-    flv = Array{Float64}(undef, n, n, n, nd, nb)
-    fl2v = Array{Float64}(undef, n, n, n, nd, nb)
-    ng = ifpgh >= 2 ? nb : 0
-    nh = ifpgh >= 3 ? nb : 0
-    g = Array{Float64}(undef, n, n, n, nd, 3, ng); gl = Array{Float64}(undef, n, n, n, nd, 3, ng)
-    h = Array{Float64}(undef, n, n, n, nd, 6, nh); hl = Array{Float64}(undef, n, n, n, nd, 6, nh)
-    wss = make_workspaces(() -> Array{Float64}(undef, n, n, n))
-    parallel_foreach(leafboxes(ft), wss) do ibox, tmp
-        sc = 2.0 / ft.boxsize[ft.level[ibox] + 1]
+    asym = [s.idelta[ilev + 1] > 0 ? _asym_coefs(s, s.idelta[ilev + 1]) : (0.0, 0.0, 0.0) for ilev in 0:ft.nlevels]
+    wss = make_workspaces(() -> ntuple(_ -> Array{Float64}(undef, n, n, n), 5))
+    parallel_foreach(leafboxes(ft), wss) do ibox, (fl, fl2, gd, gld, tmp)
+        ilev = ft.level[ibox]
+        a0, a2, a4 = asym[ilev + 1]
+        b0 = c0 + a0; b1 = c1 + a2; b2 = c2 + a4
+        sc = 2.0 / ft.boxsize[ilev + 1]
         sc2 = sc * sc
         for ind in 1:nd
             f = view(fv, :, :, :, ind, ibox)
-            fl = view(flv, :, :, :, ind, ibox)
-            fl2 = view(fl2v, :, :, :, ind, ibox)
             _laplacian!(fl, f, s, sc2)
             _laplacian!(fl2, fl, s, sc2)
             pb = view(pot, :, :, :, ind, ibox)
             @inbounds @simd for i in eachindex(pb)
-                pb[i] = c0 * f[i] + c1 * fl[i] + c2 * fl2[i]
+                pb[i] = b0 * f[i] + b1 * fl[i] + b2 * fl2[i]
             end
             if ifpgh >= 2
                 for d in 1:3
-                    gd = view(g, :, :, :, ind, d, ibox)
-                    gld = view(gl, :, :, :, ind, d, ibox)
                     apply_dim!(gd, f, s.D1, s.D1T, d, n, sc, false)
                     _laplacian!(gld, gd, s, sc2)
                     gb = view(grad, :, :, :, ind, d, ibox)
                     @inbounds @simd for i in eachindex(gb)
-                        gb[i] = c0 * gd[i] + c1 * gld[i]
+                        gb[i] = b0 * gd[i] + b1 * gld[i]
                     end
                 end
             end
             if ifpgh >= 3
                 for m in 1:6
                     d1, d2 = _HESS_DIRS[m]
-                    hm = view(h, :, :, :, ind, m, ibox)
-                    hlm = view(hl, :, :, :, ind, m, ibox)
                     if d1 == d2
-                        apply_dim!(hm, f, s.D2, s.D2T, d1, n, sc2, false)
+                        apply_dim!(gd, f, s.D2, s.D2T, d1, n, sc2, false)
                     else
                         apply_dim!(tmp, f, s.D1, s.D1T, d1, n, sc, false)
-                        apply_dim!(hm, tmp, s.D1, s.D1T, d2, n, sc, false)
+                        apply_dim!(gd, tmp, s.D1, s.D1T, d2, n, sc, false)
                     end
-                    _laplacian!(hlm, hm, s, sc2)
+                    _laplacian!(gld, gd, s, sc2)
                     hb = view(hess, :, :, :, ind, m, ibox)
                     @inbounds @simd for i in eachindex(hb)
-                        hb[i] = c0 * hm[i] + c1 * hlm[i]
+                        hb[i] = b0 * gd[i] + b1 * gld[i]
                     end
                 end
             end
         end
     end
-    return DensityDerivs(flv, fl2v, g, gl, h, hl)
+    return nothing
 end
 
 _childsides(slot::Int) = (((slot - 1) & 1) + 1, (((slot - 1) >> 1) & 1) + 1, (((slot - 1) >> 2) & 1) + 1)
@@ -592,53 +576,6 @@ function _asym_coefs(s::DMKSetup, nas::Int)
     return c0, c2, c4
 end
 
-function step8_asymptotic!(pot, grad, hess, s::DMKSetup, fv, dd::DensityDerivs)
-    ft = s.ft
-    for ilev in 0:ft.nlevels
-        nas = s.idelta[ilev + 1]
-        nas > 0 || continue
-        coefs = _asym_coefs(s, nas)
-        boxes = [ibox for ibox in levelboxes(ft, ilev) if ft.nchild[ibox] == 0]
-        parallel_foreach(boxes, [nothing for _ in 1:_nthreads()]) do ibox, _
-            _asym_box!(pot, grad, hess, s, fv, dd, coefs, ibox)
-        end
-    end
-    return nothing
-end
-
-function _asym_box!(pot, grad, hess, s::DMKSetup, fv, dd::DensityDerivs, (c0, c2, c4), ibox::Int)
-    for ind in 1:s.nd
-        pb = view(pot, :, :, :, ind, ibox)
-        f = view(fv, :, :, :, ind, ibox)
-        fl = view(dd.flv, :, :, :, ind, ibox)
-        fl2 = view(dd.fl2v, :, :, :, ind, ibox)
-        @inbounds @simd for i in eachindex(pb)
-            pb[i] += c0 * f[i] + c2 * fl[i] + c4 * fl2[i]
-        end
-        if s.ifpgh >= 2
-            for d in 1:3
-                gb = view(grad, :, :, :, ind, d, ibox)
-                g = view(dd.g, :, :, :, ind, d, ibox)
-                gl = view(dd.gl, :, :, :, ind, d, ibox)
-                @inbounds @simd for i in eachindex(gb)
-                    gb[i] += c0 * g[i] + c2 * gl[i]
-                end
-            end
-        end
-        if s.ifpgh >= 3
-            for m in 1:6
-                hb = view(hess, :, :, :, ind, m, ibox)
-                h = view(dd.h, :, :, :, ind, m, ibox)
-                hl = view(dd.hl, :, :, :, ind, m, ibox)
-                @inbounds @simd for i in eachindex(hb)
-                    hb[i] += c0 * h[i] + c2 * hl[i]
-                end
-            end
-        end
-    end
-    return nothing
-end
-
 # Leaves with stored proxy potential (only a leaf root): proxy -> grid values.
 function step9_proxy2pot!(pot, grad, hess, pp, nodeidx, s::DMKSetup)
     ft, n, nd, p = s.ft, s.n, s.nd, s.porder
@@ -749,15 +686,20 @@ function _bdmk_native(tree::BoxTree, fvals::AbstractArray{<:Real,3}, kernel::Abs
     s = DMKSetup(tree, nd, kernel, eps, ifpgh)
     ft, n, p = s.ft, s.n, s.porder
     nb = ft.nboxes
-    fv = Array{Float64,5}(undef, n, n, n, nd, nb)
-    fv3 = reshape(fv, np, nd, nb)
-    parallel_foreach(1:nb, fill(nothing, _nthreads())) do ibox, _
-        src = ft.perm[ibox]
-        for ind in 1:nd
-            @inbounds for j in 1:np
-                fv3[j, ind, ibox] = fvals[ind, j, src]
+    # Box data are (n, n, n, nd, nboxes); for nd = 1 that is the layout of fvals.
+    fv = if nd == 1 && fvals isa Array{Float64,3}
+        reshape(fvals, n, n, n, 1, nb)
+    else
+        a = Array{Float64,5}(undef, n, n, n, nd, nb)
+        a3 = reshape(a, np, nd, nb)
+        parallel_foreach(1:nb, fill(nothing, _nthreads())) do ibox, _
+            for ind in 1:nd
+                @inbounds for j in 1:np
+                    a3[j, ind, ibox] = fvals[ind, j, ibox]
+                end
             end
         end
+        a
     end
     ng = ifpgh >= 2 ? nb : 0
     nh = ifpgh >= 3 ? nb : 0
@@ -774,7 +716,7 @@ function _bdmk_native(tree::BoxTree, fvals::AbstractArray{<:Real,3}, kernel::Abs
     tm[1] = (time_ns() - t0) / 1e9
 
     t0 = time_ns()
-    dd = step2_taylor!(pot, gradv, hessv, s, fv)
+    step2_local_expansions!(pot, gradv, hessv, s, fv)
     tm[2] = (time_ns() - t0) / 1e9
 
     t0 = time_ns()
@@ -792,9 +734,6 @@ function _bdmk_native(tree::BoxTree, fvals::AbstractArray{<:Real,3}, kernel::Abs
     step7_local!(pot, gradv, hessv, s, fv)
     tm[7] = (time_ns() - t0) / 1e9
 
-    t0 = time_ns()
-    step8_asymptotic!(pot, gradv, hessv, s, fv, dd)
-    tm[8] = (time_ns() - t0) / 1e9
 
     t0 = time_ns()
     step9_proxy2pot!(pot, gradv, hessv, pp, nodeidx, s)
@@ -818,13 +757,13 @@ function _bdmk_native(tree::BoxTree, fvals::AbstractArray{<:Real,3}, kernel::Abs
 end
 
 function _unflatten(a::Array{Float64,5}, ft::FlatTree, nd::Int, np::Int)
+    nd == 1 && return reshape(a, 1, np, ft.nboxes)
     out = Array{Float64}(undef, nd, np, ft.nboxes)
     a3 = reshape(a, np, nd, ft.nboxes)
     parallel_foreach(1:ft.nboxes, fill(nothing, _nthreads())) do ibox, _
-        dst = ft.perm[ibox]
         for ind in 1:nd
             @inbounds for j in 1:np
-                out[ind, j, dst] = a3[j, ind, ibox]
+                out[ind, j, ibox] = a3[j, ind, ibox]
             end
         end
     end
@@ -836,10 +775,9 @@ function _unflatten(a::Array{Float64,6}, ft::FlatTree, nd::Int, np::Int)
     out = Array{Float64}(undef, nd, nc, np, ft.nboxes)
     a4 = reshape(a, np, nd, nc, ft.nboxes)
     parallel_foreach(1:ft.nboxes, fill(nothing, _nthreads())) do ibox, _
-        dst = ft.perm[ibox]
         for c in 1:nc, ind in 1:nd
             @inbounds for j in 1:np
-                out[ind, c, j, dst] = a4[j, ind, c, ibox]
+                out[ind, c, j, ibox] = a4[j, ind, c, ibox]
             end
         end
     end
