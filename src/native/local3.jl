@@ -79,9 +79,10 @@ struct LocalWork
     w2::Vector{Float64}
 end
 
-LocalWork(n::Int) = LocalWork(zeros(n, n, n), zeros(n, n, n),
-                              [zeros(n, n, n) for _ in 1:3], [zeros(n, n, n) for _ in 1:6],
-                              zeros(n^3), zeros(n^3))
+# Buffers are only read where they were written, so they start uninitialized.
+LocalWork(n::Int) = LocalWork(Array{Float64}(undef, n, n, n), Array{Float64}(undef, n, n, n),
+                              [Array{Float64}(undef, n, n, n) for _ in 1:3], [Array{Float64}(undef, n, n, n) for _ in 1:6],
+                              Vector{Float64}(undef, n^3), Vector{Float64}(undef, n^3))
 
 # pot += w * (Tx ⊗ Ty ⊗ Tz) f   (Fortran `tens_prod_to_potloc_3d`).
 # tabs = (Tx, Ty, Tz) as (j, k) tables, tabsT their transposes, inds the patterns.

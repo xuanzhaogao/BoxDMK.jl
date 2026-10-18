@@ -75,15 +75,19 @@ end
 function PWWork(npw::Int, porder::Int)
     nh = npw ÷ 2
     p = porder
-    PWWork(zeros(p * p * npw), zeros(p * npw), zeros(p * npw),
-           zeros(p * npw * nh), zeros(p * npw * nh), zeros(npw * npw * nh), zeros(npw * npw * nh),
-           [zeros(p * npw * nh) for _ in 1:3], [zeros(p * npw * nh) for _ in 1:3],
-           [zeros(p * p * npw) for _ in 1:6], zeros(npw * npw * nh), zeros(npw * npw * nh))
+    u(m) = Vector{Float64}(undef, m)     # every buffer is written before it is read
+    PWWork(u(p * p * npw), u(p * npw), u(p * npw),
+           u(p * npw * nh), u(p * npw * nh), u(npw * npw * nh), u(npw * npw * nh),
+           [u(p * npw * nh) for _ in 1:3], [u(p * npw * nh) for _ in 1:3],
+           [u(p * p * npw) for _ in 1:6], u(npw * npw * nh), u(npw * npw * nh))
 end
 
-# Outgoing expansion of real proxy coefficients q (porder^3).
+# Outgoing expansion of real proxy coefficients q (porder^3), optionally
+# multiplied by the kernel's Fourier transform (kmul).
+#
+# The expansion entry (u, col) is stored at pwr[off0 + (col-1)*cs + u].
 function proxy2pw!(pwr::AbstractVector{Float64}, pwi::AbstractVector{Float64}, q::AbstractVector{Float64},
-                   L::PWLevel, p::Int, w::PWWork)
+                   L::PWLevel, p::Int, w::PWWork, off0::Int = 0, cs::Int = L.npw, kmul::Bool = false)
     npw, nh = L.npw, L.nh
     pp = p * p
     ncol = npw * nh
@@ -116,14 +120,18 @@ function proxy2pw!(pwr::AbstractVector{Float64}, pwi::AbstractVector{Float64}, q
         gemm!(pointer(w.R1), npw, pointer(L.Ax), npw, pointer(F2r), p, npw, ncol, p, 1.0, false)
         gemm!(pointer(w.R2), npw, pointer(L.Ax), npw, pointer(F2i), p, npw, ncol, p, 1.0, false)
         R1 = w.R1; R2 = w.R2
+        kft = L.kernelft
         @inbounds for col in 0:(ncol - 1)
             o = col * npw
+            od = off0 + col * cs
             @simd for u in 1:nh
                 a = R1[o + u]; b = R2[o + nh + u]; c2 = R2[o + u]; d = R1[o + nh + u]
-                pwr[o + u] = a - b
-                pwi[o + u] = c2 + d
-                pwr[o + npw + 1 - u] = a + b
-                pwi[o + npw + 1 - u] = c2 - d
+                k1 = kmul ? kft[o + u] : 1.0
+                k2 = kmul ? kft[o + npw + 1 - u] : 1.0
+                pwr[od + u] = k1 * (a - b)
+                pwi[od + u] = k1 * (c2 + d)
+                pwr[od + npw + 1 - u] = k2 * (a + b)
+                pwi[od + npw + 1 - u] = k2 * (c2 - d)
             end
         end
     end
@@ -166,7 +174,7 @@ _ncombos(ifpgh::Int) = ifpgh == 1 ? 1 : (ifpgh == 2 ? 4 : 10)
 
 # outs[m] (porder^3) += 2 Re( Σ P_dx[u,x] P_dy[v,y] P_dz[c,z] pw[u,v,c] ) for combo m.
 function pw2proxy!(outs, pwr::AbstractVector{Float64}, pwi::AbstractVector{Float64},
-                   L::PWLevel, p::Int, ifpgh::Int, w::PWWork)
+                   L::PWLevel, p::Int, ifpgh::Int, w::PWWork, off0::Int = 0, cs::Int = L.npw)
     npw, nh = L.npw, L.nh
     pp = p * p
     ncol = npw * nh
@@ -177,9 +185,10 @@ function pw2proxy!(outs, pwr::AbstractVector{Float64}, pwi::AbstractVector{Float
         Br = w.R1; Bi = w.R2
         @inbounds for col in 0:(ncol - 1)
             o = col * npw
+            od = off0 + col * cs
             @simd for u in 1:nh
-                ar = pwr[o + u]; ai = pwi[o + u]
-                br = pwr[o + npw + 1 - u]; bi = pwi[o + npw + 1 - u]
+                ar = pwr[od + u]; ai = pwi[od + u]
+                br = pwr[od + npw + 1 - u]; bi = pwi[od + npw + 1 - u]
                 Br[o + u] = ar + br
                 Br[o + nh + u] = bi - ai
                 Bi[o + u] = ai + bi
@@ -221,6 +230,59 @@ function pw2proxy!(outs, pwr::AbstractVector{Float64}, pwi::AbstractVector{Float
             dz = _PGH_COMBOS[m][3]
             out = outs[m]
             gemm!(pointer(out), pp, pointer(w.G2[_PGH_XYIDX[m]]), pp, pointer(L.Bc[dz + 1]), npw, pp, p, npw, 1.0, true)
+        end
+    end
+    return nothing
+end
+
+# Sources of the plane-wave translation at one level, CSR by target:
+# srck = source column, srcd = 1 + (dx+1) + 3(dy+1) + 9(dz+1) for the
+# offset target - source (self included with offset 0).
+struct M2LList
+    ptr::Vector{Int}
+    k::Vector{Int}
+    d::Vector{Int}
+end
+
+# loc[:, ind, t, col] = Σ_sources shift(t - s) ⊙ mp[:, ind, s, col] for the
+# frequency columns `cols` (a column is the npw x-frequencies at fixed (v, c));
+# expansions are stored as (npw, nd, nboxes, ncols) so that a column of all
+# boxes is contiguous. Shift factors are grouped by dx:
+# loc = Σ_dx wx_dx ⊙ (Σ_{s: dx} (wy wz)_s mp_s).
+function m2l_columns!(locr, loci, mpr, mpi, lst::M2LList, L::PWLevel, nd::Int, ntarg::Int,
+                      cols::UnitRange{Int}, acc::Vector{Float64})
+    npw = L.npw
+    Sr, Si = L.shift_re, L.shift_im
+    @inbounds for col in cols
+        v = (col - 1) % npw + 1
+        cz = (col - 1) ÷ npw + 1
+        for t in 1:ntarg, ind in 1:nd
+            fill!(acc, 0.0)
+            for q in lst.ptr[t]:(lst.ptr[t + 1] - 1)
+                ks = lst.k[q]
+                dd = lst.d[q] - 1
+                kx = dd % 3; ky = (dd ÷ 3) % 3 + 1; kz = dd ÷ 9 + 1
+                yr = Sr[v, ky]; yi = Si[v, ky]; zr = Sr[cz, kz]; zi = Si[cz, kz]
+                sr = yr * zr - yi * zi
+                si = yr * zi + yi * zr
+                ab = 2 * npw * kx
+                @simd for u in 1:npw
+                    mr = mpr[u, ind, ks, col]; mi = mpi[u, ind, ks, col]
+                    acc[ab + u] = muladd(sr, mr, muladd(-si, mi, acc[ab + u]))
+                    acc[ab + npw + u] = muladd(sr, mi, muladd(si, mr, acc[ab + npw + u]))
+                end
+            end
+            @simd for u in 1:npw
+                lr = 0.0; li = 0.0
+                for kx in 0:2
+                    ar = acc[2 * npw * kx + u]; ai = acc[2 * npw * kx + npw + u]
+                    wr = Sr[u, kx + 1]; wi = Si[u, kx + 1]
+                    lr = muladd(wr, ar, muladd(-wi, ai, lr))
+                    li = muladd(wr, ai, muladd(wi, ar, li))
+                end
+                locr[u, ind, t, col] = lr
+                loci[u, ind, t, col] = li
+            end
         end
     end
     return nothing

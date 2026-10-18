@@ -161,13 +161,14 @@ function step2_taylor!(pot, grad, hess, s::DMKSetup, fv)
     ft, n, nd, ifpgh = s.ft, s.n, s.nd, s.ifpgh
     nb = ft.nboxes
     c0, c1, c2 = s.taylor
-    flv = zeros(n, n, n, nd, nb)
-    fl2v = zeros(n, n, n, nd, nb)
+    # only leaf entries are written and read
+    flv = Array{Float64}(undef, n, n, n, nd, nb)
+    fl2v = Array{Float64}(undef, n, n, n, nd, nb)
     ng = ifpgh >= 2 ? nb : 0
     nh = ifpgh >= 3 ? nb : 0
-    g = zeros(n, n, n, nd, 3, ng); gl = zeros(n, n, n, nd, 3, ng)
-    h = zeros(n, n, n, nd, 6, nh); hl = zeros(n, n, n, nd, 6, nh)
-    wss = [zeros(n, n, n) for _ in 1:_nthreads()]
+    g = Array{Float64}(undef, n, n, n, nd, 3, ng); gl = Array{Float64}(undef, n, n, n, nd, 3, ng)
+    h = Array{Float64}(undef, n, n, n, nd, 6, nh); hl = Array{Float64}(undef, n, n, n, nd, 6, nh)
+    wss = make_workspaces(() -> Array{Float64}(undef, n, n, n))
     parallel_foreach(leafboxes(ft), wss) do ibox, tmp
         sc = 2.0 / ft.boxsize[ft.level[ibox] + 1]
         sc2 = sc * sc
@@ -225,7 +226,7 @@ struct TPWork
     w4::Vector{Float64}
     tmp::Vector{Vector{Float64}}    # one p³ buffer per child slot
 end
-TPWork(m::Int) = TPWork(zeros(m), zeros(m), zeros(m), zeros(m), [zeros(m) for _ in 1:8])
+TPWork(m::Int) = (u = () -> Vector{Float64}(undef, m); TPWork(u(), u(), u(), u(), [u() for _ in 1:8]))
 
 # Proxy data is stored only for boxes with plane-wave expansions (every
 # nonleaf box and the leaves next to one); pwidx maps a box to its column.
@@ -254,7 +255,7 @@ end
 
 function step3_upward!(pc, pwidx, s::DMKSetup, fv)
     ft, n, nd, p = s.ft, s.n, s.nd, s.porder
-    wss = [TPWork(max(p, n)^3) for _ in 1:_nthreads()]
+    wss = make_workspaces(() -> TPWork(max(p, n)^3))
     for ilev in ft.nlevels:-1:0
         boxes = [ibox for ibox in levelboxes(ft, ilev) if pwidx[ibox] > 0]
         parallel_foreach(boxes, wss) do ibox, w
@@ -309,52 +310,50 @@ function steps456_planewave!(pot, grad, hess, pp, pc, pwidx, s::DMKSetup)
     end
 
     mpidx = zeros(Int, ft.nboxes)
-    tpw = [TPWork(p^3) for _ in 1:_nthreads()]
+    tpw = make_workspaces(() -> TPWork(p^3))
     # Workspaces and expansion storage are sized once for the busiest level
     # (all levels >= 0 share the same number of plane waves).
     npw = pw_terms(eps, 0)
     nexp = npw * npw * (npw ÷ 2)
     maxboxes = maximum(ilev -> count(ibox -> s.ifpwexp[ibox], levelboxes(ft, ilev)), 0:ft.nlevels)
-    mpr_all = Vector{Float64}(undef, nexp * nd * maxboxes)
-    mpi_all = Vector{Float64}(undef, nexp * nd * maxboxes)
-    wss = [PWWork(npw, p) for _ in 1:_nthreads()]
+    ncols = npw * (npw ÷ 2)
+    mpr = Array{Float64}(undef, npw, nd, maxboxes, ncols)
+    mpi = Array{Float64}(undef, npw, nd, maxboxes, ncols)
+    locr = Array{Float64}(undef, npw, nd, maxboxes, ncols)
+    loci = Array{Float64}(undef, npw, nd, maxboxes, ncols)
+    cs = npw * nd * maxboxes
+    wss = make_workspaces(() -> PWWork(npw, p))
+    accs = [zeros(6 * npw) for _ in 1:_nthreads()]
     for ilev in 0:ft.nlevels
         boxes = [ibox for ibox in levelboxes(ft, ilev) if s.ifpwexp[ibox]]
         isempty(boxes) && continue
         L = s.pwlevels[ilev + 1]
         if L !== nothing
+            nbl = length(boxes)
             for (k, ibox) in enumerate(boxes)
                 mpidx[ibox] = k
             end
-            mpr = reshape(view(mpr_all, 1:(L.nexp * nd * length(boxes))), L.nexp, nd, length(boxes))
-            mpi = reshape(view(mpi_all, 1:(L.nexp * nd * length(boxes))), L.nexp, nd, length(boxes))
+            @assert L.nexp == nexp
+            # outgoing expansions, premultiplied by the kernel's Fourier transform
+            mpr1 = vec(mpr); mpi1 = vec(mpi); locr1 = vec(locr); loci1 = vec(loci)
             parallel_foreach(boxes, wss) do ibox, w
                 k = mpidx[ibox]
                 for ind in 1:nd
-                    proxy2pw!(view(mpr, :, ind, k), view(mpi, :, ind, k), view(pc, :, ind, pwidx[ibox]), L, p, w)
+                    off0 = npw * ((ind - 1) + nd * (k - 1))
+                    proxy2pw!(mpr1, mpi1, view(pc, :, ind, pwidx[ibox]), L, p, w, off0, cs, true)
                 end
             end
-            xmin = ft.boxsize[ilev + 1]
+            lst = _m2l_list(s, boxes, mpidx, ft.boxsize[ilev + 1])
+            nchunk = min(ncols, 8 * _nthreads())
+            ranges = [(1 + div((i - 1) * ncols, nchunk)):div(i * ncols, nchunk) for i in 1:nchunk]
+            parallel_foreach(ranges, accs) do cols, acc
+                m2l_columns!(locr, loci, mpr, mpi, lst, L, nd, nbl, cols, acc)
+            end
             parallel_foreach(boxes, wss) do ibox, w
                 k = mpidx[ibox]
                 for ind in 1:nd
-                    locr, loci = w.locr, w.loci
-                    copyto!(locr, view(mpr, :, ind, k))
-                    copyto!(loci, view(mpi, :, ind, k))
-                    for j in 1:s.nlistpw[ibox]
-                        jbox = s.listpw[j, ibox]
-                        dx = round(Int, (ft.centers[1, ibox] - ft.centers[1, jbox]) / xmin)
-                        dy = round(Int, (ft.centers[2, ibox] - ft.centers[2, jbox]) / xmin)
-                        dz = round(Int, (ft.centers[3, ibox] - ft.centers[3, jbox]) / xmin)
-                        kj = mpidx[jbox]
-                        shiftpw_add!(locr, loci, view(mpr, :, ind, kj), view(mpi, :, ind, kj), L, dx, dy, dz)
-                    end
-                    kft = L.kernelft
-                    @inbounds @simd for e in eachindex(kft)
-                        locr[e] *= kft[e]
-                        loci[e] *= kft[e]
-                    end
-                    pw2proxy!(ProxyOuts(pp, ind, pwidx[ibox]), locr, loci, L, p, ifpgh, w)
+                    off0 = npw * ((ind - 1) + nd * (k - 1))
+                    pw2proxy!(ProxyOuts(pp, ind, pwidx[ibox]), locr1, loci1, L, p, ifpgh, w, off0, cs)
                 end
             end
         end
@@ -384,11 +383,29 @@ function steps456_planewave!(pot, grad, hess, pp, pc, pwidx, s::DMKSetup)
     return nothing
 end
 
+function _m2l_list(s::DMKSetup, boxes, mpidx, xmin)
+    ft = s.ft
+    ptr = ones(Int, length(boxes) + 1)
+    ks = Int[]; ds = Int[]
+    for (t, ibox) in enumerate(boxes)
+        push!(ks, t); push!(ds, 14)
+        for j in 1:s.nlistpw[ibox]
+            jbox = s.listpw[j, ibox]
+            dx = round(Int, (ft.centers[1, ibox] - ft.centers[1, jbox]) / xmin)
+            dy = round(Int, (ft.centers[2, ibox] - ft.centers[2, jbox]) / xmin)
+            dz = round(Int, (ft.centers[3, ibox] - ft.centers[3, jbox]) / xmin)
+            push!(ks, mpidx[jbox]); push!(ds, 1 + (dx + 1) + 3 * (dy + 1) + 9 * (dz + 1))
+        end
+        ptr[t + 1] = length(ks) + 1
+    end
+    return M2LList(ptr, ks, ds)
+end
+
 @inline _loctab_slot(t::Float64, c::Float64, bs::Float64) = round(Int, (t - c) / bs) + NLOCTAB + 1
 
 function step7_local!(pot, grad, hess, s::DMKSetup, fv)
     ft, n = s.ft, s.n
-    wss = [(LocalWork(n), zeros(n^3), zeros(n^3), zeros(Int, 27), Int[]) for _ in 1:_nthreads()]
+    wss = make_workspaces(() -> (LocalWork(n), Vector{Float64}(undef, n^3), Vector{Float64}(undef, n^3), zeros(Int, 27), Int[]))
     parallel_foreach(leafboxes(ft), wss) do ibox, ws
         if s.ifpgh == 1
             _local_pot_box!(pot, s, fv, ibox, ws)
@@ -616,7 +633,7 @@ end
 function step9_proxy2pot!(pot, grad, hess, pp, pwidx, s::DMKSetup)
     ft, n, nd, p = s.ft, s.n, s.nd, s.porder
     ncomb = _ncombos(s.ifpgh)
-    wss = [TPWork(max(n, p)^3) for _ in 1:_nthreads()]
+    wss = make_workspaces(() -> TPWork(max(n, p)^3))
     leaves = [ibox for ibox in 1:ft.nboxes if ft.nchild[ibox] == 0 && pwidx[ibox] > 0]
     parallel_foreach(leaves, wss) do ibox, w
         for ind in 1:nd, c in 1:ncomb
@@ -724,17 +741,19 @@ function _bdmk_native(tree::BoxTree, fvals::AbstractArray{<:Real,3}, kernel::Abs
     nb = ft.nboxes
     fv = Array{Float64,5}(undef, n, n, n, nd, nb)
     fv3 = reshape(fv, np, nd, nb)
-    for ibox in 1:nb, ind in 1:nd
+    parallel_foreach(1:nb, fill(nothing, _nthreads())) do ibox, _
         src = ft.perm[ibox]
-        @inbounds for j in 1:np
-            fv3[j, ind, ibox] = fvals[ind, j, src]
+        for ind in 1:nd
+            @inbounds for j in 1:np
+                fv3[j, ind, ibox] = fvals[ind, j, src]
+            end
         end
     end
     ng = ifpgh >= 2 ? nb : 0
     nh = ifpgh >= 3 ? nb : 0
-    pot = zeros(n, n, n, nd, nb)
-    gradv = zeros(n, n, n, nd, 3, ng)
-    hessv = zeros(n, n, n, nd, 6, nh)
+    pot = pzeros(n, n, n, nd, nb)
+    gradv = pzeros(n, n, n, nd, 3, ng)
+    hessv = pzeros(n, n, n, nd, 6, nh)
     tm[1] = (time_ns() - t0) / 1e9
 
     t0 = time_ns()
@@ -748,7 +767,7 @@ function _bdmk_native(tree::BoxTree, fvals::AbstractArray{<:Real,3}, kernel::Abs
     tm[3] = (time_ns() - t0) / 1e9
 
     t0 = time_ns()
-    pp = zeros(p^3, nd, _ncombos(ifpgh), npwbox)
+    pp = pzeros(p^3, nd, _ncombos(ifpgh), npwbox)
     steps456_planewave!(pot, gradv, hessv, pp, pc, pwidx, s)
     tm[4] = (time_ns() - t0) / 1e9
 
@@ -782,12 +801,14 @@ function _bdmk_native(tree::BoxTree, fvals::AbstractArray{<:Real,3}, kernel::Abs
 end
 
 function _unflatten(a::Array{Float64,5}, ft::FlatTree, nd::Int, np::Int)
-    out = zeros(nd, np, ft.nboxes)
+    out = Array{Float64}(undef, nd, np, ft.nboxes)
     a3 = reshape(a, np, nd, ft.nboxes)
-    for ibox in 1:ft.nboxes, ind in 1:nd
+    parallel_foreach(1:ft.nboxes, fill(nothing, _nthreads())) do ibox, _
         dst = ft.perm[ibox]
-        @inbounds for j in 1:np
-            out[ind, j, dst] = a3[j, ind, ibox]
+        for ind in 1:nd
+            @inbounds for j in 1:np
+                out[ind, j, dst] = a3[j, ind, ibox]
+            end
         end
     end
     return out
@@ -795,12 +816,14 @@ end
 
 function _unflatten(a::Array{Float64,6}, ft::FlatTree, nd::Int, np::Int)
     nc = size(a, 5)
-    out = zeros(nd, nc, np, ft.nboxes)
+    out = Array{Float64}(undef, nd, nc, np, ft.nboxes)
     a4 = reshape(a, np, nd, nc, ft.nboxes)
-    for ibox in 1:ft.nboxes, c in 1:nc, ind in 1:nd
+    parallel_foreach(1:ft.nboxes, fill(nothing, _nthreads())) do ibox, _
         dst = ft.perm[ibox]
-        @inbounds for j in 1:np
-            out[ind, c, j, dst] = a4[j, ind, c, ibox]
+        for c in 1:nc, ind in 1:nd
+            @inbounds for j in 1:np
+                out[ind, c, j, dst] = a4[j, ind, c, ibox]
+            end
         end
     end
     return out

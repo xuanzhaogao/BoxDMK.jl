@@ -140,3 +140,24 @@ function parent2children!(outs::F, phi::AbstractArray{Float64}, A::NTuple{2,Matr
     end
     return nothing
 end
+
+# Per-task workspaces, each allocated (and first touched) on its own thread.
+function make_workspaces(f::F) where {F}
+    tasks = [Threads.@spawn f() for _ in 1:Threads.nthreads()]
+    return [fetch(t) for t in tasks]
+end
+
+# Fill `a` with v using all threads (parallel first touch of fresh memory).
+function pfill!(a::Array{Float64}, v::Float64 = 0.0)
+    n = length(a)
+    nt = Threads.nthreads()
+    (nt == 1 || n < 1 << 16) && return fill!(a, v)
+    nchunk = 4 * nt
+    ranges = [(1 + div((i - 1) * n, nchunk)):div(i * n, nchunk) for i in 1:nchunk]
+    parallel_foreach(ranges, fill(nothing, nt)) do r, _
+        fill!(view(a, r), v)
+    end
+    return a
+end
+
+pzeros(dims::Int...) = pfill!(Array{Float64}(undef, dims...))
