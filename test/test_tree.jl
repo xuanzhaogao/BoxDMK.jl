@@ -53,10 +53,18 @@ end
         boxlen = 1.0,
         nd = 1,
     )
-    lists = BoxDMK.build_interaction_lists(tree)
+    # Native solver lists, mapped back to BoxTree box numbers.
+    ft = BoxDMK.FlatTree(tree)
+    ptr, flat = BoxDMK.compute_list1(ft)
+    nlistpw, listpw = BoxDMK.compute_listpw(ft)
     nboxes = size(tree.centers, 2)
-    @test length(lists.list1) == nboxes
-    @test length(lists.listpw) == nboxes
+    lists = (list1 = [Int[] for _ in 1:nboxes], listpw = [Int[] for _ in 1:nboxes])
+    for k in 1:nboxes
+        ibox = ft.perm[k]
+        append!(lists.list1[ibox], ft.perm[flat[ptr[k]:(ptr[k + 1] - 1)]])
+        append!(lists.listpw[ibox], ft.perm[listpw[1:nlistpw[k], k]])
+    end
+    @test sum(length, lists.list1) > 0
 
     function touches(tree, ibox, jbox)
         size_i = tree.boxsize[tree.level[ibox] + 1]

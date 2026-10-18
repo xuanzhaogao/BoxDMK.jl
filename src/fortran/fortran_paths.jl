@@ -3,7 +3,8 @@ const _BUILD_FORTRAN_REF_CMD = "julia --project deps/build_fortran_ref.jl"
 
 _vendored_fortran_root() = normpath(joinpath(_PACKAGE_ROOT, "deps", "boxdmk_fortran"))
 _vendored_fortran_build_root() = normpath(joinpath(_PACKAGE_ROOT, "deps", "usr"))
-_vendored_fortran_libdir() = joinpath(_vendored_fortran_build_root(), "lib")
+# BOXDMK_FORTRAN_LIBDIR overrides the location of the reference libraries.
+_vendored_fortran_libdir() = get(ENV, "BOXDMK_FORTRAN_LIBDIR", joinpath(_vendored_fortran_build_root(), "lib"))
 
 function _fortran_library_candidates(; debug::Bool = false)
     basename = debug ? "libboxdmk_debug.so" : "libboxdmk.so"

@@ -105,12 +105,23 @@ function PWWork(npw::Int, porder::Int)
            [u(p * p * npw) for _ in 1:6], u(npw * npw * nh), u(npw * npw * nh))
 end
 
+# Storage layout of expansions: frequency column col (0-based) of a box lives
+# at off0 + (col % cb) * npw + (col ÷ cb) * bs, i.e. columns are grouped into
+# blocks of cb (contiguous per box) and blocks of all boxes are adjacent.
+struct PWLayout
+    npw::Int
+    cb::Int
+    bs::Int
+end
+PWLayout(L) = PWLayout(L.npw, L.npw * L.nh, 0)     # one contiguous expansion
+
 # Outgoing expansion of real proxy coefficients q (porder^3), optionally
 # multiplied by the kernel's Fourier transform (kmul).
 #
-# The expansion entry (u, col) is stored at pwr[off0 + (col-1)*cs + u].
+# The expansion entry (u, col) is stored at pwr[addr(col) + u] (see PWLayout).
 function proxy2pw!(pwr::AbstractVector{Float64}, pwi::AbstractVector{Float64}, q::AbstractArray{Float64},
-                   L::PWLevel, tb::PWTables, w::PWWork, off0::Int = 0, cs::Int = L.npw, kmul::Bool = false)
+                   L::PWLevel, tb::PWTables, w::PWWork, off0::Int = 0, lay::PWLayout = PWLayout(L),
+                   kmul::Bool = false)
     npw, nh = L.npw, L.nh
     p = tb.m
     pp = p * p
@@ -145,9 +156,12 @@ function proxy2pw!(pwr::AbstractVector{Float64}, pwi::AbstractVector{Float64}, q
         gemm!(pointer(w.R2), npw, pointer(tb.Ax), npw, pointer(F2i), p, npw, ncol, p, 1.0, false)
         R1 = w.R1; R2 = w.R2
         kft = L.kernelft
+        cc = 0; od0 = off0
         @inbounds for col in 0:(ncol - 1)
             o = col * npw
-            od = off0 + col * cs
+            od = od0 + cc * npw
+            cc += 1
+            cc == lay.cb && (cc = 0; od0 += lay.bs)
             @simd for u in 1:nh
                 a = R1[o + u]; b = R2[o + nh + u]; c2 = R2[o + u]; d = R1[o + nh + u]
                 k1 = kmul ? kft[o + u] : 1.0
@@ -198,7 +212,7 @@ _ncombos(ifpgh::Int) = ifpgh == 1 ? 1 : (ifpgh == 2 ? 4 : 10)
 
 # outs[m] (porder^3) += 2 Re( Σ P_dx[u,x] P_dy[v,y] P_dz[c,z] pw[u,v,c] ) for combo m.
 function pw2proxy!(outs, pwr::AbstractVector{Float64}, pwi::AbstractVector{Float64},
-                   L::PWLevel, tb::PWTables, ifpgh::Int, w::PWWork, off0::Int = 0, cs::Int = L.npw)
+                   L::PWLevel, tb::PWTables, ifpgh::Int, w::PWWork, off0::Int = 0, lay::PWLayout = PWLayout(L))
     npw, nh = L.npw, L.nh
     p = tb.m
     pp = p * p
@@ -208,9 +222,12 @@ function pw2proxy!(outs, pwr::AbstractVector{Float64}, pwi::AbstractVector{Float
     GC.@preserve outs pwr pwi tb w begin
         # x: stacked B_r = [S_r; -D_i], B_i = [S_i; D_r] with S/D = pw[u] ± pw[u'] (u ≤ nh)
         Br = w.R1; Bi = w.R2
+        cc = 0; od0 = off0
         @inbounds for col in 0:(ncol - 1)
             o = col * npw
-            od = off0 + col * cs
+            od = od0 + cc * npw
+            cc += 1
+            cc == lay.cb && (cc = 0; od0 += lay.bs)
             @simd for u in 1:nh
                 ar = pwr[od + u]; ai = pwi[od + u]
                 br = pwr[od + npw + 1 - u]; bi = pwi[od + npw + 1 - u]
@@ -284,25 +301,25 @@ function M2LList(srcs::Vector{Vector{NTuple{4,Int}}})
     return M2LList(ptr, k, kyz, nkx)
 end
 
-# loc[:, ind, t, col] = Σ_sources shift(t - s) ⊙ mp[:, ind, s, col] for the
+# loc[:, col, ind, t] = Σ_sources shift(t - s) ⊙ mp[:, col, ind, s] for the
 # frequency columns `cols` (a column is the npw x-frequencies at fixed (v, c));
-# expansions are stored as (npw, nd, nboxes, ncols) so that a column of all
-# boxes is contiguous. Shift factors are grouped by dx:
+# expansions are stored as (npw, cb, nd, nboxes, nblocks), see PWLayout. Shift factors are grouped by dx:
 # loc = Σ_dx wx_dx ⊙ (Σ_{s: dx} (wy wz)_s mp_s), evaluated in blocks of 8
 # frequencies held in registers. `scr` holds per-source scalars.
-function m2l_columns!(locr::Array{Float64,4}, loci::Array{Float64,4}, mpr::Array{Float64,4}, mpi::Array{Float64,4},
+function m2l_columns!(locr::Array{Float64,5}, loci::Array{Float64,5}, mpr::Array{Float64,5}, mpi::Array{Float64,5},
                       lst::M2LList, L::PWLevel, nd::Int, ntarg::Int, cols::UnitRange{Int}, scr::Vector{Float64})
     npw = L.npw
     Sr, Si = L.shift_re, L.shift_im
-    cstr = npw * nd * size(mpr, 3)            # column stride
-    bstr = npw * nd                           # box stride
+    cb = size(mpr, 2)
+    bstr = npw * cb * nd                      # box stride
+    blkstr = bstr * size(mpr, 4)              # block stride
     GC.@preserve locr loci mpr mpi scr Sr Si begin
         pmr = pointer(mpr); pmi = pointer(mpi); plr = pointer(locr); pli = pointer(loci)
         pS = pointer(scr); pSr = pointer(Sr); pSi = pointer(Si)
         for col in cols
             v = (col - 1) % npw + 1
             cz = (col - 1) ÷ npw + 1
-            cbase = (col - 1) * cstr
+            cbase = ((col - 1) % cb) * npw + ((col - 1) ÷ cb) * blkstr
             # the 9 (y, z) shift products of this column
             wyz = ntuple(9) do j
                 ky = (j - 1) % 3 + 1; kz = (j - 1) ÷ 3 + 1
@@ -321,7 +338,7 @@ function m2l_columns!(locr::Array{Float64,4}, loci::Array{Float64,4}, mpr::Array
                 end
                 n1 = lst.nkx[1, t]; n2 = lst.nkx[2, t]
                 for ind in 1:nd
-                    ib = cbase + npw * (ind - 1)
+                    ib = cbase + npw * cb * (ind - 1)
                     u0 = 0
                     while u0 < npw
                         # 16 frequencies per pass (two vectors, masked at the end);

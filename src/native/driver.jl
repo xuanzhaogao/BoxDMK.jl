@@ -318,7 +318,7 @@ function steps456_planewave!(pot, grad, hess, pp, pc, nodeidx, s::DMKSetup, fv)
         L = PWLevel(eps, ilev, p, bs0, bs0, @view(s.deltas[r]), @view(s.wdeltas[r]), s.prox)
         w = PWWork(L.npw, max(p, s.n))
         for ind in 1:nd
-            proxy2pw!(w.locr, w.loci, view(pc, :, ind, nodeidx[1]), L, L.prox, w, 0, L.npw, true)
+            proxy2pw!(w.locr, w.loci, view(pc, :, ind, nodeidx[1]), L, L.prox, w, 0, PWLayout(L), true)
             pw2proxy!(ProxyOuts(pp, ind, nodeidx[1]), w.locr, w.loci, L, L.prox, ifpgh, w)
         end
     end
@@ -331,11 +331,13 @@ function steps456_planewave!(pot, grad, hess, pp, pc, nodeidx, s::DMKSetup, fv)
     nexp = npw * npw * (npw ÷ 2)
     maxboxes = maximum(ilev -> count(ibox -> s.ifpwexp[ibox], levelboxes(ft, ilev)), 0:ft.nlevels)
     ncols = npw * (npw ÷ 2)
-    mpr = Array{Float64}(undef, npw, nd, maxboxes, ncols)
-    mpi = Array{Float64}(undef, npw, nd, maxboxes, ncols)
-    locr = Array{Float64}(undef, npw, nd, maxboxes, ncols)
-    loci = Array{Float64}(undef, npw, nd, maxboxes, ncols)
-    cs = npw * nd * maxboxes
+    cb = min(ncols, cld(2048, npw))           # ~16 KB of a box's expansion per block
+    nblk = cld(ncols, cb)
+    mpr = Array{Float64}(undef, npw, cb, nd, maxboxes, nblk)
+    mpi = Array{Float64}(undef, npw, cb, nd, maxboxes, nblk)
+    locr = Array{Float64}(undef, npw, cb, nd, maxboxes, nblk)
+    loci = Array{Float64}(undef, npw, cb, nd, maxboxes, nblk)
+    lay = PWLayout(npw, cb, npw * cb * nd * maxboxes)
     wss = make_workspaces(() -> PWWork(npw, max(p, s.n)))
     accs = [zeros(2 * 64) for _ in 1:_nthreads()]
     for ilev in 0:ft.nlevels
@@ -353,11 +355,11 @@ function steps456_planewave!(pot, grad, hess, pp, pc, nodeidx, s::DMKSetup, fv)
             parallel_foreach(boxes, wss) do ibox, w
                 k = mpidx[ibox]
                 for ind in 1:nd
-                    off0 = npw * ((ind - 1) + nd * (k - 1))
+                    off0 = npw * cb * ((ind - 1) + nd * (k - 1))
                     if ft.nchild[ibox] == 0
-                        proxy2pw!(mpr1, mpi1, view(fv, :, :, :, ind, ibox), L, L.leaf, w, off0, cs, true)
+                        proxy2pw!(mpr1, mpi1, view(fv, :, :, :, ind, ibox), L, L.leaf, w, off0, lay, true)
                     else
-                        proxy2pw!(mpr1, mpi1, view(pc, :, ind, nodeidx[ibox]), L, L.prox, w, off0, cs, true)
+                        proxy2pw!(mpr1, mpi1, view(pc, :, ind, nodeidx[ibox]), L, L.prox, w, off0, lay, true)
                     end
                 end
             end
@@ -370,11 +372,11 @@ function steps456_planewave!(pot, grad, hess, pp, pc, nodeidx, s::DMKSetup, fv)
             parallel_foreach(boxes, wss) do ibox, w
                 k = mpidx[ibox]
                 for ind in 1:nd
-                    off0 = npw * ((ind - 1) + nd * (k - 1))
+                    off0 = npw * cb * ((ind - 1) + nd * (k - 1))
                     if ft.nchild[ibox] == 0
-                        pw2proxy!(BoxOuts(pot, grad, hess, ind, ibox), locr1, loci1, L, L.leaf, ifpgh, w, off0, cs)
+                        pw2proxy!(BoxOuts(pot, grad, hess, ind, ibox), locr1, loci1, L, L.leaf, ifpgh, w, off0, lay)
                     else
-                        pw2proxy!(ProxyOuts(pp, ind, nodeidx[ibox]), locr1, loci1, L, L.prox, ifpgh, w, off0, cs)
+                        pw2proxy!(ProxyOuts(pp, ind, nodeidx[ibox]), locr1, loci1, L, L.prox, ifpgh, w, off0, lay)
                     end
                 end
             end
