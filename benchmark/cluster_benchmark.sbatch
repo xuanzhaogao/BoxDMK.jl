@@ -34,7 +34,7 @@ export OMP_PROC_BIND=spread OMP_PLACES=cores
 NCORES=$(nproc --all)
 lscpu | grep -E "Model name|^CPU\(s\)|Socket|NUMA node\(s\)" | tee -a "$OUT"
 
-"$JULIA" --project -e 'using Pkg; Pkg.instantiate(); using BoxDMK'
+"$JULIA" --project -e "using BoxDMK"
 for T in 1 8 16 32 64 96 128; do
     [ "$T" -le "$NCORES" ] || continue
     OMP_NUM_THREADS=$T "$JULIA" --project -t "$T" benchmark/native_vs_fortran.jl "$OUT"

@@ -80,10 +80,11 @@ end
         @test size(res.target_pot) == (1, 3)
         @test size(res.target_grad) == (1, 3, 3)
         @test size(res.target_hess) == (1, 6, 3)
+        gscale = maximum(abs, res.grad)
         for t in 1:3
             u, _, g = _gauss_terms(_MS, targets[:, t])
             @test abs(res.target_pot[1, t] - u) < 1e-5 * maximum(abs, res.pot)
-            @test norm(res.target_grad[1, :, t] - g) < 1e-3 * norm(g) + 1e-6
+            @test norm(res.target_grad[1, :, t] - g) < 1e-4 * gscale
         end
         # Hessian trace = Δu = -4π f
         for t in 1:3
@@ -95,10 +96,14 @@ end
         field = PotentialField(tree, res)
         @test evaluate_potential(field, targets) ≈ res.target_pot rtol = 1e-12
 
+        # several densities at once give the same results as one at a time
+        # (potential-only solves; with derivatives the near field takes
+        # Fortran's sparse path, which rounds differently)
         f2 = cat(fvals, 2 .* fvals; dims = 1)
+        res1 = bdmk(tree, fvals, LaplaceKernel(); eps = 1e-6)
         res2 = bdmk(tree, f2, LaplaceKernel(); eps = 1e-6)
-        @test res2.pot[1:1, :, :] ≈ res.pot rtol = 1e-12
-        @test res2.pot[2:2, :, :] ≈ 2 .* res.pot rtol = 1e-12
+        @test res2.pot[1:1, :, :] ≈ res1.pot rtol = 1e-14
+        @test res2.pot[2:2, :, :] ≈ 2 .* res1.pot rtol = 1e-14
     end
 
     @testset "Kernels" begin
