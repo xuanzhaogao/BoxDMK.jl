@@ -2,6 +2,7 @@ module BoxDMK
 
 using LinearAlgebra
 using Libdl
+using SIMD
 
 function build_tree end
 function bdmk end
@@ -24,6 +25,7 @@ include("native/pw.jl")
 include("native/sog.jl")
 include("native/flattree.jl")
 include("native/loctab.jl")
+include("native/gemm.jl")
 include("native/tensor3.jl")
 include("native/local3.jl")
 include("native/pwops.jl")

@@ -24,9 +24,13 @@ struct DMKSetup
     D1::Matrix{Float64}         # values -> first derivative values on [-1,1]
     D2::Matrix{Float64}
     den2pc::Matrix{Float64}     # values -> proxy coefficients (porder × n)
+    den2pcT::Matrix{Float64}
     poteval::Matrix{Float64}    # proxy coefficients -> values (n × porder)
+    potevalT::Matrix{Float64}
     p2c::NTuple{2,Matrix{Float64}}
+    p2cT::NTuple{2,Matrix{Float64}}
     c2p::NTuple{2,Matrix{Float64}}
+    c2pT::NTuple{2,Matrix{Float64}}
     prox::Ortho1D
     loctabs::Vector{Vector{Union{Nothing,LocTab1D}}}   # [ilev+1][id]
     pwlevels::Vector{Union{Nothing,PWLevel}}            # [ilev+1]
@@ -123,7 +127,9 @@ function DMKSetup(tree::BoxTree, nd::Int, kernel::AbstractKernel, eps::Float64, 
     D2 = inp.Vpp * inp.U
 
     return DMKSetup(ft, nd, n, porder, ifpgh, eps, deltas, wdeltas, r0, ipwaddr, idelta, ifpwexp,
-                    nlistpw, listpw, list1_ptr, list1, inp, D1, D2, den2pc, poteval, p2c, c2p, prox,
+                    nlistpw, listpw, list1_ptr, list1, inp, D1, D2, den2pc, Matrix(transpose(den2pc)),
+                    poteval, Matrix(transpose(poteval)), p2c, map(m -> Matrix(transpose(m)), p2c),
+                    c2p, map(m -> Matrix(transpose(m)), c2p), prox,
                     loctabs, pwlevels, taylor)
 end
 
@@ -225,14 +231,14 @@ function step3_upward!(pc, s::DMKSetup, fv)
             for ind in 1:nd
                 out = view(pc, :, ind, ibox)
                 if ft.nchild[ibox] == 0
-                    tp3!(out, view(fv, :, :, :, ind, ibox), s.den2pc, s.den2pc, s.den2pc, w.w1, w.w2, sc3, false)
+                    tp3!(out, view(fv, :, :, :, ind, ibox), s.den2pc, s.den2pcT, s.den2pcT, w.w1, w.w2, sc3, false)
                 else
                     fill!(out, 0.0)
                     for slot in 1:8
                         jbox = ft.child[slot, ibox]
                         jbox == 0 && continue
                         sx, sy, sz = _childsides(slot)
-                        tp3!(out, view(pc, :, ind, jbox), s.c2p[sx], s.c2p[sy], s.c2p[sz], w.w1, w.w2, 1.0, true)
+                        tp3!(out, view(pc, :, ind, jbox), s.c2p[sx], s.c2pT[sy], s.c2pT[sz], w.w1, w.w2, 1.0, true)
                     end
                 end
             end
@@ -278,8 +284,8 @@ function steps456_planewave!(ppot, pgrad, phess, s::DMKSetup, pc)
             for (k, ibox) in enumerate(boxes)
                 mpidx[ibox] = k
             end
-            mpr = zeros(L.nexp, nd, length(boxes))
-            mpi = zeros(L.nexp, nd, length(boxes))
+            mpr = Array{Float64}(undef, L.nexp, nd, length(boxes))
+            mpi = Array{Float64}(undef, L.nexp, nd, length(boxes))
             wss = [PWWork(L.npw, p) for _ in 1:_nthreads()]
             parallel_foreach(boxes, wss) do ibox, w
                 k = mpidx[ibox]
@@ -318,7 +324,7 @@ function steps456_planewave!(ppot, pgrad, phess, s::DMKSetup, pc)
                 jbox = ft.child[slot, ibox]
                 jbox == 0 && continue
                 sx, sy, sz = _childsides(slot)
-                A, B, C = s.p2c[sx], s.p2c[sy], s.p2c[sz]
+                A, B, C = s.p2c[sx], s.p2cT[sy], s.p2cT[sz]
                 for ind in 1:nd
                     tp3!(view(ppot, :, ind, jbox), view(ppot, :, ind, ibox), A, B, C, w.w1, w.w2, 1.0, true)
                     if ifpgh >= 2
@@ -395,51 +401,61 @@ end
     return (o1, g..., h...)
 end
 
-function step8_asymptotic!(pot, grad, hess, s::DMKSetup, fv, dd::DensityDerivs)
-    ft, nd, ifpgh = s.ft, s.nd, s.ifpgh
+function _asym_coefs(s::DMKSetup, nas::Int)
     nde = length(s.deltas)
     sqrtpi = sqrt(pi)
+    c0 = 0.0; c2 = 0.0; c4 = 0.0
+    for i in 1:nas
+        delta = s.deltas[nde - i + 1]
+        wd = s.wdeltas[nde - i + 1]
+        d0 = (sqrtpi * sqrt(delta))^3
+        c0 += d0 * wd
+        c2 += d0 * delta / 4 * wd
+        c4 += d0 * delta^2 / 32 * wd
+    end
+    return c0, c2, c4
+end
+
+function step8_asymptotic!(pot, grad, hess, s::DMKSetup, fv, dd::DensityDerivs)
+    ft = s.ft
     for ilev in 0:ft.nlevels
         nas = s.idelta[ilev + 1]
         nas > 0 || continue
-        c0 = 0.0; c2 = 0.0; c4 = 0.0
-        for i in 1:nas
-            delta = s.deltas[nde - i + 1]
-            wd = s.wdeltas[nde - i + 1]
-            d0 = (sqrtpi * sqrt(delta))^3
-            c0 += d0 * wd
-            c2 += d0 * delta / 4 * wd
-            c4 += d0 * delta^2 / 32 * wd
-        end
+        coefs = _asym_coefs(s, nas)
         boxes = [ibox for ibox in levelboxes(ft, ilev) if ft.nchild[ibox] == 0]
         parallel_foreach(boxes, [nothing for _ in 1:_nthreads()]) do ibox, _
-            for ind in 1:nd
-                pb = view(pot, :, :, :, ind, ibox)
-                f = view(fv, :, :, :, ind, ibox)
-                fl = view(dd.flv, :, :, :, ind, ibox)
-                fl2 = view(dd.fl2v, :, :, :, ind, ibox)
-                @inbounds @simd for i in eachindex(pb)
-                    pb[i] += c0 * f[i] + c2 * fl[i] + c4 * fl2[i]
+            _asym_box!(pot, grad, hess, s, fv, dd, coefs, ibox)
+        end
+    end
+    return nothing
+end
+
+function _asym_box!(pot, grad, hess, s::DMKSetup, fv, dd::DensityDerivs, (c0, c2, c4), ibox::Int)
+    for ind in 1:s.nd
+        pb = view(pot, :, :, :, ind, ibox)
+        f = view(fv, :, :, :, ind, ibox)
+        fl = view(dd.flv, :, :, :, ind, ibox)
+        fl2 = view(dd.fl2v, :, :, :, ind, ibox)
+        @inbounds @simd for i in eachindex(pb)
+            pb[i] += c0 * f[i] + c2 * fl[i] + c4 * fl2[i]
+        end
+        if s.ifpgh >= 2
+            for d in 1:3
+                gb = view(grad, :, :, :, ind, d, ibox)
+                g = view(dd.g, :, :, :, ind, d, ibox)
+                gl = view(dd.gl, :, :, :, ind, d, ibox)
+                @inbounds @simd for i in eachindex(gb)
+                    gb[i] += c0 * g[i] + c2 * gl[i]
                 end
-                if ifpgh >= 2
-                    for d in 1:3
-                        gb = view(grad, :, :, :, ind, d, ibox)
-                        g = view(dd.g, :, :, :, ind, d, ibox)
-                        gl = view(dd.gl, :, :, :, ind, d, ibox)
-                        @inbounds @simd for i in eachindex(gb)
-                            gb[i] += c0 * g[i] + c2 * gl[i]
-                        end
-                    end
-                end
-                if ifpgh >= 3
-                    for m in 1:6
-                        hb = view(hess, :, :, :, ind, m, ibox)
-                        h = view(dd.h, :, :, :, ind, m, ibox)
-                        hl = view(dd.hl, :, :, :, ind, m, ibox)
-                        @inbounds @simd for i in eachindex(hb)
-                            hb[i] += c0 * h[i] + c2 * hl[i]
-                        end
-                    end
+            end
+        end
+        if s.ifpgh >= 3
+            for m in 1:6
+                hb = view(hess, :, :, :, ind, m, ibox)
+                h = view(dd.h, :, :, :, ind, m, ibox)
+                hl = view(dd.hl, :, :, :, ind, m, ibox)
+                @inbounds @simd for i in eachindex(hb)
+                    hb[i] += c0 * h[i] + c2 * hl[i]
                 end
             end
         end
@@ -450,18 +466,19 @@ end
 function step9_proxy2pot!(pot, grad, hess, s::DMKSetup, ppot, pgrad, phess)
     ft, n, nd, p, ifpgh = s.ft, s.n, s.nd, s.porder, s.ifpgh
     PE = s.poteval
+    PET = s.potevalT
     wss = [TPWork(max(n, p)^3) for _ in 1:_nthreads()]
     parallel_foreach(leafboxes(ft), wss) do ibox, w
         for ind in 1:nd
-            tp3!(view(pot, :, :, :, ind, ibox), view(ppot, :, ind, ibox), PE, PE, PE, w.w1, w.w2, 1.0, true)
+            tp3!(view(pot, :, :, :, ind, ibox), view(ppot, :, ind, ibox), PE, PET, PET, w.w1, w.w2, 1.0, true)
             if ifpgh >= 2
                 for d in 1:3
-                    tp3!(view(grad, :, :, :, ind, d, ibox), view(pgrad, :, ind, d, ibox), PE, PE, PE, w.w1, w.w2, 1.0, true)
+                    tp3!(view(grad, :, :, :, ind, d, ibox), view(pgrad, :, ind, d, ibox), PE, PET, PET, w.w1, w.w2, 1.0, true)
                 end
             end
             if ifpgh >= 3
                 for m in 1:6
-                    tp3!(view(hess, :, :, :, ind, m, ibox), view(phess, :, ind, m, ibox), PE, PE, PE, w.w1, w.w2, 1.0, true)
+                    tp3!(view(hess, :, :, :, ind, m, ibox), view(phess, :, ind, m, ibox), PE, PET, PET, w.w1, w.w2, 1.0, true)
                 end
             end
         end

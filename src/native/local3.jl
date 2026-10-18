@@ -91,7 +91,7 @@ function local_pot!(pot::AbstractArray{Float64,3}, f::AbstractArray{Float64,3}, 
     nx = length(Kx); ny = length(Ky); nz = length(Kz)
     (nx == 0 || ny == 0 || nz == 0) && return nothing
     if nx + ny + nz >= n
-        tp3!(pot, f, tabsT[1], tabsT[2], tabsT[3], lw.w1, lw.w2, w, true)
+        tp3!(pot, f, tabsT[1], tabs[2], tabs[3], lw.w1, lw.w2, w, true)
         return nothing
     end
     order = if nx <= ny && ny <= nz

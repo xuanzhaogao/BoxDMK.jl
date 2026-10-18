@@ -1,7 +1,11 @@
 # Plane-wave operators. A plane-wave expansion is stored as separate real and
-# imaginary arrays indexed (a, b, c) -> a + npw*(b-1) + npw^2*(c-1), with a/b
-# the x/y frequencies (1:npw) and c the z frequency restricted to the first
-# half (1:npw÷2) using conjugate symmetry.
+# imaginary arrays indexed (u, v, c) -> u + npw*(v-1) + npw^2*(c-1): u and v
+# are the x and y frequencies (1:npw) and c the z frequency restricted to the
+# first half (1:npw÷2) by conjugate symmetry.
+#
+# The 1D tables satisfy T[npw+1-u, :] = conj(T[u, :]) because the nodes are
+# symmetric, so every complex contraction is done on half the frequencies
+# with real GEMMs.
 
 struct PWLevel
     npw::Int
@@ -9,17 +13,15 @@ struct PWLevel
     nexp::Int
     ts::Vector{Float64}
     ws::Vector{Float64}
-    # proxy coefficients -> outgoing PW: T[a, i] (npw × porder)
-    c2pw_re::Matrix{Float64}
-    c2pw_im::Matrix{Float64}
-    # incoming PW -> proxy coefficients for derivative order d = 0, 1, 2:
-    # P[d+1][a, x] (npw × porder) and its transpose PT[d+1][x, a]
-    pw2c_re::NTuple{3,Matrix{Float64}}
-    pw2c_im::NTuple{3,Matrix{Float64}}
-    pw2cT_re::NTuple{3,Matrix{Float64}}
-    pw2cT_im::NTuple{3,Matrix{Float64}}
-    kernelft::Vector{Float64}           # (nexp)
-    shift_re::Matrix{Float64}           # (npw, 3): exp(i t_j xmin k), k = -1:1
+    # proxy coefficients -> outgoing PW (table conj(P0))
+    B1::Matrix{Float64}             # (p, npw) = [Re T_h' Im T_h']   (z and y stages)
+    Ax::Matrix{Float64}             # (npw, p) = [Re T_h; Im T_h]    (x stage)
+    # incoming PW -> proxy coefficients, derivative order d = 0, 1, 2
+    A1::NTuple{3,Matrix{Float64}}   # (p, npw) = [Re P_h' Im P_h']   (x stage)
+    Bv::NTuple{3,Matrix{Float64}}   # (npw, p) = [Re P_h; Im P_h]    (y stage)
+    Bc::NTuple{3,Matrix{Float64}}   # (npw, p) = [2Re P_h; -2Im P_h] (z stage)
+    kernelft::Vector{Float64}       # (nexp)
+    shift_re::Matrix{Float64}       # (npw, 3): exp(i t_j xmin k), k = -1:1
     shift_im::Matrix{Float64}
 end
 
@@ -30,13 +32,17 @@ function PWLevel(eps::Float64, ilev::Int, porder::Int, bsize::Float64, bs0::Floa
     nh = npw ÷ 2
     nexp = npw * npw * nh
     dsq = bsize / 2
-    # P[j, i] = Σ_k exp(i t_j x_k dsq) U[i, k]
+    # P0[j, i] = Σ_k exp(i t_j x_k dsq) U[i, k]
     tmp = [cis(ts[j] * prox.x[k] * dsq) for j in 1:npw, k in 1:porder]
     P0 = tmp * transpose(prox.U)
-    P1 = [im * ts[j] * P0[j, i] for j in 1:npw, i in 1:porder]
-    P2 = [-ts[j]^2 * P0[j, i] for j in 1:npw, i in 1:porder]
-    Ps = (P0, P1, P2)
-    C = conj.(P0)
+    Ps = (P0, [im * ts[j] * P0[j, i] for j in 1:npw, i in 1:porder],
+          [-ts[j]^2 * P0[j, i] for j in 1:npw, i in 1:porder])
+    Th = conj.(P0[1:nh, :])
+    B1 = hcat(transpose(real.(Th)), transpose(imag.(Th)))
+    Ax = vcat(real.(Th), imag.(Th))
+    A1 = ntuple(d -> Matrix(hcat(transpose(real.(Ps[d][1:nh, :])), transpose(imag.(Ps[d][1:nh, :])))), 3)
+    Bv = ntuple(d -> vcat(real.(Ps[d][1:nh, :]), imag.(Ps[d][1:nh, :])), 3)
+    Bc = ntuple(d -> vcat(2 .* real.(Ps[d][1:nh, :]), -2 .* imag.(Ps[d][1:nh, :])), 3)
     kft = zeros(nexp)
     for k in eachindex(deltas)
         delta = deltas[k]
@@ -48,87 +54,76 @@ function PWLevel(eps::Float64, ilev::Int, porder::Int, bsize::Float64, bs0::Floa
         end
     end
     sh = [cis(ts[j] * bsize * k) for j in 1:npw, k in -1:1]
-    return PWLevel(npw, nh, nexp, ts, ws, real.(C), imag.(C),
-                   ntuple(d -> real.(Ps[d]), 3), ntuple(d -> imag.(Ps[d]), 3),
-                   ntuple(d -> Matrix(transpose(real.(Ps[d]))), 3),
-                   ntuple(d -> Matrix(transpose(imag.(Ps[d]))), 3),
-                   kft, real.(sh), imag.(sh))
+    return PWLevel(npw, nh, nexp, ts, ws, Matrix(B1), Matrix(Ax), A1, Bv, Bc, kft, real.(sh), imag.(sh))
 end
 
 struct PWWork
-    f1r::Vector{Float64}; f1i::Vector{Float64}
-    f2r::Vector{Float64}; f2i::Vector{Float64}
-    g1r::Vector{Vector{Float64}}; g1i::Vector{Vector{Float64}}
-    g2r::Vector{Vector{Float64}}; g2i::Vector{Vector{Float64}}
-    locr::Vector{Float64}; loci::Vector{Float64}
+    F1::Vector{Float64}             # (p², npw)
+    U::Vector{Float64}              # (p, npw)
+    V::Vector{Float64}
+    F2r::Vector{Float64}            # (p, npw*nh)
+    F2i::Vector{Float64}
+    R1::Vector{Float64}             # (npw, npw*nh)
+    R2::Vector{Float64}
+    G1r::Vector{Vector{Float64}}    # (p, npw*nh) per derivative order
+    G1i::Vector{Vector{Float64}}
+    G2::Vector{Vector{Float64}}     # (p², npw) per (dx, dy) pair
+    locr::Vector{Float64}           # (nexp)
+    loci::Vector{Float64}
 end
 
 function PWWork(npw::Int, porder::Int)
     nh = npw ÷ 2
     p = porder
-    n1 = max(p * p * nh, p * npw * nh)
-    n2 = max(p * npw * nh, p * p * nh)
-    PWWork(zeros(n1), zeros(n1), zeros(n2), zeros(n2),
+    PWWork(zeros(p * p * npw), zeros(p * npw), zeros(p * npw),
+           zeros(p * npw * nh), zeros(p * npw * nh), zeros(npw * npw * nh), zeros(npw * npw * nh),
            [zeros(p * npw * nh) for _ in 1:3], [zeros(p * npw * nh) for _ in 1:3],
-           [zeros(p * p * nh) for _ in 1:6], [zeros(p * p * nh) for _ in 1:6],
-           zeros(npw * npw * nh), zeros(npw * npw * nh))
+           [zeros(p * p * npw) for _ in 1:6], zeros(npw * npw * nh), zeros(npw * npw * nh))
 end
 
 # Outgoing expansion of real proxy coefficients q (porder^3).
 function proxy2pw!(pwr::AbstractVector{Float64}, pwi::AbstractVector{Float64}, q::AbstractVector{Float64},
-                   L::PWLevel, porder::Int, w::PWWork)
-    npw, nh, p = L.npw, L.nh, porder
-    Tr, Ti = L.c2pw_re, L.c2pw_im
-    f1r, f1i, f2r, f2i = w.f1r, w.f1i, w.f2r, w.f2i
+                   L::PWLevel, p::Int, w::PWWork)
+    npw, nh = L.npw, L.nh
     pp = p * p
-    # z (half range): f1[ij, c] = Σ_k T[c, k] q[ij, k]
-    @inbounds for c in 1:nh
-        ob = (c - 1) * pp
-        for ij in 1:pp
-            f1r[ob + ij] = 0.0
-            f1i[ob + ij] = 0.0
-        end
-        for k in 1:p
-            tr = Tr[c, k]; ti = Ti[c, k]
-            ib = (k - 1) * pp
-            @simd for ij in 1:pp
-                qv = q[ib + ij]
-                f1r[ob + ij] = muladd(tr, qv, f1r[ob + ij])
-                f1i[ob + ij] = muladd(ti, qv, f1i[ob + ij])
+    ncol = npw * nh
+    GC.@preserve pwr pwi q L w begin
+        pF1 = pointer(w.F1); pU = pointer(w.U); pV = pointer(w.V)
+        pB1 = pointer(L.B1)
+        # z: F1[xy, 1:nh] = Re, F1[xy, nh+1:npw] = Im of Σ_z q[xy, z] T[c, z]
+        gemm!(pF1, pp, pointer(q), pp, pB1, p, pp, npw, p, 1.0, false)
+        # y (per c): [U Ui] = F1r_c * B1, [V Vi] = F1i_c * B1
+        F2r = w.F2r; F2i = w.F2i; U = w.U; V = w.V
+        for c in 1:nh
+            gemm!(pU, p, pF1 + 8 * (c - 1) * pp, p, pB1, p, p, npw, p, 1.0, false)
+            gemm!(pV, p, pF1 + 8 * (nh + c - 1) * pp, p, pB1, p, p, npw, p, 1.0, false)
+            base = (c - 1) * npw * p
+            @inbounds for v in 1:nh
+                ov = base + (v - 1) * p
+                ov2 = base + (npw - v) * p
+                iu = (v - 1) * p
+                ii = (nh + v - 1) * p
+                @simd for x in 1:p
+                    ur = U[iu + x]; ui = U[ii + x]; vr = V[iu + x]; vi = V[ii + x]
+                    F2r[ov + x] = ur - vi
+                    F2i[ov + x] = ui + vr
+                    F2r[ov2 + x] = ur + vi
+                    F2i[ov2 + x] = vr - ui
+                end
             end
         end
-    end
-    # y: f2[i, b, c] = Σ_j T[b, j] f1[i, j, c]
-    @inbounds for c in 1:nh, b in 1:npw
-        ob = ((c - 1) * npw + b - 1) * p
-        for i in 1:p
-            f2r[ob + i] = 0.0
-            f2i[ob + i] = 0.0
-        end
-        for j in 1:p
-            tr = Tr[b, j]; ti = Ti[b, j]
-            ib = ((c - 1) * p + j - 1) * p
-            @simd for i in 1:p
-                xr = f1r[ib + i]; xi = f1i[ib + i]
-                f2r[ob + i] = muladd(tr, xr, muladd(-ti, xi, f2r[ob + i]))
-                f2i[ob + i] = muladd(tr, xi, muladd(ti, xr, f2i[ob + i]))
-            end
-        end
-    end
-    # x: pw[a, bc] = Σ_i T[a, i] f2[i, bc]
-    @inbounds for bc in 0:(npw * nh - 1)
-        ob = bc * npw
-        ib = bc * p
-        for a in 1:npw
-            pwr[ob + a] = 0.0
-            pwi[ob + a] = 0.0
-        end
-        for i in 1:p
-            xr = f2r[ib + i]; xi = f2i[ib + i]
-            @simd for a in 1:npw
-                tr = Tr[a, i]; ti = Ti[a, i]
-                pwr[ob + a] = muladd(tr, xr, muladd(-ti, xi, pwr[ob + a]))
-                pwi[ob + a] = muladd(tr, xi, muladd(ti, xr, pwi[ob + a]))
+        # x: R = Ax * F2, then assemble both halves in u
+        gemm!(pointer(w.R1), npw, pointer(L.Ax), npw, pointer(F2r), p, npw, ncol, p, 1.0, false)
+        gemm!(pointer(w.R2), npw, pointer(L.Ax), npw, pointer(F2i), p, npw, ncol, p, 1.0, false)
+        R1 = w.R1; R2 = w.R2
+        @inbounds for col in 0:(ncol - 1)
+            o = col * npw
+            @simd for u in 1:nh
+                a = R1[o + u]; b = R2[o + nh + u]; c2 = R2[o + u]; d = R1[o + nh + u]
+                pwr[o + u] = a - b
+                pwi[o + u] = c2 + d
+                pwr[o + npw + 1 - u] = a + b
+                pwi[o + npw + 1 - u] = c2 - d
             end
         end
     end
@@ -165,77 +160,67 @@ const _PGH_COMBOS = ((0, 0, 0),
                      (1, 0, 0), (0, 1, 0), (0, 0, 1),
                      (2, 0, 0), (0, 2, 0), (0, 0, 2), (1, 1, 0), (1, 0, 1), (0, 1, 1))
 const _PGH_XY = ((0, 0), (1, 0), (0, 1), (2, 0), (0, 2), (1, 1))
+const _PGH_XYIDX = (1, 2, 3, 1, 4, 5, 1, 6, 2, 3)   # combo -> (dx, dy) pair index
 
 _ncombos(ifpgh::Int) = ifpgh == 1 ? 1 : (ifpgh == 2 ? 4 : 10)
 
-# outs[m] (porder^3) += 2 Re( Σ P_dx[a,x] P_dy[b,y] P_dz[c,z] pw[a,b,c] ) for combo m.
+# outs[m] (porder^3) += 2 Re( Σ P_dx[u,x] P_dy[v,y] P_dz[c,z] pw[u,v,c] ) for combo m.
 function pw2proxy!(outs, pwr::AbstractVector{Float64}, pwi::AbstractVector{Float64},
-                   L::PWLevel, porder::Int, ifpgh::Int, w::PWWork)
-    npw, nh, p = L.npw, L.nh, porder
-    ncomb = _ncombos(ifpgh)
-    nd1 = ifpgh == 1 ? 1 : (ifpgh == 2 ? 2 : 3)
-    # x: g1[d][x, bc] = Σ_a P_d[a, x] pw[a, bc]
-    for d in 1:nd1
-        PTr = L.pw2cT_re[d]; PTi = L.pw2cT_im[d]
-        g1r = w.g1r[d]; g1i = w.g1i[d]
-        @inbounds for bc in 0:(npw * nh - 1)
-            ob = bc * p
-            ib = bc * npw
-            for x in 1:p
-                g1r[ob + x] = 0.0
-                g1i[ob + x] = 0.0
-            end
-            for a in 1:npw
-                xr = pwr[ib + a]; xi = pwi[ib + a]
-                @simd for x in 1:p
-                    tr = PTr[x, a]; ti = PTi[x, a]
-                    g1r[ob + x] = muladd(tr, xr, muladd(-ti, xi, g1r[ob + x]))
-                    g1i[ob + x] = muladd(tr, xi, muladd(ti, xr, g1i[ob + x]))
-                end
-            end
-        end
-    end
-    # y: g2[(dx,dy)][x, y, c] = Σ_b P_dy[b, y] g1[dx][x, b, c]
-    nxy = ifpgh == 1 ? 1 : (ifpgh == 2 ? 3 : 6)
-    for m in 1:nxy
-        dx, dy = _PGH_XY[m]
-        Pr = L.pw2c_re[dy + 1]; Pi = L.pw2c_im[dy + 1]
-        g1r = w.g1r[dx + 1]; g1i = w.g1i[dx + 1]
-        g2r = w.g2r[m]; g2i = w.g2i[m]
-        @inbounds for c in 1:nh, y in 1:p
-            ob = ((c - 1) * p + y - 1) * p
-            for x in 1:p
-                g2r[ob + x] = 0.0
-                g2i[ob + x] = 0.0
-            end
-            for b in 1:npw
-                tr = Pr[b, y]; ti = Pi[b, y]
-                ib = ((c - 1) * npw + b - 1) * p
-                @simd for x in 1:p
-                    xr = g1r[ib + x]; xi = g1i[ib + x]
-                    g2r[ob + x] = muladd(tr, xr, muladd(-ti, xi, g2r[ob + x]))
-                    g2i[ob + x] = muladd(tr, xi, muladd(ti, xr, g2i[ob + x]))
-                end
-            end
-        end
-    end
-    # z: out[xy, z] += 2 Σ_c Re(P_dz[c, z] g2[xy, c])
+                   L::PWLevel, p::Int, ifpgh::Int, w::PWWork)
+    npw, nh = L.npw, L.nh
     pp = p * p
-    for m in 1:ncomb
-        dx, dy, dz = _PGH_COMBOS[m]
-        ixy = findfirst(==((dx, dy)), _PGH_XY)
-        g2r = w.g2r[ixy]; g2i = w.g2i[ixy]
-        Pr = L.pw2c_re[dz + 1]; Pi = L.pw2c_im[dz + 1]
-        out = outs[m]
-        @inbounds for z in 1:p
-            ob = (z - 1) * pp
-            for c in 1:nh
-                tr = 2 * Pr[c, z]; ti = -2 * Pi[c, z]
-                ib = (c - 1) * pp
-                @simd for xy in 1:pp
-                    out[ob + xy] = muladd(tr, g2r[ib + xy], muladd(ti, g2i[ib + xy], out[ob + xy]))
-                end
+    ncol = npw * nh
+    nd1 = ifpgh == 1 ? 1 : (ifpgh == 2 ? 2 : 3)
+    nxy = ifpgh == 1 ? 1 : (ifpgh == 2 ? 3 : 6)
+    GC.@preserve outs pwr pwi L w begin
+        # x: stacked B_r = [S_r; -D_i], B_i = [S_i; D_r] with S/D = pw[u] ± pw[u'] (u ≤ nh)
+        Br = w.R1; Bi = w.R2
+        @inbounds for col in 0:(ncol - 1)
+            o = col * npw
+            @simd for u in 1:nh
+                ar = pwr[o + u]; ai = pwi[o + u]
+                br = pwr[o + npw + 1 - u]; bi = pwi[o + npw + 1 - u]
+                Br[o + u] = ar + br
+                Br[o + nh + u] = bi - ai
+                Bi[o + u] = ai + bi
+                Bi[o + nh + u] = ar - br
             end
+        end
+        for d in 1:nd1
+            gemm!(pointer(w.G1r[d]), p, pointer(L.A1[d]), p, pointer(Br), npw, p, ncol, npw, 1.0, false)
+            gemm!(pointer(w.G1i[d]), p, pointer(L.A1[d]), p, pointer(Bi), npw, p, ncol, npw, 1.0, false)
+        end
+        # y (per c): G2[:, c] = [S2_r -D2_i] * Bv, G2[:, nh+c] = [S2_i D2_r] * Bv
+        Xr = w.U; Xi = w.V
+        for m in 1:nxy
+            dx, dy = _PGH_XY[m]
+            G1r = w.G1r[dx + 1]; G1i = w.G1i[dx + 1]
+            pBv = pointer(L.Bv[dy + 1])
+            pG2 = pointer(w.G2[m])
+            for c in 1:nh
+                base = (c - 1) * npw * p
+                @inbounds for v in 1:nh
+                    o1 = base + (v - 1) * p
+                    o2 = base + (npw - v) * p
+                    ia = (v - 1) * p
+                    ib = (nh + v - 1) * p
+                    @simd for x in 1:p
+                        ar = G1r[o1 + x]; ai = G1i[o1 + x]; br = G1r[o2 + x]; bi = G1i[o2 + x]
+                        Xr[ia + x] = ar + br
+                        Xr[ib + x] = bi - ai
+                        Xi[ia + x] = ai + bi
+                        Xi[ib + x] = ar - br
+                    end
+                end
+                gemm!(pG2 + 8 * (c - 1) * pp, p, pointer(Xr), p, pBv, npw, p, p, npw, 1.0, false)
+                gemm!(pG2 + 8 * (nh + c - 1) * pp, p, pointer(Xi), p, pBv, npw, p, p, npw, 1.0, false)
+            end
+        end
+        # z: out[xy, z] += G2 * Bc
+        for m in 1:_ncombos(ifpgh)
+            dz = _PGH_COMBOS[m][3]
+            out = outs[m]
+            gemm!(pointer(out), pp, pointer(w.G2[_PGH_XYIDX[m]]), pp, pointer(L.Bc[dz + 1]), npw, pp, p, npw, 1.0, true)
         end
     end
     return nothing
