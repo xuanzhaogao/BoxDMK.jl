@@ -15,26 +15,18 @@ u(x) = \int_{\Omega} K(x, y) f(y)\,dy
 
 on tensor-product box nodes, with optional interpolation to user targets and optional derivative recovery.
 
-This repository contains both:
-
-- a pure Julia implementation producing exact Fortran-parity tree data,
-- a vendored Fortran reference build used for the solve backend and parity testing.
+Everything — tree construction and the volume-potential solve — is pure Julia.
+A vendored copy of the Fortran reference is kept only for parity testing and
+benchmarking; it is optional and not needed at runtime.
 
 ## Current Status
 
-The default workflow is:
+1. `build_tree(...)` builds the adaptive tree in Julia; it produces exactly the same tree as the Fortran builder (same refinement, `zk` forcing, 4-phase level restriction, colleague construction — bit-for-bit across all kernel/basis/dimension configurations).
+2. `bdmk(...)` solves with the pure-Julia box-DMK solver (`src/native/`), a port of the Fortran `bdmk` for 3D: Laplace, Yukawa and square-root Laplace kernels; Legendre and Chebyshev bases; potential, gradient and Hessian; arbitrary targets; any number of densities `nd`.
 
-1. Build the tree in Julia with `build_tree(...)` — produces exactly the same tree structure as the vendored Fortran builder
-2. Solve through the public `bdmk(...)` API — uses the Fortran solve backend for Laplace
-
-The Julia tree builder mirrors the Fortran algorithm exactly: same adaptive refinement with incremental `update_rints`, same `zk`-based forced refinement, same 4-phase level restriction (`flag`/`flag+`/`flag++` with `vol_tree_reorg`), and same `computecoll` colleague construction. Tree data matches Fortran bit-for-bit across all supported kernel/basis/dimension configurations.
-
-Performance: with a type-stable user function, `build_tree(...)` runs within 1.1-1.2x of a pure Fortran tree builder with a native Fortran callback.
-
-The direct Fortran entrypoints remain available for advanced use:
-
-- `bdmk_fortran(tree, fvals, ...)` for parity/debug work
-- `build_tree_fortran(...)` when you explicitly want the Fortran tree builder (slower for Julia-defined functions due to Fortran-to-Julia callbacks)
+The solver reproduces the Fortran results to ~1e-13 relative (same SOG and
+plane-wave tables, same interaction lists, same sparse/dense near-field rules)
+while being several times faster; see [Performance](#performance).
 
 ## Installation
 
@@ -45,19 +37,17 @@ Pkg.add(url = "https://github.com/xuanzhaogao/BoxDMK.jl")
 
 Requires Julia `1.10+`.
 
-## Build The Vendored Fortran Libraries
+## Optional: The Fortran Reference
 
-The public solver requires the vendored Fortran shared libraries at package load.
-
-From the package root, build them with:
+Only needed for `bdmk_fortran` / `build_tree_fortran` (parity tests and
+benchmarks). Build it from the package root with
 
 ```bash
 julia --project deps/build_fortran_ref.jl
 ```
 
-This produces repo-local libraries under `deps/usr/lib/`.
-
-If the solve library is missing, `using BoxDMK` will throw an error telling you to run that command.
+which produces `deps/usr/lib/libboxdmk{,_hot}.so` (requires `cmake`, `gfortran`
+and OpenBLAS). Set `BOXDMK_FORTRAN_LIBDIR` to use libraries built elsewhere.
 
 ## Quick Start
 
@@ -91,7 +81,9 @@ The returned `SolverResult` contains:
 - `target_grad` or `nothing`
 - `target_hess` or `nothing`
 
-`bdmk(...)` is the normal entrypoint. For Laplace solves, it uses the Fortran solve backend behind the public Julia API.
+`bdmk(...)` is the normal entrypoint. Pass `timings = zeros(10)` to receive
+the wall time of the solver stages (precomputation, local expansions, proxy
+upward pass, plane waves, near field, …).
 
 ## Performance: Writing Fast User Functions
 
@@ -199,68 +191,69 @@ LegendreBasis()
 ChebyshevBasis()
 ```
 
-## Fortran And Hybrid APIs
-
-The default public workflow is:
+## Fortran Reference APIs
 
 ```julia
-tree, fvals = build_tree(...)      # Julia tree builder (Fortran-parity)
-result = bdmk(tree, fvals, kernel; eps = 1e-6)  # Fortran solve backend
-```
-
-The Fortran entrypoints remain available:
-
-```julia
-# Explicit Fortran solve (same as bdmk for Laplace)
-result = bdmk_fortran(tree, fvals, LaplaceKernel(); eps = 1e-6)
-
-# Fortran tree builder (slower for Julia functions due to callbacks)
+result = bdmk_fortran(tree, fvals, LaplaceKernel(); eps = 1e-6)   # Fortran solve, same API
 ftree = build_tree_fortran(f, LaplaceKernel(), LegendreBasis(); ndim=3, norder=8, eps=1e-6, boxlen=1.0, nd=1)
 ```
 
-Since `build_tree(...)` now produces identical tree data to the Fortran builder, `build_tree_fortran(...)` is mainly useful for parity testing.
+## Performance
+
+PERFORMANCE_PLACEHOLDER
+
+## Implementation Notes
+
+The solver (`src/native/`) follows the nine steps of the Fortran `bdmk` and
+keeps its numerical choices (SOG nodes, plane-wave quadratures and lengths,
+proxy orders, interaction lists, local tables and their sparsity patterns,
+the dense-versus-sparse switch of the near field), which is why results agree
+with Fortran to rounding. The speed comes from restructuring the work:
+
+- **SIMD GEMM kernels** (`gemm.jl`, via SIMD.jl): every tensor-product stage
+  is a small register-blocked matrix product, with no data transposes.
+- **Near field**: same-level neighbours are evaluated target-centrically,
+  `pot += w Σ_dz Tz(Σ_dy Ty(Σ_dx Tx f_s))`, sharing the y/z stages among
+  sources (≈2× fewer flops); sparse pairs use GEMMs on pattern-zeroed tables.
+- **Plane waves**: conjugate symmetry halves all complex transforms, which run
+  as real GEMMs; leaves form/evaluate plane waves directly from/to grid values;
+  the kernel's Fourier transform is folded into the outgoing expansions; the
+  translation (M2L) runs over frequency blocks of all boxes, cache-blocked and
+  partitioned over threads, with shift factors grouped by offset.
+- **Tree passes**: parent↔child transfers share stages among the 8 children
+  and fuse the leaf value↔proxy maps; proxy data is stored only for nonleaf
+  boxes.
+- **Local expansions**: the Taylor correction and the asymptotic expansion of
+  the narrowest Gaussians are one linear combination per leaf.
+- **Runtime**: subnormal numbers are flushed to zero during the solve (the
+  Gaussian tails otherwise hit slow subnormal arithmetic); large buffers come
+  from a malloc arena (no GC pressure); dynamic scheduling over boxes.
+
+`scripts/generate_fortran_tables.jl` regenerates `src/native/tables/` from the
+Fortran DATA statements.
 
 ## Repository Layout
 
-The source tree is grouped by responsibility:
-
-- `src/core/`: types, utilities, basis/tensor/kernel primitives
-- `src/tree/`: adaptive tree construction, tree data transforms, interaction lists
-- `src/solver/`: SOG tables, proxy/passes, plane-wave pipeline, local tables, derivatives, top-level solver
-- `src/fortran/`: vendored-library paths, hotpaths, wrappers, debug snapshots
-- `benchmark/`: performance and parity drivers
-- `test/`: package regression tests
+- `src/core/`: types, utilities, basis/tensor primitives
+- `src/tree/`: adaptive tree construction
+- `src/native/`: the box-DMK solver (tables, flat tree and lists, local tables, GEMM and tensor kernels, plane waves, driver)
+- `src/solver/`: public `bdmk` entry point, target helpers, `PotentialField`
+- `src/fortran/`: optional Fortran reference wrappers
+- `benchmark/`: `native_vs_fortran.jl` (speed and accuracy against an analytic solution), cluster/node runners
+- `test/`: regression tests (Fortran parity tests run when the reference is built)
 - `deps/boxdmk_fortran/`: vendored Fortran reference sources
-
-Generated build outputs under `deps/usr/` and `deps/boxdmk_fortran/build*` are local artifacts and should not be committed.
 
 ## Development Workflow
 
-Useful commands:
-
-Run a focused test:
-
 ```bash
-julia --project --threads=1 -e 'using BoxDMK; include("test/test_solver.jl")'
-```
-
-Run wrapper and hybrid parity checks:
-
-```bash
-julia --project --threads=1 -e 'using BoxDMK; include("test/test_fortran_wrapper.jl"); include("test/test_hybrid_parity.jl")'
-```
-
-Run the reference hybrid benchmark:
-
-```bash
-JULIA_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 julia --project benchmark/hybrid_parity.jl
+julia --project -t auto -e 'using Pkg; Pkg.test()'
+OMP_NUM_THREADS=16 julia --project -t 16 benchmark/native_vs_fortran.jl results.md
 ```
 
 ## Limitations
 
-- The vendored Fortran solve library is a required runtime dependency for the public solver.
-- Tree construction is verified for exact Fortran parity across Laplace, Yukawa, and SqrtLaplace kernels, with Legendre and Chebyshev bases, in 1D/2D/3D.
-- The native Julia solver internals remain in the repo for debugging and development and are still used for kernels outside the validated Laplace-backed path.
+- The native solver is 3D only (the tree builder also supports 1D/2D).
+- `eps` must lie in `(1e-12, 1e-2]`, the range covered by the Fortran tables (SOG nodes exist for 3/6/9/12 digits, plane-wave tables for 2–11).
 
 ## License
 
