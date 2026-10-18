@@ -761,9 +761,16 @@ function _bdmk_native(tree::BoxTree, fvals::AbstractArray{<:Real,3}, kernel::Abs
     end
     ng = ifpgh >= 2 ? nb : 0
     nh = ifpgh >= 3 ? nb : 0
-    pot = pzeros(n, n, n, nd, nb)
-    gradv = pzeros(n, n, n, nd, 3, ng)
-    hessv = pzeros(n, n, n, nd, 6, nh)
+    # STEP 2 overwrites every leaf; only nonleaf boxes need zeros.
+    pot = Array{Float64}(undef, n, n, n, nd, nb)
+    gradv = Array{Float64}(undef, n, n, n, nd, 3, ng)
+    hessv = Array{Float64}(undef, n, n, n, nd, 6, nh)
+    for ibox in 1:nb
+        ft.nchild[ibox] == 0 && continue
+        fill!(view(pot, :, :, :, :, ibox), 0.0)
+        ng > 0 && fill!(view(gradv, :, :, :, :, :, ibox), 0.0)
+        nh > 0 && fill!(view(hessv, :, :, :, :, :, ibox), 0.0)
+    end
     tm[1] = (time_ns() - t0) / 1e9
 
     t0 = time_ns()

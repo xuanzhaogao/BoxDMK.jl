@@ -250,7 +250,8 @@ struct LocTabQuad
 end
 
 function LocTabQuad(basis::AbstractBasis, n::Int; nquad::Int = 50)
-    xq, wq = nodes_and_weights(LegendreBasis(), nquad)
+    qr = ortho1d(LegendreBasis(), nquad)
+    xq, wq = qr.x, qr.w
     polyv = zeros(nquad, n)
     p = zeros(n)
     for i in 1:nquad

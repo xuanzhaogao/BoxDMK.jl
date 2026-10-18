@@ -10,15 +10,30 @@ struct Ortho1D
     Vpp::Matrix{Float64}    # coefficients -> second-derivative values
 end
 
-function ortho1d(::LegendreBasis, n::Integer)
-    x, w, U, V, Vp, Vpp = _legendre_gauss_data(Int(n))
-    return Ortho1D(Int(n), x, w, Matrix(U), Matrix(V), Matrix(Vp), Matrix(Vpp))
+# The tables are computed in extended precision, so they are cached.
+const _ORTHO_CACHE = Dict{Tuple{Symbol,Int},Ortho1D}()
+const _ORTHO_LOCK = ReentrantLock()
+
+ortho1d(::LegendreBasis, n::Integer) = _cached_ortho(:legendre, Int(n))
+ortho1d(::ChebyshevBasis, n::Integer) = _cached_ortho(:chebyshev, Int(n))
+
+function _cached_ortho(kind::Symbol, n::Int)
+    lock(_ORTHO_LOCK) do
+        get!(_ORTHO_CACHE, (kind, n)) do
+            kind === :legendre ? _ortho1d_legendre(n) : _ortho1d_chebyshev(n)
+        end
+    end
 end
 
-function ortho1d(::ChebyshevBasis, n::Integer)
+function _ortho1d_legendre(n::Int)
+    x, w, U, V, Vp, Vpp = _legendre_gauss_data(n)
+    return Ortho1D(n, x, w, Matrix(U), Matrix(V), Matrix(Vp), Matrix(Vpp))
+end
+
+function _ortho1d_chebyshev(n::Int)
     return setprecision(BigFloat, 256) do
-        x, w, U, V, Vp, Vpp = _chebyshev_gauss_data(BigFloat, Int(n))
-        Ortho1D(Int(n), Float64.(x), Float64.(w), Float64.(U), Float64.(V), Float64.(Vp), Float64.(Vpp))
+        x, w, U, V, Vp, Vpp = _chebyshev_gauss_data(BigFloat, n)
+        Ortho1D(n, Float64.(x), Float64.(w), Float64.(U), Float64.(V), Float64.(Vp), Float64.(Vpp))
     end
 end
 
