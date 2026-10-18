@@ -173,3 +173,28 @@ function pfill!(a::Array{Float64}, v::Float64 = 0.0)
 end
 
 pzeros(dims::Int...) = pfill!(Array{Float64}(undef, dims...))
+
+# Large solver buffers are taken from malloc and released when the solve ends,
+# so they neither trigger nor burden garbage collection.
+struct Arena
+    ptrs::Vector{Ptr{Cvoid}}
+    lock::ReentrantLock
+end
+Arena() = Arena(Ptr{Cvoid}[], ReentrantLock())
+
+function alloc(ar::Arena, dims::Int...)
+    n = prod(dims)
+    n == 0 && return Array{Float64}(undef, dims...)
+    p = Libc.malloc(8 * n)
+    p == C_NULL && throw(OutOfMemoryError())
+    lock(() -> push!(ar.ptrs, p), ar.lock)
+    return unsafe_wrap(Array, Ptr{Float64}(p), dims)
+end
+
+function release!(ar::Arena)
+    lock(ar.lock) do
+        foreach(Libc.free, ar.ptrs)
+        empty!(ar.ptrs)
+    end
+    return nothing
+end

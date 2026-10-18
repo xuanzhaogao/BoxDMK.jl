@@ -95,10 +95,10 @@ struct PWWork
     loci::Vector{Float64}
 end
 
-function PWWork(npw::Int, porder::Int)
+function PWWork(npw::Int, porder::Int, ar::Arena)
     nh = npw ÷ 2
     p = porder
-    u(m) = Vector{Float64}(undef, m)     # every buffer is written before it is read
+    u(m) = alloc(ar, m)     # every buffer is written before it is read
     PWWork(u(p * p * npw), u(p * npw), u(p * npw),
            u(p * npw * nh), u(p * npw * nh), u(npw * npw * nh), u(npw * npw * nh),
            [u(p * npw * nh) for _ in 1:3], [u(p * npw * nh) for _ in 1:3],

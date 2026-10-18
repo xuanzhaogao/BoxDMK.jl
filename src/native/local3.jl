@@ -16,9 +16,9 @@ struct LocalWork
 end
 
 # Buffers are only read where they were written, so they start uninitialized.
-LocalWork(n::Int) = LocalWork(Array{Float64}(undef, n, n, n), Array{Float64}(undef, n, n, n),
-                              [Array{Float64}(undef, n, n, n) for _ in 1:3], [Array{Float64}(undef, n, n, n) for _ in 1:6],
-                              Vector{Float64}(undef, n^3), Vector{Float64}(undef, n^3))
+LocalWork(n::Int, ar::Arena) = LocalWork(alloc(ar, n, n, n), alloc(ar, n, n, n),
+                                         [alloc(ar, n, n, n) for _ in 1:3], [alloc(ar, n, n, n) for _ in 1:6],
+                                         alloc(ar, n^3), alloc(ar, n^3))
 
 # Sparse-path near field with GEMMs on pattern-zeroed tables, restricted to
 # the nonzero blocks (identical to Fortran's sparse loops up to rounding):

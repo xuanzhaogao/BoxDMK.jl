@@ -42,6 +42,7 @@ struct DMKSetup
     loctabs::Vector{Vector{Union{Nothing,LocTab1D}}}   # [ilev+1][id]
     pwlevels::Vector{Union{Nothing,PWLevel}}            # [ilev+1]
     taylor::NTuple{3,Float64}
+    arena::Arena                # large buffers of this solve
 end
 
 _lvidx(ilev::Int) = ilev - _NLEVSTART + 1
@@ -140,7 +141,7 @@ function DMKSetup(tree::BoxTree, nd::Int, kernel::AbstractKernel, eps::Float64, 
                     c2p, map(m -> Matrix(transpose(m)), c2p),
                     map(m -> m * den2pc, c2p), map(m -> Matrix(transpose(m * den2pc)), c2p),
                     map(m -> poteval * m, p2c), map(m -> Matrix(transpose(poteval * m)), p2c), prox,
-                    loctabs, pwlevels, taylor)
+                    loctabs, pwlevels, taylor, Arena())
 end
 
 leafboxes(ft::FlatTree) = [ibox for ibox in 1:ft.nboxes if ft.nchild[ibox] == 0]
@@ -163,7 +164,7 @@ function step2_local_expansions!(pot, grad, hess, s::DMKSetup, fv)
     ft, n, nd, ifpgh = s.ft, s.n, s.nd, s.ifpgh
     c0, c1, c2 = s.taylor
     asym = [s.idelta[ilev + 1] > 0 ? _asym_coefs(s, s.idelta[ilev + 1]) : (0.0, 0.0, 0.0) for ilev in 0:ft.nlevels]
-    wss = make_workspaces(() -> ntuple(_ -> Array{Float64}(undef, n, n, n), 5))
+    wss = make_workspaces(() -> ntuple(_ -> alloc(s.arena, n, n, n), 5))
     parallel_foreach(leafboxes(ft), wss) do ibox, (fl, fl2, gd, gld, tmp)
         ilev = ft.level[ibox]
         a0, a2, a4 = asym[ilev + 1]
@@ -218,7 +219,7 @@ struct TPWork
     w4::Vector{Float64}
     tmp::Vector{Vector{Float64}}    # one p³ buffer per child slot
 end
-TPWork(m::Int) = (u = () -> Vector{Float64}(undef, m); TPWork(u(), u(), u(), u(), [u() for _ in 1:8]))
+TPWork(m::Int, ar::Arena) = (u = () -> alloc(ar, m); TPWork(u(), u(), u(), u(), [u() for _ in 1:8]))
 
 # Proxy data is stored only for nonleaf boxes (and the root): leaves form and
 # evaluate plane waves directly from/to their grid values, and their proxy
@@ -257,7 +258,7 @@ end
 
 function step3_upward!(pc, nodeidx, s::DMKSetup, fv)
     ft, n, nd, p = s.ft, s.n, s.nd, s.porder
-    wss = make_workspaces(() -> TPWork(max(p, n)^3))
+    wss = make_workspaces(() -> TPWork(max(p, n)^3, s.arena))
     for ilev in ft.nlevels:-1:0
         boxes = [ibox for ibox in levelboxes(ft, ilev) if nodeidx[ibox] > 0]
         sc3 = ilev < ft.nlevels ? (ft.boxsize[ilev + 2] / 2)^3 : 0.0
@@ -300,7 +301,7 @@ function steps456_planewave!(pot, grad, hess, pp, pc, nodeidx, s::DMKSetup, fv)
         r = ipwrange(s, ilev)
         isempty(r) && continue
         L = PWLevel(eps, ilev, p, bs0, bs0, @view(s.deltas[r]), @view(s.wdeltas[r]), s.prox)
-        w = PWWork(L.npw, max(p, s.n))
+        w = PWWork(L.npw, max(p, s.n), s.arena)
         for ind in 1:nd
             proxy2pw!(w.locr, w.loci, view(pc, :, ind, nodeidx[1]), L, L.prox, w, 0, PWLayout(L), true)
             pw2proxy!(ProxyOuts(pp, ind, nodeidx[1]), w.locr, w.loci, L, L.prox, ifpgh, w)
@@ -308,7 +309,7 @@ function steps456_planewave!(pot, grad, hess, pp, pc, nodeidx, s::DMKSetup, fv)
     end
 
     mpidx = zeros(Int, ft.nboxes)
-    tpw = make_workspaces(() -> TPWork(p^3))
+    tpw = make_workspaces(() -> TPWork(p^3, s.arena))
     # Workspaces and expansion storage are sized once for the busiest level
     # (all levels >= 0 share the same number of plane waves).
     npw = pw_terms(eps, 0)
@@ -317,12 +318,12 @@ function steps456_planewave!(pot, grad, hess, pp, pc, nodeidx, s::DMKSetup, fv)
     ncols = npw * (npw ÷ 2)
     cb = min(ncols, cld(2048, npw))           # ~16 KB of a box's expansion per block
     nblk = cld(ncols, cb)
-    mpr = Array{Float64}(undef, npw, cb, nd, maxboxes, nblk)
-    mpi = Array{Float64}(undef, npw, cb, nd, maxboxes, nblk)
-    locr = Array{Float64}(undef, npw, cb, nd, maxboxes, nblk)
-    loci = Array{Float64}(undef, npw, cb, nd, maxboxes, nblk)
+    mpr = alloc(s.arena, npw, cb, nd, maxboxes, nblk)
+    mpi = alloc(s.arena, npw, cb, nd, maxboxes, nblk)
+    locr = alloc(s.arena, npw, cb, nd, maxboxes, nblk)
+    loci = alloc(s.arena, npw, cb, nd, maxboxes, nblk)
     lay = PWLayout(npw, cb, npw * cb * nd * maxboxes)
-    wss = make_workspaces(() -> PWWork(npw, max(p, s.n)))
+    wss = make_workspaces(() -> PWWork(npw, max(p, s.n), s.arena))
     accs = [zeros(2 * 64) for _ in 1:_nthreads()]
     for ilev in 0:ft.nlevels
         boxes = [ibox for ibox in levelboxes(ft, ilev) if s.ifpwexp[ibox]]
@@ -402,7 +403,7 @@ end
 
 function step7_local!(pot, grad, hess, s::DMKSetup, fv)
     ft, n = s.ft, s.n
-    wss = make_workspaces(() -> (LocalWork(n), Vector{Float64}(undef, n^3), Vector{Float64}(undef, n^3), zeros(Int, 27), Int[]))
+    wss = make_workspaces(() -> (LocalWork(n, s.arena), alloc(s.arena, n^3), alloc(s.arena, n^3), zeros(Int, 27), Int[]))
     parallel_foreach(leafboxes(ft), wss) do ibox, ws
         if s.ifpgh == 1
             _local_pot_box!(pot, s, fv, ibox, ws)
@@ -580,7 +581,7 @@ end
 function step9_proxy2pot!(pot, grad, hess, pp, nodeidx, s::DMKSetup)
     ft, n, nd, p = s.ft, s.n, s.nd, s.porder
     ncomb = _ncombos(s.ifpgh)
-    wss = make_workspaces(() -> TPWork(max(n, p)^3))
+    wss = make_workspaces(() -> TPWork(max(n, p)^3, s.arena))
     leaves = [ibox for ibox in 1:ft.nboxes if ft.nchild[ibox] == 0 && nodeidx[ibox] > 0]
     parallel_foreach(leaves, wss) do ibox, w
         for ind in 1:nd, c in 1:ncomb
@@ -675,6 +676,9 @@ function bdmk_native(tree::BoxTree, fvals::AbstractArray{<:Real,3}, kernel::Abst
     end
 end
 
+# Box data live in the solve's arena except what is returned to the caller.
+_boxarray(s::DMKSetup, returned::Bool, dims::Int...) = returned ? Array{Float64}(undef, dims...) : alloc(s.arena, dims...)
+
 function _bdmk_native(tree::BoxTree, fvals::AbstractArray{<:Real,3}, kernel::AbstractKernel, eps::Float64,
                       grad::Bool, hess::Bool, targets, timings)
     nd, np = _check_solver_inputs(tree, fvals)
@@ -684,13 +688,21 @@ function _bdmk_native(tree::BoxTree, fvals::AbstractArray{<:Real,3}, kernel::Abs
 
     t0 = time_ns()
     s = DMKSetup(tree, nd, kernel, eps, ifpgh)
+    try
+        return _bdmk_steps(s, tree, fvals, nd, np, ifpgh, targets, tm, t0)
+    finally
+        release!(s.arena)
+    end
+end
+
+function _bdmk_steps(s::DMKSetup, tree::BoxTree, fvals, nd::Int, np::Int, ifpgh::Int, targets, tm, t0)
     ft, n, p = s.ft, s.n, s.porder
     nb = ft.nboxes
     # Box data are (n, n, n, nd, nboxes); for nd = 1 that is the layout of fvals.
     fv = if nd == 1 && fvals isa Array{Float64,3}
         reshape(fvals, n, n, n, 1, nb)
     else
-        a = Array{Float64,5}(undef, n, n, n, nd, nb)
+        a = alloc(s.arena, n, n, n, nd, nb)
         a3 = reshape(a, np, nd, nb)
         parallel_foreach(1:nb, fill(nothing, _nthreads())) do ibox, _
             for ind in 1:nd
@@ -704,9 +716,9 @@ function _bdmk_native(tree::BoxTree, fvals::AbstractArray{<:Real,3}, kernel::Abs
     ng = ifpgh >= 2 ? nb : 0
     nh = ifpgh >= 3 ? nb : 0
     # STEP 2 overwrites every leaf; only nonleaf boxes need zeros.
-    pot = Array{Float64}(undef, n, n, n, nd, nb)
-    gradv = Array{Float64}(undef, n, n, n, nd, 3, ng)
-    hessv = Array{Float64}(undef, n, n, n, nd, 6, nh)
+    pot = _boxarray(s, nd == 1, n, n, n, nd, nb)
+    gradv = _boxarray(s, false, n, n, n, nd, 3, ng)
+    hessv = _boxarray(s, false, n, n, n, nd, 6, nh)
     for ibox in 1:nb
         ft.nchild[ibox] == 0 && continue
         fill!(view(pot, :, :, :, :, ibox), 0.0)
@@ -721,12 +733,12 @@ function _bdmk_native(tree::BoxTree, fvals::AbstractArray{<:Real,3}, kernel::Abs
 
     t0 = time_ns()
     nodeidx, nnode = node_index(s)
-    pc = Array{Float64}(undef, p^3, nd, nnode)
+    pc = alloc(s.arena, p^3, nd, nnode)
     step3_upward!(pc, nodeidx, s, fv)
     tm[3] = (time_ns() - t0) / 1e9
 
     t0 = time_ns()
-    pp = pzeros(p^3, nd, _ncombos(ifpgh), nnode)
+    pp = pfill!(alloc(s.arena, p^3, nd, _ncombos(ifpgh), nnode))
     steps456_planewave!(pot, gradv, hessv, pp, pc, nodeidx, s, fv)
     tm[4] = (time_ns() - t0) / 1e9
 
