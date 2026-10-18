@@ -9,7 +9,7 @@ for _ in 1:4
     t = @elapsed bdmk(tree, fvals, LaplaceKernel(); eps = e, grad = g, hess = h, timings = tm)
     t < best && (best = t; bt .= tm)
 end
-@printf("T=%3d n=%d eps=%.0e grad=%d hess=%d: %.3f s  (pre %.3f s2 %.3f s3 %.3f pw %.3f s7 %.3f out %.3f)\n",
-        Threads.nthreads(), n, e, g, h, best, bt[1], bt[2], bt[3], bt[4], bt[7], bt[10])
+@printf("T=%3d n=%d eps=%.0e grad=%d hess=%d: %.3f s  (pre %.3f s2 %.3f s3 %.3f pw %.3f [form %.3f m2l %.3f eval %.3f down %.3f] s7 %.3f out %.3f)\n",
+        Threads.nthreads(), n, e, g, h, best, bt[1], bt[2], bt[3], bt[4], bt[5], bt[6], bt[8], bt[9], bt[7], bt[10])
 end
 probe()

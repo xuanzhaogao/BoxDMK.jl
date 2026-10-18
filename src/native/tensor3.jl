@@ -177,27 +177,57 @@ end
 
 pzeros(dims::Int...) = pfill!(Array{Float64}(undef, dims...))
 
-# Large solver buffers are taken from malloc and released when the solve ends,
-# so they neither trigger nor burden garbage collection.
+# Large solver buffers are taken from malloc and handed back when the solve
+# ends, so they neither trigger nor burden garbage collection. Returned
+# blocks are kept in a pool (by size) and reused by later solves, which then
+# skip the page faults of fresh memory; `release_memory!()` frees the pool.
 struct Arena
-    ptrs::Vector{Ptr{Cvoid}}
+    ptrs::Vector{Tuple{Ptr{Cvoid},Int}}
     lock::ReentrantLock
 end
-Arena() = Arena(Ptr{Cvoid}[], ReentrantLock())
+Arena() = Arena(Tuple{Ptr{Cvoid},Int}[], ReentrantLock())
+
+const _POOL = Dict{Int,Vector{Ptr{Cvoid}}}()
+const _POOL_LOCK = ReentrantLock()
 
 function alloc(ar::Arena, dims::Int...)
     n = prod(dims)
     n == 0 && return Array{Float64}(undef, dims...)
-    p = Libc.malloc(8 * n)
-    p == C_NULL && throw(OutOfMemoryError())
-    lock(() -> push!(ar.ptrs, p), ar.lock)
+    p = lock(_POOL_LOCK) do
+        blocks = get(_POOL, n, nothing)
+        (blocks === nothing || isempty(blocks)) ? C_NULL : pop!(blocks)
+    end
+    if p == C_NULL
+        p = Libc.malloc(8 * n)
+        p == C_NULL && throw(OutOfMemoryError())
+    end
+    lock(() -> push!(ar.ptrs, (p, n)), ar.lock)
     return unsafe_wrap(Array, Ptr{Float64}(p), dims)
 end
 
 function release!(ar::Arena)
     lock(ar.lock) do
-        foreach(Libc.free, ar.ptrs)
+        lock(_POOL_LOCK) do
+            for (p, n) in ar.ptrs
+                push!(get!(Vector{Ptr{Cvoid}}, _POOL, n), p)
+            end
+        end
         empty!(ar.ptrs)
+    end
+    return nothing
+end
+
+"""
+    BoxDMK.release_memory!()
+
+Free the solver buffers kept for reuse by later `bdmk` calls.
+"""
+function release_memory!()
+    lock(_POOL_LOCK) do
+        for blocks in values(_POOL), p in blocks
+            Libc.free(p)
+        end
+        empty!(_POOL)
     end
     return nothing
 end

@@ -299,7 +299,7 @@ end
     tp3!(out, phi, s.poteval, s.potevalT, s.potevalT, w.w1, w.w2, 1.0, true)
 end
 
-function steps456_planewave!(pot, grad, hess, pp, pc, nodeidx, s::DMKSetup, fv, tpw::Vector{TPWork})
+function steps456_planewave!(pot, grad, hess, pp, pc, nodeidx, s::DMKSetup, fv, tpw::Vector{TPWork}, tm::Vector{Float64})
     ft, nd, p, ifpgh, eps = s.ft, s.nd, s.porder, s.ifpgh, s.eps
     ncomb = _ncombos(ifpgh)
     bs0 = ft.boxsize[1]
@@ -343,6 +343,7 @@ function steps456_planewave!(pot, grad, hess, pp, pc, nodeidx, s::DMKSetup, fv, 
             @assert L.nexp == nexp
             # outgoing expansions, premultiplied by the kernel's Fourier transform
             mpr1 = vec(mpr); mpi1 = vec(mpi); locr1 = vec(locr); loci1 = vec(loci)
+            t0 = time_ns()
             parallel_foreach(boxes, wss) do ibox, w
                 k = mpidx[ibox]
                 for ind in 1:nd
@@ -354,12 +355,14 @@ function steps456_planewave!(pot, grad, hess, pp, pc, nodeidx, s::DMKSetup, fv, 
                     end
                 end
             end
+            t1 = time_ns(); tm[5] += (t1 - t0) / 1e9
             lst = _m2l_list(s, boxes, mpidx, ft.boxsize[ilev + 1])
             nchunk = min(ncols, 8 * _nthreads())
             ranges = [(1 + div((i - 1) * ncols, nchunk)):div(i * ncols, nchunk) for i in 1:nchunk]
             parallel_foreach(ranges, accs) do cols, acc
                 m2l_columns!(locr, loci, mpr, mpi, lst, L, nd, nbl, cols, acc)
             end
+            t2 = time_ns(); tm[6] += (t2 - t1) / 1e9
             parallel_foreach(boxes, wss) do ibox, w
                 k = mpidx[ibox]
                 for ind in 1:nd
@@ -371,10 +374,11 @@ function steps456_planewave!(pot, grad, hess, pp, pc, nodeidx, s::DMKSetup, fv, 
                     end
                 end
             end
+            tm[8] += (time_ns() - t2) / 1e9
         end
-        # Downward pass: parent proxy potential -> children. Children without
-        # plane-wave expansions are leaves whose proxy potential is complete
-        # now, so it is evaluated on their grid directly.
+        # Downward pass: parent proxy potential -> children. Leaf children get
+        # their (now complete) proxy potential evaluated on their grid directly.
+        t3 = time_ns()
         parents = [ibox for ibox in boxes if ft.nchild[ibox] > 0]
         parallel_foreach(parents, tpw) do ibox, w
             for ind in 1:nd, c in 1:ncomb
@@ -385,6 +389,7 @@ function steps456_planewave!(pot, grad, hess, pp, pc, nodeidx, s::DMKSetup, fv, 
                 parent2children!(ol, phi, s.p2cf, s.p2cfT, s.p2cfT, p, s.n, w.w1, w.w2)
             end
         end
+        tm[9] += (time_ns() - t3) / 1e9
     end
     return nothing
 end
@@ -659,8 +664,10 @@ end
     bdmk_native(tree, fvals, kernel; eps=1e-6, grad=false, hess=false, targets=nothing, timings=nothing)
 
 Pure-Julia box-DMK volume potential solver (3D). `timings`, if given a
-`Vector{Float64}` of length ≥ 10, receives the wall time of precomputation and
-STEPS 2–9 (Fortran `tottimeinfo` order) plus target evaluation.
+`Vector{Float64}` of length ≥ 10, receives wall times (s): [1] precomputation,
+[2] local Taylor + asymptotic expansions, [3] proxy upward pass, [4] plane-wave
+part (total), of which [5] formation, [6] translation, [8] evaluation,
+[9] downward pass; [7] near field, [10] output and targets.
 """
 function bdmk_native(tree::BoxTree, fvals::AbstractArray{<:Real,3}, kernel::AbstractKernel;
                      eps = 1e-6, grad::Bool = false, hess::Bool = false, targets = nothing,
@@ -738,7 +745,7 @@ function _bdmk_steps(s::DMKSetup, tree::BoxTree, fvals, nd::Int, np::Int, ifpgh:
 
     t0 = time_ns()
     pp = pfill!(alloc(s.arena, p^3, nd, _ncombos(ifpgh), nnode))
-    steps456_planewave!(pot, gradv, hessv, pp, pc, nodeidx, s, fv, tpw)
+    steps456_planewave!(pot, gradv, hessv, pp, pc, nodeidx, s, fv, tpw, tm)
     tm[4] = (time_ns() - t0) / 1e9
 
     t0 = time_ns()
@@ -746,9 +753,7 @@ function _bdmk_steps(s::DMKSetup, tree::BoxTree, fvals, nd::Int, np::Int, ifpgh:
     tm[7] = (time_ns() - t0) / 1e9
 
 
-    t0 = time_ns()
     step9_proxy2pot!(pot, gradv, hessv, pp, nodeidx, s, tpw)
-    tm[9] = (time_ns() - t0) / 1e9
 
     t0 = time_ns()
     pot_out = _unflatten(pot, ft, nd, np)
