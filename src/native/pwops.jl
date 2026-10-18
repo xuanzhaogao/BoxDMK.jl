@@ -266,23 +266,22 @@ end
 struct M2LList
     ptr::Vector{Int}
     k::Vector{Int}
-    ky::Vector{Int}
-    kz::Vector{Int}
+    kyz::Vector{Int}            # ky + 3(kz - 1)
     nkx::Matrix{Int}
 end
 
 function M2LList(srcs::Vector{Vector{NTuple{4,Int}}})
     ptr = ones(Int, length(srcs) + 1)
-    k = Int[]; ky = Int[]; kz = Int[]
+    k = Int[]; kyz = Int[]
     nkx = zeros(Int, 3, length(srcs))
     for (t, list) in enumerate(srcs)
         for (ks, dx, dy, dz) in sort(list; by = x -> x[2])
-            push!(k, ks); push!(ky, dy + 2); push!(kz, dz + 2)
+            push!(k, ks); push!(kyz, (dy + 2) + 3 * (dz + 1))
             nkx[dx + 2, t] += 1
         end
         ptr[t + 1] = length(k) + 1
     end
-    return M2LList(ptr, k, ky, kz, nkx)
+    return M2LList(ptr, k, kyz, nkx)
 end
 
 # loc[:, ind, t, col] = Σ_sources shift(t - s) ⊙ mp[:, ind, s, col] for the
@@ -304,15 +303,21 @@ function m2l_columns!(locr::Array{Float64,4}, loci::Array{Float64,4}, mpr::Array
             v = (col - 1) % npw + 1
             cz = (col - 1) ÷ npw + 1
             cbase = (col - 1) * cstr
+            # the 9 (y, z) shift products of this column
+            wyz = ntuple(9) do j
+                ky = (j - 1) % 3 + 1; kz = (j - 1) ÷ 3 + 1
+                @inbounds yr = Sr[v, ky]; @inbounds yi = Si[v, ky]
+                @inbounds zr = Sr[cz, kz]; @inbounds zi = Si[cz, kz]
+                (yr * zr - yi * zi, yr * zi + yi * zr)
+            end
             for t in 1:ntarg
                 q0 = lst.ptr[t]
                 nq = lst.ptr[t + 1] - q0
                 @inbounds for i in 0:(nq - 1)
                     q = q0 + i
-                    ky = lst.ky[q]; kz = lst.kz[q]
-                    yr = Sr[v, ky]; yi = Si[v, ky]; zr = Sr[cz, kz]; zi = Si[cz, kz]
-                    scr[2i + 1] = yr * zr - yi * zi
-                    scr[2i + 2] = yr * zi + yi * zr
+                    sr, si = wyz[lst.kyz[q]]
+                    scr[2i + 1] = sr
+                    scr[2i + 2] = si
                 end
                 n1 = lst.nkx[1, t]; n2 = lst.nkx[2, t]
                 for ind in 1:nd
