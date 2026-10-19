@@ -56,22 +56,26 @@ struct PeriodicResult
 end
 
 """
-    bdmk_periodic(f, L; eps=1e-6, norder=16, rc_factor=0.25, nhalo=1, timings=nothing)
+    bdmk_periodic(f, L; eps=1e-6, norder=16, rc_factor=0.25, nhalo=1, f_batch=nothing, timings=nothing)
 
 Periodic Coulomb potential `u(x) = ∫_cell Σ_n f(y) / |x - y - n∘L| dy` (k = 0
 mode dropped) of the charge-neutral, `L`-periodic density
 `f(x::AbstractVector) -> Real` on the orthorhombic cell `[0, L₁) × [0, L₂) × [0, L₃)`
-(`L` a number for a cube). The level-0 boxes have side
+(`L` a number for a cube); `f_batch!(values, points)` (values `(1, npts)`,
+points `(3, npts)`) may be given instead of `f`. The level-0 boxes have side
 `rc ≈ rc_factor * minimum(L)`, rounded so that every side is a multiple of it.
 `timings` (length ≥ 6) receives wall times (s): [1] forest, [2] setup,
 [3] local expansions + upward pass, [4] wide part, [5] plane waves,
-[6] near field.
+[6] near field, and if length ≥ 10 the plane-wave split [7] formation,
+[8] translation, [9] evaluation, [10] downward pass.
 """
 function bdmk_periodic(f, L; eps::Real = 1e-6, norder::Int = 16, rc_factor::Real = 0.25, nhalo::Int = 1,
-                       timings::Union{Nothing,Vector{Float64}} = nothing)
+                       f_batch = nothing, timings::Union{Nothing,Vector{Float64}} = nothing)
+    f_batch === nothing || (f = _BatchDensity(f_batch))
     old_ftz = get_zero_subnormals()
     set_zero_subnormals(true)
     try
+        f === nothing && throw(ArgumentError("provide a density f or a batch density f_batch"))
         return _bdmk_periodic(f, L isa Real ? (Float64(L), Float64(L), Float64(L)) : Float64.(Tuple(L)),
                               Float64(eps), norder, Float64(rc_factor), nhalo, timings)
     finally
@@ -80,7 +84,7 @@ function bdmk_periodic(f, L; eps::Real = 1e-6, norder::Int = 16, rc_factor::Real
 end
 
 function _bdmk_periodic(f, L::NTuple{3,Float64}, eps::Float64, n::Int, rc_factor::Float64, nhalo::Int, timings)
-    tm = timings === nothing ? zeros(6) : timings
+    tm = timings === nothing ? zeros(10) : timings
     fill!(tm, 0.0)
     nhalo >= 1 || throw(ArgumentError("nhalo must be ≥ 1"))
     dmin = minimum(L)
@@ -101,7 +105,7 @@ function _bdmk_periodic(f, L::NTuple{3,Float64}, eps::Float64, n::Int, rc_factor
     tsw, wsw = ts[iswide], ws[iswide]
     taylor = taylor_coefficients(LaplaceKernel(), r0, wn, dn)
     s = DMKSetup(ft, LegendreBasis(), n, 1, eps, 1, r0, wn, dn, taylor; asym_safety = 1e-4, istarget = istarget)
-    wplan = isempty(tsw) ? nothing : WidePlan(g, eps, s.porder, tsw, wsw)
+    wplan = isempty(tsw) ? nothing : WidePlan(g, eps, wide_orders(eps, s.porder, n, rc)..., tsw, wsw)
     tm[2] = (time_ns() - t0) / 1e9
     try
         pot = _periodic_steps(s, g, fvals, wplan, tm)
@@ -136,6 +140,7 @@ function _periodic_steps(s::DMKSetup, g::PeriodicGrid, fvals::Array{Float64,4}, 
     pwtm = zeros(10)
     steps456_planewave!(pot, gdum, hdum, pp, pc, nodeidx, s, fv, tpw, pwtm)
     tm[5] = (time_ns() - t0) / 1e9
+    length(tm) >= 10 && (tm[7:10] .= pwtm[[5, 6, 8, 9]])
 
     t0 = time_ns()
     step7_local!(pot, gdum, hdum, s, fv)
@@ -159,22 +164,27 @@ end
 # evaluated directly on leaf boxes.
 function _wide_inject!(pot, pp, pc, nodeidx, s::DMKSetup, g::PeriodicGrid, fv, P::WidePlan, tpw)
     ft, p = s.ft, s.porder
+    pf, pe = P.pf, P.pe
     boxes = [(ibox, c) for ibox in levelboxes(ft, 0) for c in (_central_index(g, ibox),) if c !== nothing]
-    M = zeros(p * g.mgrid[1], p * g.mgrid[2], p * g.mgrid[3])
+    M = alloc(s.arena, pf * g.mgrid[1], pf * g.mgrid[2], pf * g.mgrid[3])
     sc3 = (g.rc / 2)^3
-    parallel_foreach(boxes, tpw) do (ibox, (i, j, k)), w
+    wks = make_workspaces(() -> (w1 = alloc(s.arena, max(p, s.n)^3), w2 = alloc(s.arena, max(p, s.n)^3),
+                                  w3 = alloc(s.arena, p^3)))
+    parallel_foreach(boxes, wks) do (ibox, (i, j, k)), w
         q = if ft.nchild[ibox] == 0
-            out = zeros(p, p, p)
+            out = reshape(view(w.w3, 1:p^3), p, p, p)
             tp3!(out, view(fv, :, :, :, 1, ibox), s.den2pc, s.den2pcT, s.den2pcT, w.w1, w.w2, sc3, false)
             out
         else
             reshape(view(pc, :, 1, nodeidx[ibox]), p, p, p)
         end
-        M[p * i + 1:p * (i + 1), p * j + 1:p * (j + 1), p * k + 1:p * (k + 1)] .= q
+        M[pf * i + 1:pf * (i + 1), pf * j + 1:pf * (j + 1), pf * k + 1:pf * (k + 1)] .= view(q, 1:pf, 1:pf, 1:pf)
     end
-    C = wide_coefficients(P, M)
-    parallel_foreach(boxes, tpw) do (ibox, (i, j, k)), w
-        cb = C[p * i + 1:p * (i + 1), p * j + 1:p * (j + 1), p * k + 1:p * (k + 1)]
+    C = wide_coefficients(P, M, s.arena)
+    parallel_foreach(boxes, wks) do (ibox, (i, j, k)), w
+        cb = reshape(view(w.w3, 1:p^3), p, p, p)
+        fill!(cb, 0.0)
+        cb[1:pe, 1:pe, 1:pe] .= view(C, pe * i + 1:pe * (i + 1), pe * j + 1:pe * (j + 1), pe * k + 1:pe * (k + 1))
         if ft.nchild[ibox] == 0
             tp3!(view(pot, :, :, :, 1, ibox), cb, s.poteval, s.potevalT, s.potevalT, w.w1, w.w2, 1.0, true)
         else

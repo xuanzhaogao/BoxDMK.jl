@@ -47,13 +47,14 @@ mutable struct _Forest
     level::Vector{Int}
     parent::Vector{Int}
     child::Vector{NTuple{8,Int}}    # slot = 1 + sx + 2sy + 4sz
-    fvals::Vector{Float64}          # n³ values per box, x fastest
+    fvals::Vector{Vector{Float64}}  # n³ values per box, x fastest (arena memory)
     boxsize::Vector{Float64}        # boxsize[ilev + 1]
+    ar::Arena
 end
 
 _nbox(F::_Forest) = length(F.level)
 _isleaf(F::_Forest, b::Int) = F.child[b][1] == 0
-_fbox(F::_Forest, b::Int) = view(F.fvals, (b - 1) * F.n^3 + 1:b * F.n^3)
+_fbox(F::_Forest, b::Int) = F.fvals[b]
 
 function _addbox!(F::_Forest, c::NTuple{3,Float64}, lev::Int, par::Int)
     push!(F.centers, c); push!(F.level, lev); push!(F.parent, par)
@@ -61,18 +62,40 @@ function _addbox!(F::_Forest, c::NTuple{3,Float64}, lev::Int, par::Int)
     return _nbox(F)
 end
 
+# Point-by-point density f(x) -> value, or batch density
+# f_batch!(values (1, npts), points (3, npts)) as in `build_tree`.
+struct _BatchDensity{B}
+    f!::B
+end
+
 # Sample the density on the grids of boxes `bs` (appended at the end).
 function _sample!(F::_Forest, f, bs, x::Vector{Float64})
     n = F.n; np = n^3
-    resize!(F.fvals, _nbox(F) * np)
+    length(F.fvals) < _nbox(F) && resize!(F.fvals, _nbox(F))
+    for b in bs
+        F.fvals[b] = alloc(F.ar, np)
+    end
+    if f isa _BatchDensity
+        parallel_foreach(bs, [zeros(3, np) for _ in 1:_nthreads()]) do b, pts
+            c = F.centers[b]
+            h = F.boxsize[F.level[b] + 1] / 2
+            i = 0
+            for iz in 1:n, iy in 1:n, ix in 1:n
+                i += 1
+                pts[1, i] = c[1] + h * x[ix]; pts[2, i] = c[2] + h * x[iy]; pts[3, i] = c[3] + h * x[iz]
+            end
+            f.f!(reshape(F.fvals[b], 1, np), pts)
+        end
+        return F
+    end
     parallel_foreach(bs, [zeros(3) for _ in 1:_nthreads()]) do b, pt
         c = F.centers[b]
         h = F.boxsize[F.level[b] + 1] / 2
-        off = (b - 1) * np
+        v = F.fvals[b]
         i = 0
         for iz in 1:n, iy in 1:n, ix in 1:n
             pt[1] = c[1] + h * x[ix]; pt[2] = c[2] + h * x[iy]; pt[3] = c[3] + h * x[iz]
-            F.fvals[off + (i += 1)] = f(pt)
+            @inbounds v[i += 1] = f(pt)
         end
     end
     return F
@@ -212,21 +235,34 @@ function _balance!(F::_Forest, g::PeriodicGrid, f, x::Vector{Float64})
 end
 
 """
-    build_periodic_forest(f, grid::PeriodicGrid; norder=16, eps=1e-6, min_levels=1)
+    build_periodic_forest(f, grid::PeriodicGrid; norder=16, eps=1e-6, min_levels=1, f_batch=nothing)
 
-Adaptive forest over `grid` for the periodic density `f(x::AbstractVector) -> Real`.
+Adaptive forest over `grid` for the periodic density `f(x::AbstractVector) -> Real`
+(or the batch form `f_batch!(values::AbstractMatrix, points::AbstractMatrix)`,
+values `(1, npts)`, points `(3, npts)`).
 Returns `(ft::FlatTree, fvals::Array{Float64,4}, istarget::BitVector)` with boxes
 in level order, `fvals` of size `(n, n, n, nboxes)` and `istarget` false on halo
 boxes.
 """
-function build_periodic_forest(f, g::PeriodicGrid; norder::Int = 16, eps::Float64 = 1e-6, min_levels::Int = 1)
-    n = norder
+function build_periodic_forest(f, g::PeriodicGrid; norder::Int = 16, eps::Float64 = 1e-6, min_levels::Int = 1,
+                               f_batch = nothing)
+    f_batch === nothing || (f = _BatchDensity(f_batch))
+    f === nothing && throw(ArgumentError("provide a density f or a batch density f_batch"))
+    F = _Forest(norder, NTuple{3,Float64}[], Int[], Int[], NTuple{8,Int}[], Vector{Float64}[], [g.rc], Arena())
+    try
+        return _build_forest!(F, f, g, eps, min_levels)
+    finally
+        release!(F.ar)
+    end
+end
+
+function _build_forest!(F::_Forest, f, g::PeriodicGrid, eps::Float64, min_levels::Int)
+    n = F.n
     leg = ortho1d(LegendreBasis(), n)
     x = leg.x
     w3 = vec([leg.w[i] * leg.w[j] * leg.w[k] for i in 1:n, j in 1:n, k in 1:n])
     tail = BitArray([i^2 + j^2 + k^2 >= n^2 for i in 1:n, j in 1:n, k in 1:n])
     rc = g.rc
-    F = _Forest(n, NTuple{3,Float64}[], Int[], Int[], NTuple{8,Int}[], Float64[], [rc])
     m1, m2, m3 = g.mle
     for k in 0:(m3 - 1), j in 0:(m2 - 1), i in 0:(m1 - 1)
         _addbox!(F, (g.xelo[1] + (i + 0.5) * rc, g.xelo[2] + (j + 0.5) * rc, g.xelo[3] + (k + 0.5) * rc), 0, 0)
@@ -309,15 +345,14 @@ function _flatten_forest(F::_Forest, g::PeriodicGrid)
     # colleagues on the renumbered forest
     G = _Forest(F.n, [Tuple(centers[:, i]) for i in 1:nb], level, parent,
                 [nchild[i] == 0 ? ntuple(_ -> 0, 8) : Tuple(child[:, i]) for i in 1:nb],
-                Float64[], F.boxsize)
+                Vector{Float64}[], F.boxsize, F.ar)
     ncoll, coll = _colleagues(G, g, [collect(laddr[1, l]:laddr[2, l]) for l in 1:nl + 1])
     ft = FlatTree(nb, nl, collect(1:nb), laddr, level, parent, nchild, child, ncoll, coll, centers,
                   F.boxsize[1:nl + 1])
     np = F.n^3
     fvals = Array{Float64}(undef, F.n, F.n, F.n, nb)
-    fv = reshape(fvals, np, nb)
-    for (i, b) in enumerate(order)
-        copyto!(fv, (i - 1) * np + 1, F.fvals, (b - 1) * np + 1, np)
+    parallel_foreach(collect(1:nb), fill(nothing, _nthreads())) do i, _
+        copyto!(fvals, (i - 1) * np + 1, F.fvals[order[i]], 1, np)
     end
     istarget = BitVector([!_inhalo(g, centers[:, i]) for i in 1:nb])
     return ft, fvals, istarget

@@ -205,6 +205,12 @@ function alloc(ar::Arena, dims::Int...)
     return unsafe_wrap(Array, Ptr{Float64}(p), dims)
 end
 
+# Complex buffer from the arena.
+function allocc(ar::Arena, dims::Int...)
+    a = alloc(ar, 2 * prod(dims))
+    return unsafe_wrap(Array, Ptr{ComplexF64}(pointer(a)), dims)
+end
+
 function release!(ar::Arena)
     lock(ar.lock) do
         lock(_POOL_LOCK) do

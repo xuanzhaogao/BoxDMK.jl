@@ -23,6 +23,7 @@ benchmarking; it is optional and not needed at runtime.
 
 1. `build_tree(...)` builds the adaptive tree in Julia; it produces exactly the same tree as the Fortran builder (same refinement, `zk` forcing, 4-phase level restriction, colleague construction — bit-for-bit across all kernel/basis/dimension configurations).
 2. `bdmk(...)` solves with the pure-Julia box-DMK solver (`src/native/`), a port of the Fortran `bdmk` for 3D: Laplace, Yukawa and square-root Laplace kernels; Legendre and Chebyshev bases; potential, gradient and Hessian; arbitrary targets; any number of densities `nd`.
+3. `bdmk_periodic(...)` computes the periodic Coulomb potential on an orthorhombic cell (pure-Julia port of the C++ periodic box-DMK of PeriodicDMK); see [Periodic Solver](#periodic-solver).
 
 The solver reproduces the Fortran results to ~1e-13 relative (same SOG and
 plane-wave tables, same interaction lists, same sparse/dense near-field rules)
@@ -174,6 +175,62 @@ potential, discretization error for derivatives).
 
 The raw Fortran reference uses a box centered at the origin. The wrappers handle that coordinate shift internally for `build_tree_fortran(...)` and `bdmk_fortran(...)`.
 
+## Periodic Solver
+
+`bdmk_periodic` computes the periodic Coulomb potential of a charge-neutral,
+cell-periodic density on the orthorhombic cell `[0, L₁) × [0, L₂) × [0, L₃)`:
+
+```math
+u(x) = \int_{\text{cell}} \sum_{n \in \mathbb{Z}^3} \frac{f(y)}{|x - y - n \circ L|}\,dy \qquad (k = 0 \text{ mode dropped})
+```
+
+```julia
+f(x) = ...                                  # L-periodic, ∫_cell f = 0
+res = bdmk_periodic(f, (1.0, 1.5, 2.0); eps = 1e-6)    # or bdmk_periodic(f, 1.0) for a cube
+
+res.pot                                     # (n, n, n, nboxes) on each box's Legendre grid
+res.ft, res.istarget                        # forest; istarget is false on image-halo boxes
+evaluate_periodic(res, [0.3, 0.7, 1.9])     # anywhere (wrapped into the cell)
+```
+
+`f` must be defined (periodically) slightly outside the cell; `f_batch!(values, points)`
+may be passed instead, as for `build_tree`. Options: `norder = 16`, `rc_factor = 0.25`
+(level-0 box side `rc ≈ rc_factor * minimum(L)`, rounded so that every side is a
+multiple of it), `timings`.
+
+How it works (`src/native/periodic/`, after the C++ `bdmk_laplace3d_pot_periodic`):
+
+- **Forest**: a grid of cubic boxes of side `rc` covering the cell plus a one-box
+  image halo, each box refined adaptively (same refinement test as the C++
+  builder, which it reproduces box for box) and the whole forest 2:1 balanced.
+- **Kernel split**: `1/r` is the u-series sum of Gaussians; the Gaussians that
+  decay within `rc` run through the free-space box machinery of `bdmk` on the
+  forest (halo boxes carry the image density and act as sources only).
+- **Wide Gaussians** are summed in reciprocal space. The proxy charges of the
+  level-0 boxes are Legendre moments, so `ρ̂(k)` follows from spherical Bessel
+  functions, `e^{-iαξ} = Σ (2l+1)(-i)^l j_l(α) P_l(ξ)`, axis by axis, and so do the
+  Legendre coefficients of the wide potential on each box. They are injected
+  into the level-0 proxy potentials before the downward pass. No FFT is needed:
+  the transforms are a few dense matrix products.
+
+Accuracy against an Ewald-summed Gaussian mixture is `≤ eps` relative to max|u| at
+`eps = 1e-3, 1e-6, 1e-9` on cubic and 1:1.5:2 cells (`test/test_periodic.jl`). On the C++
+benchmark problem the potentials agree with the C++ solver to 1.5e-11 at `eps = 1e-9`.
+
+Wall time against the C++ solver (PeriodicDMK `bench_steps cubic multi`: unit cube,
+four Gaussians down to width 0.007, `norder = 16`; same forest, same density
+callback; genoa node, one socket, threads pinned; `benchmark/run_periodic_node.sh`):
+
+| eps | boxes | 1 thread C++ / Julia | 48 threads C++ / Julia |
+|---|---|---|---|
+| 1e-3 | 624  | 0.80 / 0.54 s | 118 / 73 ms |
+| 1e-6 | 1416 | 2.39 / 1.67 s | 393 / 179 ms |
+| 1e-9 | 2560 | 6.85 / 4.62 s | 451 / 396 ms |
+
+Both include the tree build with density sampling (1.7 s of the Julia 4.6 s at
+1e-9). Limitation: cells are orthorhombic with sides that are integer multiples
+of `rc` (the C++ code also handles triclinic cells).
+
 ## Kernels And Bases
 
 Supported kernels:
@@ -268,10 +325,10 @@ Fortran DATA statements.
 
 - `src/core/`: types, utilities, basis/tensor primitives
 - `src/tree/`: adaptive tree construction
-- `src/native/`: the box-DMK solver (tables, flat tree and lists, local tables, GEMM and tensor kernels, plane waves, driver)
+- `src/native/`: the box-DMK solver (tables, flat tree and lists, local tables, GEMM and tensor kernels, plane waves, driver); `src/native/periodic/`: periodic solver (forest, wide term, driver)
 - `src/solver/`: public `bdmk` entry point, target helpers, `PotentialField`
 - `src/fortran/`: optional Fortran reference wrappers
-- `benchmark/`: `native_vs_fortran.jl` (speed and accuracy against an analytic solution), cluster/node runners
+- `benchmark/`: `native_vs_fortran.jl` (speed and accuracy against an analytic solution), `periodic_vs_cpp.jl` (periodic solver vs the C++ code), cluster/node runners
 - `test/`: regression tests (Fortran parity tests run when the reference is built)
 - `deps/boxdmk_fortran/`: vendored Fortran reference sources
 

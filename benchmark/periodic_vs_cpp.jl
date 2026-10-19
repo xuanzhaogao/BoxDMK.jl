@@ -11,7 +11,7 @@ const XS = [(0.20, 0.25, 0.40), (0.72, 0.65, 0.55), (0.95, 0.30, 0.80), (0.45, 0
 const CS = [1.0, 0.7, -0.5, 0.9]
 
 # C++ `lattice_density` on the unit cube: per Gaussian, the images around the
-# nearest one within sqrt(46/α).
+# nearest one within sqrt(46/α), skipping exp below 1e-20.
 struct CppDensity
     alpha::Vector{Float64}
     mrange::Vector{Int}
@@ -26,7 +26,8 @@ function (g::CppDensity)(p::AbstractVector)
         c1 = round(d1); c2 = round(d2); c3 = round(d3)
         for i3 in -m:m, i2 in -m:m, i1 in -m:m
             e1 = d1 - (c1 + i1); e2 = d2 - (c2 + i2); e3 = d3 - (c3 + i3)
-            s += CS[j] * exp(-a * (e1 * e1 + e2 * e2 + e3 * e3))
+            r2 = e1 * e1 + e2 * e2 + e3 * e3
+            r2 * a < 46 && (s += CS[j] * exp(-a * r2))      # exp(-46) ~ 1e-20
         end
     end
     return s
@@ -39,12 +40,12 @@ f = CppDensity(dist == "multi" ? [20000.0, 200, 300, 400] : [60.0, 120, 180, 240
 eps = 10.0^-ndig
 
 tm = zeros(6)
-res = bdmk_periodic(f, 1.0; eps = eps, timings = tm)        # compile + warm up
+# compile + warm up; like the C++ solver, later solves reuse the buffers
+res = bdmk_periodic(f, 1.0; eps = eps, timings = tm)
 best = Inf; tbest = zeros(6)
 for r in 1:reps
     t = @elapsed global res = bdmk_periodic(f, 1.0; eps = eps, timings = tm)
     t < best && (global best = t; tbest .= tm)
-    BoxDMK.release_memory!()
 end
 ft = res.ft
 nleaf = count(i -> ft.nchild[i] == 0 && res.istarget[i], 1:ft.nboxes)

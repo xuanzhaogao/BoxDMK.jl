@@ -10,6 +10,7 @@ using LinearAlgebra
     include("test_tree.jl")
     include("test_solver.jl")
     include("test_field.jl")
+    include("test_periodic.jl")
     if isfile(BoxDMK._resolve_fortran_library_path())
         include("test_fortran_wrapper.jl")
     else
