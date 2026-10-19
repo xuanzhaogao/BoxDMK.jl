@@ -210,14 +210,14 @@ function _wide_inject!(pot, pp, pc, nodeidx, s::DMKSetup, g::PeriodicGrid, fv, P
         M = alloc(s.arena, pf * g.mgrid[1], pf * g.mgrid[2], pf * g.mgrid[3])
         rc3 = g.rc^3
         parallel_foreach(boxes, wks) do (ibox, (i, j, k)), w
-            q = if ft.nchild[ibox] == 0
+            q, sc = if ft.nchild[ibox] == 0
                 out = reshape(view(w.w3, 1:p^3), p, p, p)
                 tp3!(out, view(fv, :, :, :, 1, ibox), s.den2pc, s.den2pcT, s.den2pcT, w.w1, w.w2, 1 / 8, false)
-                out
+                out, 1.0
             else
-                reshape(view(pc, :, 1, nodeidx[ibox]), p, p, p) ./ rc3
+                reshape(view(pc, :, 1, nodeidx[ibox]), p, p, p), 1 / rc3
             end
-            M[pf * i + 1:pf * (i + 1), pf * j + 1:pf * (j + 1), pf * k + 1:pf * (k + 1)] .= view(q, 1:pf, 1:pf, 1:pf)
+            M[pf * i + 1:pf * (i + 1), pf * j + 1:pf * (j + 1), pf * k + 1:pf * (k + 1)] .= sc .* view(q, 1:pf, 1:pf, 1:pf)
         end
     end
     G = wide_modes(P, M, s.arena)
