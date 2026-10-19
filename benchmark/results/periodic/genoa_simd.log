@@ -1,0 +1,76 @@
+# BoxDMK.jl simd branch, genoa node (worker7188), one socket, threads pinned; 2026-10-19
+# Julia: main (8be8782) vs new, and new with DENSITY=simd; parity vs C++ dumps in this directory
+main: [JULIA-PERIODIC] threads=48 cell=cubic dist=multi n=3 | total=61 ms : forest=41 setup+src=2 local+up=5 wide=2 pw=5 near=5    parity max diff / max|u| 3.561e-06 
+new: [JULIA-PERIODIC] threads=48 cell=cubic dist=multi n=3 | total=51 ms : forest=30 setup+src=7 local+up=3 wide=2 pw=4 near=5    parity max diff / max|u| 3.561e-06 
+new-simd: [JULIA-PERIODIC simd-density] threads=48 cell=cubic dist=multi n=3 | total=31 ms : forest=6 setup+src=15 local+up=2 wide=3 pw=3 near=2    parity max diff / max|u| 3.561e-06 
+main: [JULIA-PERIODIC] threads=1 cell=cubic dist=multi n=3 | total=319 ms : forest=277 setup+src=7 local+up=6 wide=3 pw=9 near=15    parity max diff / max|u| 3.561e-06 
+new: [JULIA-PERIODIC] threads=1 cell=cubic dist=multi n=3 | total=308 ms : forest=268 setup+src=5 local+up=6 wide=3 pw=9 near=15    parity max diff / max|u| 3.561e-06 
+new-simd: [JULIA-PERIODIC simd-density] threads=1 cell=cubic dist=multi n=3 | total=84 ms : forest=44 setup+src=5 local+up=6 wide=2 pw=9 near=15    parity max diff / max|u| 3.561e-06 
+main: [JULIA-PERIODIC] threads=48 cell=cubic dist=multi n=6 | total=110 ms : forest=37 setup+src=11 local+up=4 wide=22 pw=18 near=5    parity max diff / max|u| 2.608e-08 
+new: [JULIA-PERIODIC] threads=48 cell=cubic dist=multi n=6 | total=107 ms : forest=42 setup+src=24 local+up=4 wide=3 pw=15 near=6    parity max diff / max|u| 2.608e-08 
+new-simd: [JULIA-PERIODIC simd-density] threads=48 cell=cubic dist=multi n=6 | total=75 ms : forest=23 setup+src=10 local+up=4 wide=4 pw=15 near=18    parity max diff / max|u| 2.608e-08 
+main: [JULIA-PERIODIC] threads=1 cell=cubic dist=multi n=6 | total=891 ms : forest=569 setup+src=32 local+up=34 wide=12 pw=127 near=112    parity max diff / max|u| 2.608e-08 
+new: [JULIA-PERIODIC] threads=1 cell=cubic dist=multi n=6 | total=874 ms : forest=566 setup+src=22 local+up=34 wide=8 pw=127 near=113    parity max diff / max|u| 2.608e-08 
+new-simd: [JULIA-PERIODIC simd-density] threads=1 cell=cubic dist=multi n=6 | total=399 ms : forest=92 setup+src=16 local+up=35 wide=9 pw=129 near=114    parity max diff / max|u| 2.608e-08 
+main: [JULIA-PERIODIC] threads=48 cell=cubic dist=multi n=9 | total=370 ms : forest=79 setup+src=45 local+up=14 wide=98 pw=112 near=20    parity max diff / max|u| 2.409e-13 
+new: [JULIA-PERIODIC] threads=48 cell=cubic dist=multi n=9 | total=256 ms : forest=76 setup+src=50 local+up=14 wide=6 pw=89 near=19    parity max diff / max|u| 2.408e-13 
+new-simd: [JULIA-PERIODIC simd-density] threads=48 cell=cubic dist=multi n=9 | total=202 ms : forest=31 setup+src=18 local+up=14 wide=4 pw=101 near=20    parity max diff / max|u| 2.408e-13 
+main: [JULIA-PERIODIC] threads=1 cell=cubic dist=multi n=9 | total=3008 ms : forest=1002 setup+src=58 local+up=173 wide=42 pw=917 near=808    parity max diff / max|u| 2.409e-13 
+new: [JULIA-PERIODIC] threads=1 cell=cubic dist=multi n=9 | total=3034 ms : forest=1074 setup+src=33 local+up=175 wide=24 pw=923 near=797    parity max diff / max|u| 2.408e-13 
+new-simd: [JULIA-PERIODIC simd-density] threads=1 cell=cubic dist=multi n=9 | total=2137 ms : forest=167 setup+src=29 local+up=179 wide=25 pw=916 near=812    parity max diff / max|u| 2.408e-13 
+main: [JULIA-PERIODIC] threads=48 cell=sheared dist=multi n=3 | total=112 ms : forest=50 setup+src=17 local+up=2 wide=28 pw=7 near=7    parity max diff / max|u| 3.586e-06 
+new: [JULIA-PERIODIC] threads=48 cell=sheared dist=multi n=3 | total=91 ms : forest=62 setup+src=15 local+up=2 wide=3 pw=6 near=3    parity max diff / max|u| 3.586e-06 
+new-simd: [JULIA-PERIODIC simd-density] threads=48 cell=sheared dist=multi n=3 | total=45 ms : forest=9 setup+src=20 local+up=3 wide=3 pw=4 near=4    parity max diff / max|u| 3.586e-06 
+main: [JULIA-PERIODIC] threads=1 cell=sheared dist=multi n=3 | total=809 ms : forest=480 setup+src=280 local+up=7 wide=5 pw=12 near=22    parity max diff / max|u| 3.586e-06 
+new: [JULIA-PERIODIC] threads=1 cell=sheared dist=multi n=3 | total=764 ms : forest=454 setup+src=260 local+up=7 wide=5 pw=13 near=23    parity max diff / max|u| 3.586e-06 
+new-simd: [JULIA-PERIODIC simd-density] threads=1 cell=sheared dist=multi n=3 | total=200 ms : forest=102 setup+src=46 local+up=7 wide=5 pw=13 near=23    parity max diff / max|u| 3.586e-06 
+main: [JULIA-PERIODIC] threads=48 cell=sheared dist=multi n=6 | total=239 ms : forest=126 setup+src=42 local+up=5 wide=33 pw=20 near=13    parity max diff / max|u| 4.009e-08 
+new: [JULIA-PERIODIC] threads=48 cell=sheared dist=multi n=6 | total=178 ms : forest=79 setup+src=26 local+up=4 wide=3 pw=30 near=21    parity max diff / max|u| 4.009e-08 
+new-simd: [JULIA-PERIODIC simd-density] threads=48 cell=sheared dist=multi n=6 | total=112 ms : forest=42 setup+src=16 local+up=4 wide=4 pw=28 near=17    parity max diff / max|u| 4.009e-08 
+main: [JULIA-PERIODIC] threads=1 cell=sheared dist=multi n=6 | total=1941 ms : forest=1061 setup+src=480 local+up=41 wide=30 pw=164 near=157    parity max diff / max|u| 4.009e-08 
+new: [JULIA-PERIODIC] threads=1 cell=sheared dist=multi n=6 | total=1803 ms : forest=942 setup+src=474 local+up=41 wide=17 pw=165 near=156    parity max diff / max|u| 4.009e-08 
+new-simd: [JULIA-PERIODIC simd-density] threads=1 cell=sheared dist=multi n=6 | total=747 ms : forest=254 setup+src=103 local+up=42 wide=18 pw=165 near=158    parity max diff / max|u| 4.009e-08 
+main: [JULIA-PERIODIC] threads=48 cell=sheared dist=multi n=9 | total=499 ms : forest=174 setup+src=82 local+up=17 wide=84 pw=103 near=24    parity max diff / max|u| 2.042e-13 
+new: [JULIA-PERIODIC] threads=48 cell=sheared dist=multi n=9 | total=366 ms : forest=138 setup+src=68 local+up=27 wide=6 pw=89 near=23    parity max diff / max|u| 2.041e-13 
+new-simd: [JULIA-PERIODIC simd-density] threads=48 cell=sheared dist=multi n=9 | total=241 ms : forest=69 setup+src=35 local+up=17 wide=6 pw=69 near=35    parity max diff / max|u| 2.042e-13 
+main: [JULIA-PERIODIC] threads=1 cell=sheared dist=multi n=9 | total=5500 ms : forest=2181 setup+src=836 local+up=252 wide=115 pw=1116 near=989    parity max diff / max|u| 2.042e-13 
+new: [JULIA-PERIODIC] threads=1 cell=sheared dist=multi n=9 | total=5226 ms : forest=1930 setup+src=873 local+up=255 wide=59 pw=1116 near=981    parity max diff / max|u| 2.041e-13 
+new-simd: [JULIA-PERIODIC simd-density] threads=1 cell=sheared dist=multi n=9 | total=3196 ms : forest=595 setup+src=168 local+up=258 wide=60 pw=1114 near=988    parity max diff / max|u| 2.042e-13 
+main: [JULIA-PERIODIC] threads=48 cell=hex dist=multi n=3 | total=151 ms : forest=65 setup+src=16 local+up=2 wide=49 pw=7 near=10    parity max diff / max|u| 2.011e-06 
+new: [JULIA-PERIODIC] threads=48 cell=hex dist=multi n=3 | total=60 ms : forest=31 setup+src=15 local+up=2 wide=5 pw=3 near=3    parity max diff / max|u| 2.011e-06 
+new-simd: [JULIA-PERIODIC simd-density] threads=48 cell=hex dist=multi n=3 | total=62 ms : forest=29 setup+src=14 local+up=4 wide=4 pw=7 near=3    parity max diff / max|u| 2.011e-06 
+main: [JULIA-PERIODIC] threads=1 cell=hex dist=multi n=3 | total=836 ms : forest=458 setup+src=329 local+up=7 wide=8 pw=12 near=19    parity max diff / max|u| 2.011e-06 
+new: [JULIA-PERIODIC] threads=1 cell=hex dist=multi n=3 | total=725 ms : forest=408 setup+src=271 local+up=7 wide=5 pw=11 near=19    parity max diff / max|u| 2.011e-06 
+new-simd: [JULIA-PERIODIC simd-density] threads=1 cell=hex dist=multi n=3 | total=207 ms : forest=111 setup+src=49 local+up=8 wide=6 pw=11 near=19    parity max diff / max|u| 2.011e-06 
+main: [JULIA-PERIODIC] threads=48 cell=hex dist=multi n=6 | total=257 ms : forest=120 setup+src=40 local+up=4 wide=42 pw=21 near=27    parity max diff / max|u| 2.614e-08 
+new: [JULIA-PERIODIC] threads=48 cell=hex dist=multi n=6 | total=134 ms : forest=52 setup+src=41 local+up=4 wide=4 pw=28 near=5    parity max diff / max|u| 2.614e-08 
+new-simd: [JULIA-PERIODIC simd-density] threads=48 cell=hex dist=multi n=6 | total=100 ms : forest=43 setup+src=15 local+up=4 wide=4 pw=15 near=17    parity max diff / max|u| 2.614e-08 
+main: [JULIA-PERIODIC] threads=1 cell=hex dist=multi n=6 | total=1737 ms : forest=915 setup+src=487 local+up=42 wide=43 pw=133 near=110    parity max diff / max|u| 2.614e-08 
+new: [JULIA-PERIODIC] threads=1 cell=hex dist=multi n=6 | total=1532 ms : forest=748 setup+src=467 local+up=41 wide=26 pw=134 near=110    parity max diff / max|u| 2.614e-08 
+new-simd: [JULIA-PERIODIC simd-density] threads=1 cell=hex dist=multi n=6 | total=672 ms : forest=233 setup+src=120 local+up=42 wide=26 pw=135 near=110    parity max diff / max|u| 2.614e-08 
+main: [JULIA-PERIODIC] threads=48 cell=hex dist=multi n=9 | total=504 ms : forest=185 setup+src=81 local+up=32 wide=73 pw=98 near=32    parity max diff / max|u| 1.696e-13 
+new: [JULIA-PERIODIC] threads=48 cell=hex dist=multi n=9 | total=361 ms : forest=121 setup+src=89 local+up=21 wide=19 pw=75 near=22    parity max diff / max|u| 1.695e-13 
+new-simd: [JULIA-PERIODIC simd-density] threads=48 cell=hex dist=multi n=9 | total=262 ms : forest=78 setup+src=28 local+up=21 wide=21 pw=74 near=21    parity max diff / max|u| 1.695e-13 
+main: [JULIA-PERIODIC] threads=1 cell=hex dist=multi n=9 | total=5876 ms : forest=2437 setup+src=1087 local+up=376 wide=164 pw=920 near=875    parity max diff / max|u| 1.696e-13 
+new: [JULIA-PERIODIC] threads=1 cell=hex dist=multi n=9 | total=5451 ms : forest=1930 setup+src=1243 local+up=382 wide=86 pw=926 near=868    parity max diff / max|u| 1.695e-13 
+new-simd: [JULIA-PERIODIC simd-density] threads=1 cell=hex dist=multi n=9 | total=3185 ms : forest=681 setup+src=221 local+up=382 wide=86 pw=925 near=873    parity max diff / max|u| 1.695e-13 
+
+# C++ PeriodicDMK_private 77500a8 bench_steps (same binding)
+cpp T48: [STEPS] cell=cubic dist=multi n=3 | nboxes=624 nleaves=573 depth=3 | tree=28 narrow_cascade=24 wide=4 total=57 ms (narrow_drv=52)
+cpp T1: [STEPS] cell=cubic dist=multi n=3 | nboxes=624 nleaves=573 depth=3 | tree=250 narrow_cascade=74 wide=0 total=324 ms (narrow_drv=323)
+cpp T48: [STEPS] cell=cubic dist=multi n=6 | nboxes=1416 nleaves=1266 depth=4 | tree=54 narrow_cascade=117 wide=-2 total=169 ms (narrow_drv=171)
+cpp T1: [STEPS] cell=cubic dist=multi n=6 | nboxes=1416 nleaves=1266 depth=4 | tree=529 narrow_cascade=449 wide=23 total=1001 ms (narrow_drv=978)
+cpp T48: [STEPS] cell=cubic dist=multi n=9 | nboxes=2560 nleaves=2267 depth=5 | tree=114 narrow_cascade=180 wide=34 total=328 ms (narrow_drv=294)
+cpp T1: [STEPS] cell=cubic dist=multi n=9 | nboxes=2560 nleaves=2267 depth=5 | tree=970 narrow_cascade=2539 wide=99 total=3609 ms (narrow_drv=3510)
+cpp T48: [STEPS] cell=sheared dist=multi n=3 | nboxes=720 nleaves=684 depth=3 | tree=42 narrow_cascade=25 wide=25 total=91 ms (narrow_drv=66)
+cpp T1: [STEPS] cell=sheared dist=multi n=3 | nboxes=720 nleaves=684 depth=3 | tree=522 narrow_cascade=93 wide=259 total=875 ms (narrow_drv=615)
+cpp T48: [STEPS] cell=sheared dist=multi n=6 | nboxes=1960 nleaves=1769 depth=4 | tree=105 narrow_cascade=155 wide=51 total=311 ms (narrow_drv=260)
+cpp T1: [STEPS] cell=sheared dist=multi n=6 | nboxes=1960 nleaves=1769 depth=4 | tree=1306 narrow_cascade=569 wide=485 total=2360 ms (narrow_drv=1875)
+cpp T48: [STEPS] cell=sheared dist=multi n=9 | nboxes=4048 nleaves=3596 depth=4 | tree=223 narrow_cascade=192 wide=127 total=542 ms (narrow_drv=415)
+cpp T1: [STEPS] cell=sheared dist=multi n=9 | nboxes=4048 nleaves=3596 depth=4 | tree=2769 narrow_cascade=3169 wide=1119 total=7057 ms (narrow_drv=5938)
+cpp T48: [STEPS] cell=hex dist=multi n=3 | nboxes=920 nleaves=868 depth=3 | tree=49 narrow_cascade=21 wide=34 total=105 ms (narrow_drv=71)
+cpp T1: [STEPS] cell=hex dist=multi n=3 | nboxes=920 nleaves=868 depth=3 | tree=528 narrow_cascade=85 wide=262 total=875 ms (narrow_drv=613)
+cpp T48: [STEPS] cell=hex dist=multi n=6 | nboxes=2160 nleaves=1953 depth=4 | tree=103 narrow_cascade=130 wide=66 total=299 ms (narrow_drv=233)
+cpp T1: [STEPS] cell=hex dist=multi n=6 | nboxes=2160 nleaves=1953 depth=4 | tree=1129 narrow_cascade=462 wide=472 total=2063 ms (narrow_drv=1591)
+cpp T48: [STEPS] cell=hex dist=multi n=9 | nboxes=5648 nleaves=5005 depth=4 | tree=299 narrow_cascade=188 wide=169 total=657 ms (narrow_drv=488)
+cpp T1: [STEPS] cell=hex dist=multi n=9 | nboxes=5648 nleaves=5005 depth=4 | tree=3158 narrow_cascade=2898 wide=1370 total=7426 ms (narrow_drv=6056)

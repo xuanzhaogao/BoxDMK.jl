@@ -128,13 +128,16 @@ mutable struct PeriodicPlan
     fresh::Bool                   # fvals hold the samples of the plan's density
     tforest::Float64
     targets::Union{Nothing,Matrix{Float64}}
+    iws::Any                      # interpolation workspaces of `_resample!` (created on first use)
 end
 
 """
     periodic_plan(f, cell; eps=1e-6, norder=16, rc_factor=0.25, nhalo=1, f_batch=nothing,
                   skip_negligible=true, interpolate=true, targets=nothing, near32=nothing) -> PeriodicPlan
 
-With `targets` (3 × N points), only the leaves holding a target are computed
+Forest (adapted to `f`), tables and buffers of [`bdmk_periodic`](@ref), for
+repeated solves with [`periodic_solve!`](@ref); the options are those of
+`bdmk_periodic`. With `targets` (3 × N points), only the leaves holding a target are computed
 and solves return the potential at the targets (`target_pot`). `near32`
 runs the dense same-level near field in single precision (default: when
 eps ≥ 1e-6).
@@ -195,7 +198,7 @@ function _periodic_plan(f, A::Matrix{Float64}, eps::Float64, n::Int, rc_factor::
     copysrc = g.tiled ? _copy_sources(ft, g) : zeros(Int, ft.nboxes)
     pot = Array{Float64}(undef, n, n, n, ft.nboxes)
     return PeriodicPlan(g, ft, n, eps, istarget, core, copysrc, s, wplan, wn, dn, Tuple(taylor), skip,
-                        fvals, pot, true, tforest, targets)
+                        fvals, pot, true, tforest, targets, nothing)
 end
 
 # Tiled cells: for each box below a halo root, the box at the same place
@@ -296,11 +299,12 @@ function _resample!(plan::PeriodicPlan, f)
     ar = Arena()
     try
         leaves = [b for b in 1:ft.nboxes if plan.core[b] && ft.nchild[b] == 0]
-        cf = _leaf_coefs(ar, n, [view(fvals, :, :, :, b) for b in leaves])
+        plan.iws === nothing && (plan.iws = _interp_workspaces(n))
+        cf = _leaf_coefs(ar, n, [view(fvals, :, :, :, b) for b in leaves], plan.iws)
         coefs = Dict(zip(leaves, cf))
         locate = y -> _locate_leaf(ft, g, y)
         geom = L -> (view(ft.centers, :, L), ft.boxsize[ft.level[L] + 1] / 2)
-        parallel_foreach(others, _interp_workspaces(n)) do b, w
+        parallel_foreach(others, plan.iws) do b, w
             _interp_values!(view(fvals, :, :, :, b), view(ft.centers, :, b), ft.boxsize[ft.level[b] + 1] / 2, x, g, n,
                             locate, geom, L -> coefs[L], w)
         end
@@ -445,7 +449,9 @@ function _wide_inject!(pot, pp, pc, nodeidx, s::DMKSetup, g::PeriodicGrid, fv, P
     parallel_foreach([b for b in boxes if s.istarget[b[1]]], wks) do (ibox, (i, j, k)), w
         cb = reshape(view(w.w3, 1:p^3), p, p, p)
         fill!(cb, 0.0)
-        cb[1:pe, 1:pe, 1:pe] .= view(C, pe * i + 1:pe * (i + 1), pe * j + 1:pe * (j + 1), pe * k + 1:pe * (k + 1))
+        @inbounds for l3 in 1:pe, l2 in 1:pe, l1 in 1:pe
+            cb[l1, l2, l3] = C[pe * k + l3, pe * j + l2, pe * i + l1]
+        end
         if ft.nchild[ibox] == 0
             tp3!(view(pot, :, :, :, 1, ibox), cb, s.poteval, s.potevalT, s.potevalT, w.w1, w.w2, 1.0, true)
         else

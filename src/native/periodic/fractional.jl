@@ -58,8 +58,9 @@ function _fractional_moments!(F::_Forest, f, g::PeriodicGrid, ft::FlatTree, Ur::
     Ut = Matrix(transpose(leg.U))
     while true
         flag = zeros(Bool, length(level_boxes))
-        parallel_foreach(collect(eachindex(level_boxes)), wss) do i, (c3, w1, w2, y)
-            b = level_boxes[i]
+        lb = level_boxes                     # not captured as a reassigned (boxed) variable
+        parallel_foreach(collect(eachindex(lb)), wss) do i, (c3, w1, w2, y)
+            b = lb[i]
             h = F.boxsize[F.level[b] + 1]
             if _tail_error(_fbox(F, b), leg.U, Ut, tail, c3, w1, w2) > thr
                 flag[i] = true
@@ -67,14 +68,14 @@ function _fractional_moments!(F::_Forest, f, g::PeriodicGrid, ft::FlatTree, Ur::
             end
             # finest main-forest leaf at the 27 points of the cell (slightly inside)
             c = F.centers[b]
-            size = edge * h
+            hb = edge * h
             for oz in -1:1, oy in -1:1, ox in -1:1
                 u1 = c[1] + 0.49 * h * ox; u2 = c[2] + 0.49 * h * oy; u3 = c[3] + 0.49 * h * oz
                 for d in 1:3
                     y[d] = Ur[d, 1] * u1 + Ur[d, 2] * u2 + Ur[d, 3] * u3
                 end
                 leaf = _locate_leaf(ft, g, y)
-                if ft.boxsize[ft.level[leaf] + 1] < size / 2
+                if ft.boxsize[ft.level[leaf] + 1] < hb / 2
                     flag[i] = true
                     return
                 end

@@ -52,9 +52,10 @@ res = bdmk_periodic(f, A; eps=1e-6)     # periodic Coulomb potential; A = lattic
 
 - `forest.jl` — `PeriodicGrid` (QR frame A = QU, bounding-box rc grid + 1-box image halo; `tiled` = orthorhombic with sides multiple of rc), `build_periodic_forest` (Legendre tail refinement, forest 2:1 balance); level-ordered `FlatTree` with many level-0 roots, `istarget` = non-halo boxes meeting the cell.
 - `fractional.jl` — `fractional_moments`: source tree over one period in fractional coordinates (non-tiled cells), refined by the tail test and the main forest's leaf sizes; root-cell Legendre moments.
-- `wide.jl` — `WidePlan` (Ŵ on the mode grid m, k = 2πU⁻ᵀm), `wide_modes` (moments -> Ŵρ̂, separable per fractional axis), `wide_coefficients` (modes -> Legendre coefficients on the level-0 cubes; separable if orthorhombic, triangular otherwise).
+- `wide.jl` — `WidePlan` (Ŵ on the half mode grid m₁ ≥ 0, k = 2πU⁻ᵀm; f is real), `wide_modes` (moments -> Ŵρ̂ as (re, im) arrays, separable per fractional axis), `wide_coefficients` (modes -> Legendre coefficients on the level-0 cubes, returned in reversed axis order `Ct[r₃, r₂, r₁]`; separable if orthorhombic, triangular otherwise). All contractions are split-complex `gemm!` threaded with `parallel_foreach` (no BLAS: OpenBLAS threads compete with Julia's).
 - `periodic.jl` — `useries_sog`, `bdmk_periodic` (narrow Gaussians through `DMKSetup` with `istarget`/`asym_safety = 1e-4`; wide term injected into level-0 proxy potentials before the downward pass; neutralizing-background correction ⟨f⟩(Σ_narrow w(πδ)^{3/2} + c₀)), `evaluate_periodic`.
-- Validate with `test/test_periodic.jl` (Ewald oracle) and `benchmark/periodic_vs_cpp.jl` (box-by-box parity with a C++ dump).
+- Validate with `test/test_periodic.jl` (Ewald oracle; `BOXDMK_TEST_VERBOSE=1` prints the errors) and `benchmark/periodic_vs_cpp.jl` (box-by-box parity with a C++ dump; `DENSITY=simd` uses the SIMD.jl batch density `density_batch!`).
+- Threaded closures: never capture a variable that is reassigned (e.g. `level_boxes` in a refinement loop): Julia boxes it and every access allocates. Bind it to a fresh local first.
 
 Parity rules to keep: same SOG/PW tables, Fortran's dense (`nx+ny+nz ≥ n`) vs sparse near-field switch (pot) and sparse-only path (grad/hess). Check with `test/test_solver.jl` ("Fortran parity") or `benchmark/native_vs_fortran.jl`.
 

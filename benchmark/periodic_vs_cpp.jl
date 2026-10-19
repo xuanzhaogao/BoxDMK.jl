@@ -4,6 +4,9 @@
 # run dumped by `BDMK_DUMP_POT=<pot> BDMK_DUMP_TREE=<tree> bench_steps ...`.
 #
 #   julia --project -t 48 benchmark/periodic_vs_cpp.jl <cell> <n> [multi|smooth] [reps] [cpp_pot cpp_tree]
+#
+# DENSITY=simd evaluates the density with `density_batch!` (SIMD.jl, through
+# `f_batch`) instead of point by point; the C++ code evaluates it point by point.
 
 using BoxDMK, Printf, LinearAlgebra
 
@@ -65,6 +68,62 @@ function (g::CppDensity)(p::AbstractVector)
     return s
 end
 
+# The same density for 8 points at a time with SIMD.jl (`DENSITY=simd`, passed
+# as `f_batch`): every lane runs the image loop around its own nearest image,
+# and exp is a vectorized 2^k p(r) (|r| ≤ ln2/2, Taylor degree 12) evaluated
+# only when some lane is inside the cutoff.
+using SIMD
+const V8 = Vec{8,Float64}
+
+@inline function vexp(x::V8)
+    k = round(x * (1 / log(2.0)))
+    r = muladd(k, V8(-6.93147180369123816490e-01), x)      # Cody-Waite ln 2 = hi + lo
+    r = muladd(k, V8(-1.90821492927058770002e-10), r)
+    p = V8(1 / 479001600)
+    for c in (1 / 39916800, 1 / 3628800, 1 / 362880, 1 / 40320, 1 / 5040, 1 / 720, 1 / 120, 1 / 24, 1 / 6, 0.5, 1.0, 1.0)
+        p = muladd(p, r, V8(c))
+    end
+    ki = convert(Vec{8,Int64}, k)
+    scale = reinterpret(V8, (ki + 1023) << 52)
+    return vifelse(x < V8(-700.0), zero(V8), p * scale)
+end
+
+function density_batch!(vals::AbstractMatrix, pts::AbstractMatrix, g::CppDensity)
+    Q, U, Ui = g.Q, g.U, g.Uinv
+    np = size(pts, 2)
+    @inbounds for i in 1:8:np
+        nl = min(8, np - i + 1)
+        lane(d) = V8(ntuple(k -> pts[d, i + min(k, nl) - 1], 8))
+        p1, p2, p3 = lane(1), lane(2), lane(3)
+        y1 = Q[1, 1] * p1 + Q[2, 1] * p2 + Q[3, 1] * p3
+        y2 = Q[1, 2] * p1 + Q[2, 2] * p2 + Q[3, 2] * p3
+        y3 = Q[1, 3] * p1 + Q[2, 3] * p2 + Q[3, 3] * p3
+        s = zero(V8)
+        for j in eachindex(g.alpha)
+            a = g.alpha[j]; m = g.mrange[j]; cj = CS[j]
+            d1 = y1 - g.xc[j][1]; d2 = y2 - g.xc[j][2]; d3 = y3 - g.xc[j][3]
+            c1 = round(Ui[1, 1] * d1 + Ui[1, 2] * d2 + Ui[1, 3] * d3)
+            c2 = round(Ui[2, 2] * d2 + Ui[2, 3] * d3)
+            c3 = round(Ui[3, 3] * d3)
+            e1c = d1 - (U[1, 1] * c1 + U[1, 2] * c2 + U[1, 3] * c3)    # offset of the nearest image
+            e2c = d2 - (U[2, 2] * c2 + U[2, 3] * c3)
+            e3c = d3 - U[3, 3] * c3
+            for o3 in -m:m, o2 in -m:m, o1 in -m:m
+                e1 = e1c - (U[1, 1] * o1 + U[1, 2] * o2 + U[1, 3] * o3)
+                e2 = e2c - (U[2, 2] * o2 + U[2, 3] * o3)
+                e3 = e3c - U[3, 3] * o3
+                r2 = e1 * e1 + e2 * e2 + e3 * e3
+                msk = r2 * a < V8(46.0)
+                any(msk) && (s += vifelse(msk, cj * vexp(-a * r2), zero(V8)))
+            end
+        end
+        for k in 1:nl
+            vals[1, i + k - 1] = s[k]
+        end
+    end
+    return vals
+end
+
 cell = get(ARGS, 1, "cubic")
 ndig = parse(Int, get(ARGS, 2, "6"))
 dist = get(ARGS, 3, "multi")
@@ -73,18 +132,21 @@ A = cpp_sorted(CELLS[cell])
 f = CppDensity(A, dist == "multi" ? [20000.0, 200, 300, 400] : [60.0, 120, 180, 240])
 eps = 10.0^-ndig
 
+simd = get(ENV, "DENSITY", "scalar") == "simd"
+solve() = simd ? bdmk_periodic(nothing, A; eps = eps, timings = tm, f_batch = (v, p) -> density_batch!(v, p, f)) :
+                 bdmk_periodic(f, A; eps = eps, timings = tm)
 tm = zeros(10)
 # compile + warm up; like the C++ solver, later solves reuse the buffers
-res = bdmk_periodic(f, A; eps = eps, timings = tm)
+res = solve()
 best = Inf; tbest = zeros(10)
 for r in 1:reps
-    t = @elapsed global res = bdmk_periodic(f, A; eps = eps, timings = tm)
+    t = @elapsed global res = solve()
     t < best && (global best = t; tbest .= tm)
 end
 ft = res.ft
 nleaf = count(i -> ft.nchild[i] == 0 && res.istarget[i], 1:ft.nboxes)
-@printf("[JULIA-PERIODIC] threads=%d cell=%s dist=%s n=%d | nboxes=%d depth=%d target leaves=%d | total=%.0f ms : forest=%.0f setup+src=%.0f local+up=%.0f wide=%.0f pw=%.0f near=%.0f\n",
-        Threads.nthreads(), cell, dist, ndig, ft.nboxes, ft.nlevels, nleaf, 1e3best, (1e3 .* tbest[1:6])...)
+@printf("[JULIA-PERIODIC%s] threads=%d cell=%s dist=%s n=%d | nboxes=%d depth=%d target leaves=%d | total=%.0f ms : forest=%.0f setup+src=%.0f local+up=%.0f wide=%.0f pw=%.0f near=%.0f\n",
+        simd ? " simd-density" : "", Threads.nthreads(), cell, dist, ndig, ft.nboxes, ft.nlevels, nleaf, 1e3best, (1e3 .* tbest[1:6])...)
 
 function parity(res, potfile, treefile)
     ft = res.ft

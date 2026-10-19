@@ -148,7 +148,7 @@ function _sample_density!(F::_Forest, f, bs, x::Vector{Float64})
     n = F.n; np = n^3
     isempty(bs) && return F
     if f isa _BatchDensity
-        parallel_foreach(bs, [zeros(3, np) for _ in 1:_nthreads()]) do b, pts
+        parallel_foreach(bs, [alloc(F.ar, 3, np) for _ in 1:_nthreads()]) do b, pts
             c = F.centers[b]
             h = F.boxsize[F.level[b] + 1] / 2
             R = F.R
@@ -474,8 +474,10 @@ mutable struct _CoreInterp
     g::PeriodicGrid
     leg::Ortho1D
     coef::Dict{Int,Vector{Float64}}
+    ws::Any                         # per-thread workspaces (`_interp_workspaces`)
 end
-_CoreInterp(g::PeriodicGrid, leg::Ortho1D) = _CoreInterp(g, leg, Dict{Int,Vector{Float64}}())
+_CoreInterp(g::PeriodicGrid, leg::Ortho1D) =
+    _CoreInterp(g, leg, Dict{Int,Vector{Float64}}(), _interp_workspaces(length(leg.x)))
 
 function _core_leaf(F::_Forest, g::PeriodicGrid, y)
     b = 1 + _gridcell(g, y[1], 1) + g.mle[1] * (_gridcell(g, y[2], 2) + g.mle[2] * _gridcell(g, y[3], 3))
@@ -491,87 +493,103 @@ function _interp_sample!(F::_Forest, bs::Vector{Int}, x::Vector{Float64})
     g = ci.g; n = F.n
     # coefficients of the core leaves not seen yet
     need = [b for b in 1:_nbox(F) if F.core[b] && _isleaf(F, b) && !haskey(ci.coef, b)]
-    newc = _leaf_coefs(F.ar, n, [F.fvals[b] for b in need])
+    newc = _leaf_coefs(F.ar, n, [F.fvals[b] for b in need], ci.ws)
     for (i, b) in enumerate(need)
         ci.coef[b] = newc[i]
     end
     locate = y -> _core_leaf(F, g, y)
     geom = L -> (F.centers[L], F.boxsize[F.level[L] + 1] / 2)
     coef = L -> ci.coef[L]
-    parallel_foreach(bs, _interp_workspaces(n)) do b, w
+    parallel_foreach(bs, ci.ws) do b, w
         _interp_values!(F.fvals[b], F.centers[b], F.boxsize[F.level[b] + 1] / 2, x, g, n, locate, geom, coef, w)
     end
     return F
 end
 
 # Legendre coefficients of value arrays (n³ each).
-function _leaf_coefs(ar::Arena, n::Int, vals)
+function _leaf_coefs(ar::Arena, n::Int, vals, ws = _interp_workspaces(n))
     U = ortho1d(LegendreBasis(), n).U
     Ut = Matrix(transpose(U))
     out = [alloc(ar, n^3) for _ in vals]
-    parallel_foreach(collect(eachindex(vals)), [(zeros(n^3), zeros(n^3)) for _ in 1:_nthreads()]) do i, (w1, w2)
-        tp3!(out[i], vals[i], U, Ut, Ut, w1, w2, 1.0, false)
+    parallel_foreach(collect(eachindex(vals)), ws) do i, w
+        tp3!(out[i], vals[i], U, Ut, Ut, w.w1, w.w2, 1.0, false)
     end
     return out
 end
 
-_interp_workspaces(n::Int) = [(leafof = zeros(Int, n^3), shift = zeros(3, n^3), w1 = zeros(n^3), w2 = zeros(n^3),
-                               out = zeros(n^3), P = (zeros(n, n), zeros(n, n), zeros(n, n)), pv = zeros(n),
-                               y = zeros(3), t = zeros(3), done = falses(n^3)) for _ in 1:_nthreads()]
+_interp_workspaces(n::Int) = [(gid = zeros(Int, n^3), grp = Tuple{Int,NTuple{3,Float64}}[], mask = falses(n, 3),
+                               pos = zeros(Int, n, 3), w1 = zeros(n^3), w2 = zeros(n^3), out = zeros(n^3),
+                               P1t = zeros(n, n), P2 = zeros(n, n), P3 = zeros(n, n), pv = zeros(n))
+                              for _ in 1:_nthreads()]
 
 # Values v at the nodes of the box (center c, half side h) from the core:
 # `locate(y)` is the core leaf at the in-cell point y, `geom(L)` its (center,
-# half side), `coef(L)` its Legendre coefficients.
+# half side), `coef(L)` its Legendre coefficients. The nodes are grouped by
+# the leaf holding their periodic image (the image shift is the same on a
+# leaf, which is smaller than the lattice spacing); on each leaf they are a
+# subset of a tensor grid, evaluated by three small products.
 function _interp_values!(v, c, h::Float64, x::Vector{Float64}, g::PeriodicGrid, n::Int, locate, geom, coef, w)
-    y = w.y; t = w.t
+    Ui, U = g.Uinv, g.U
+    gid = w.gid; grp = w.grp
+    empty!(grp)
+    Lc = 0; lo = (0.0, 0.0, 0.0); hi = (0.0, 0.0, 0.0); gc = 0
     q = 0
-    for iz in 1:n, iy in 1:n, ix in 1:n
+    @inbounds for iz in 1:n, iy in 1:n, ix in 1:n
         q += 1
         p = (c[1] + h * x[ix], c[2] + h * x[iy], c[3] + h * x[iz])
-        for d in 1:3
-            t[d] = g.Uinv[d, 1] * p[1] + g.Uinv[d, 2] * p[2] + g.Uinv[d, 3] * p[3]
-            t[d] = clamp(t[d] - floor(t[d]), 1e-12, 1 - 1e-12) - t[d]     # wrapped - unwrapped
+        t = ntuple(3) do d
+            u = Ui[d, 1] * p[1] + Ui[d, 2] * p[2] + Ui[d, 3] * p[3]
+            clamp(u - floor(u), 1e-12, 1 - 1e-12) - u                 # wrapped - unwrapped
         end
-        for d in 1:3                                                       # image shift (rotated frame)
-            w.shift[d, q] = g.U[d, 1] * t[1] + g.U[d, 2] * t[2] + g.U[d, 3] * t[3]
-            y[d] = p[d] + w.shift[d, q]
-        end
-        w.leafof[q] = locate(y)
-    end
-    done = w.done
-    fill!(done, false)
-    for q0 in 1:(n^3)
-        done[q0] && continue
-        L = w.leafof[q0]
-        cl, hl = geom(L)
-        # index sets of this leaf's nodes along each axis (same image shift:
-        # a leaf is smaller than the lattice spacing)
-        I = falses(n); J = falses(n); K = falses(n)
-        for q in q0:(n^3)
-            (done[q] || w.leafof[q] != L) && continue
-            I[(q - 1) % n + 1] = J[((q - 1) ÷ n) % n + 1] = K[(q - 1) ÷ (n * n) + 1] = true
-        end
-        idx = (findall(I), findall(J), findall(K))
-        pos = (zeros(Int, n), zeros(Int, n), zeros(Int, n))
-        for d in 1:3
-            for (r, i) in enumerate(idx[d])
-                pos[d][i] = r
-                ξ = (c[d] + h * x[i] + w.shift[d, q0] - cl[d]) / hl
-                legepols!(w.pv, ξ, n)
-                for a in 1:n
-                    w.P[d][a, r] = w.pv[a]
-                end
+        sh = ntuple(d -> U[d, 1] * t[1] + U[d, 2] * t[2] + U[d, 3] * t[3], 3)   # image shift (rotated frame)
+        y = (p[1] + sh[1], p[2] + sh[2], p[3] + sh[3])
+        # the previous node's leaf holds most images (strictly inside: same leaf as `locate`)
+        if !(Lc != 0 && lo[1] < y[1] < hi[1] && lo[2] < y[2] < hi[2] && lo[3] < y[3] < hi[3])
+            Lc = locate(y)
+            cl, hl = geom(Lc)
+            lo = (cl[1] - hl, cl[2] - hl, cl[3] - hl); hi = (cl[1] + hl, cl[2] + hl, cl[3] + hl)
+            gc = 0
+            for e in eachindex(grp)
+                grp[e][1] == Lc && (gc = e; break)
+            end
+            if gc == 0
+                push!(grp, (Lc, sh))
+                gc = length(grp)
             end
         end
-        ni, nj, nk = length.(idx)
-        A = Matrix(transpose(view(w.P[1], :, 1:ni)))
-        tp3!(view(w.out, 1:ni * nj * nk), coef(L), A, view(w.P[2], :, 1:nj), view(w.P[3], :, 1:nk),
+        gid[q] = gc
+    end
+    mask = w.mask; pos = w.pos; pv = w.pv
+    for (gi, (L, sh)) in enumerate(grp)
+        cl, hl = geom(L)
+        # index sets of this leaf's nodes along each axis
+        fill!(mask, false)
+        q = 0
+        @inbounds for k in 1:n, j in 1:n, i in 1:n
+            q += 1
+            gid[q] == gi && (mask[i, 1] = mask[j, 2] = mask[k, 3] = true)
+        end
+        nr = ntuple(3) do d
+            r = 0
+            for i in 1:n
+                mask[i, d] || continue
+                pos[i, d] = (r += 1)
+                legepols!(pv, (c[d] + h * x[i] + sh[d] - cl[d]) / hl, n)
+                P = d == 1 ? w.P1t : d == 2 ? w.P2 : w.P3
+                for a in 1:n
+                    d == 1 ? (P[r, a] = pv[a]) : (P[a, r] = pv[a])
+                end
+            end
+            r
+        end
+        ni, nj, nk = nr
+        tp3!(view(w.out, 1:ni * nj * nk), coef(L), view(w.P1t, 1:ni, :), view(w.P2, :, 1:nj), view(w.P3, :, 1:nk),
              w.w1, w.w2, 1.0, false)
-        for q in q0:(n^3)
-            (done[q] || w.leafof[q] != L) && continue
-            i = (q - 1) % n + 1; j = ((q - 1) ÷ n) % n + 1; k = (q - 1) ÷ (n * n) + 1
-            v[q] = w.out[pos[1][i] + ni * ((pos[2][j] - 1) + nj * (pos[3][k] - 1))]
-            done[q] = true
+        q = 0
+        @inbounds for k in 1:n, j in 1:n, i in 1:n
+            q += 1
+            gid[q] == gi || continue
+            v[q] = w.out[pos[i, 1] + ni * ((pos[j, 2] - 1) + nj * (pos[k, 3] - 1))]
         end
     end
     return v
