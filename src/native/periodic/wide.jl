@@ -37,8 +37,10 @@ function sphbesselj!(j::AbstractVector{Float64}, lmax::Int, x::Float64)
             end
         end
     end
+    # normalise by j_0, or by j_1 near the zeros of j_0 (x ≥ 1, where the
+    # closed form of j_1 does not cancel)
     j0 = sin(x) / x
-    j1 = sin(x) / x^2 - cos(x) / x
+    j1 = x < 1 ? 0.0 : sin(x) / x^2 - cos(x) / x
     sc = abs(j0) >= abs(j1) ? j0 / j[1] : j1 / j[2]
     @inbounds for i in 1:(lm + 1)
         j[i] *= sc
