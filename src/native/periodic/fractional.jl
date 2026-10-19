@@ -34,7 +34,7 @@ function fractional_moments(f, g::PeriodicGrid, ft::FlatTree, n::Int, pf::Int, t
     mt = source_cells(g)
     R = g.Q * g.U * Diagonal(1 ./ collect(mt))         # u -> original frame
     Ur = g.U * Diagonal(1 ./ collect(mt))               # u -> rotated frame
-    F = _Forest(n, NTuple{3,Float64}[], Int[], Int[], NTuple{8,Int}[], Vector{Float64}[], [1.0], Arena(), R)
+    F = _Forest(n, 1.0, Arena(), R)
     try
         return _fractional_moments!(F, f, g, ft, Ur, mt, pf, thr)
     finally
@@ -54,13 +54,14 @@ function _fractional_moments!(F::_Forest, f, g::PeriodicGrid, ft::FlatTree, Ur::
     _sample!(F, f, 1:nroot, x)
     edge = maximum(norm(view(Ur, :, d)) for d in 1:3)  # physical size of a unit u-cube (max edge)
     level_boxes = collect(1:nroot)
-    wss = [(zeros(n, n, n), zeros(n, n, n), zeros(3)) for _ in 1:_nthreads()]
+    wss = [(zeros(n^3), zeros(n^3), zeros(n^3), zeros(3)) for _ in 1:_nthreads()]
+    Ut = Matrix(transpose(leg.U))
     while true
         flag = zeros(Bool, length(level_boxes))
-        parallel_foreach(collect(eachindex(level_boxes)), wss) do i, (w1, w2, y)
+        parallel_foreach(collect(eachindex(level_boxes)), wss) do i, (c3, w1, w2, y)
             b = level_boxes[i]
             h = F.boxsize[F.level[b] + 1]
-            if _tail_error(_fbox(F, b), leg.U, tail, w1, w2) > thr
+            if _tail_error(_fbox(F, b), leg.U, Ut, tail, c3, w1, w2) > thr
                 flag[i] = true
                 return
             end

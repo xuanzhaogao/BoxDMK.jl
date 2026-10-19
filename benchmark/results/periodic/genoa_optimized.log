@@ -1,0 +1,91 @@
+== C++ periodic cubic T1 n=3 ==
+[STEPS] cell=cubic dist=multi n=3 | nboxes=624 nleaves=573 depth=3 | tree=636 narrow_cascade=153 wide=8 total=797 ms (narrow_drv=789)
+== Julia periodic cubic T1 n=3 ==
+[JULIA-PERIODIC] threads=1 cell=cubic dist=multi n=3 | nboxes=624 depth=3 target leaves=218 | total=315 ms : forest=273 setup+src=7 local+up=6 wide=3 pw=9 near=15
+[PARITY] boxes C++ 624 / Julia 624 | matched 218 / 218 target leaves | rel L2 diff 6.758e-05  max diff / max|u| 1.788e-05
+== C++ periodic cubic T48 n=3 ==
+[STEPS] cell=cubic dist=multi n=3 | nboxes=624 nleaves=573 depth=3 | tree=31 narrow_cascade=63 wide=23 total=116 ms (narrow_drv=94)
+== Julia periodic cubic T48 n=3 ==
+[JULIA-PERIODIC] threads=48 cell=cubic dist=multi n=3 | nboxes=624 depth=3 target leaves=218 | total=88 ms : forest=47 setup+src=22 local+up=3 wide=4 pw=8 near=3
+[PARITY] boxes C++ 624 / Julia 624 | matched 218 / 218 target leaves | rel L2 diff 6.758e-05  max diff / max|u| 1.788e-05
+== C++ periodic cubic T1 n=6 ==
+[STEPS] cell=cubic dist=multi n=6 | nboxes=1416 nleaves=1266 depth=4 | tree=1437 narrow_cascade=877 wide=65 total=2380 ms (narrow_drv=2314)
+== Julia periodic cubic T1 n=6 ==
+[JULIA-PERIODIC] threads=1 cell=cubic dist=multi n=6 | nboxes=1416 depth=4 target leaves=449 | total=907 ms : forest=586 setup+src=31 local+up=34 wide=12 pw=127 near=112
+[PARITY] boxes C++ 1416 / Julia 1416 | matched 449 / 449 target leaves | rel L2 diff 1.108e-08  max diff / max|u| 2.581e-08
+== C++ periodic cubic T48 n=6 ==
+[STEPS] cell=cubic dist=multi n=6 | nboxes=1416 nleaves=1266 depth=4 | tree=68 narrow_cascade=273 wide=45 total=387 ms (narrow_drv=341)
+== Julia periodic cubic T48 n=6 ==
+[JULIA-PERIODIC] threads=48 cell=cubic dist=multi n=6 | nboxes=1416 depth=4 target leaves=449 | total=149 ms : forest=43 setup+src=41 local+up=4 wide=10 pw=42 near=8
+[PARITY] boxes C++ 1416 / Julia 1416 | matched 449 / 449 target leaves | rel L2 diff 1.108e-08  max diff / max|u| 2.581e-08
+== C++ periodic cubic T1 n=9 ==
+[STEPS] cell=cubic dist=multi n=9 | nboxes=2560 nleaves=2267 depth=5 | tree=2669 narrow_cascade=3662 wide=472 total=6803 ms (narrow_drv=6331)
+== Julia periodic cubic T1 n=9 ==
+[JULIA-PERIODIC] threads=1 cell=cubic dist=multi n=9 | nboxes=2560 depth=5 target leaves=785 | total=3005 ms : forest=1010 setup+src=58 local+up=174 wide=42 pw=917 near=797
+[PARITY] boxes C++ 2560 / Julia 2560 | matched 785 / 785 target leaves | rel L2 diff 5.336e-12  max diff / max|u| 8.914e-12
+== C++ periodic cubic T48 n=9 ==
+[STEPS] cell=cubic dist=multi n=9 | nboxes=2560 nleaves=2267 depth=5 | tree=142 narrow_cascade=218 wide=94 total=454 ms (narrow_drv=360)
+== Julia periodic cubic T48 n=9 ==
+[JULIA-PERIODIC] threads=48 cell=cubic dist=multi n=9 | nboxes=2560 depth=5 target leaves=785 | total=347 ms : forest=70 setup+src=21 local+up=17 wide=92 pw=112 near=20
+[PARITY] boxes C++ 2560 / Julia 2560 | matched 785 / 785 target leaves | rel L2 diff 5.336e-12  max diff / max|u| 8.914e-12
+== C++ periodic sheared T1 n=3 ==
+[STEPS] cell=sheared dist=multi n=3 | nboxes=1320 nleaves=1209 depth=3 | tree=1339 narrow_cascade=440 wide=689 total=2469 ms (narrow_drv=1779)
+== Julia periodic sheared T1 n=3 ==
+[JULIA-PERIODIC] threads=1 cell=sheared dist=multi n=3 | nboxes=720 depth=3 target leaves=323 | total=816 ms : forest=486 setup+src=281 local+up=7 wide=5 pw=12 near=22
+[PARITY] boxes C++ 1320 / Julia 720 | matched 309 / 323 target leaves | rel L2 diff 1.059e-04  max diff / max|u| 1.205e-04
+== C++ periodic sheared T48 n=3 ==
+[STEPS] cell=sheared dist=multi n=3 | nboxes=1320 nleaves=1209 depth=3 | tree=63 narrow_cascade=184 wide=66 total=312 ms (narrow_drv=246)
+== Julia periodic sheared T48 n=3 ==
+[JULIA-PERIODIC] threads=48 cell=sheared dist=multi n=3 | nboxes=720 depth=3 target leaves=323 | total=115 ms : forest=56 setup+src=24 local+up=2 wide=19 pw=10 near=3
+[PARITY] boxes C++ 1320 / Julia 720 | matched 309 / 323 target leaves | rel L2 diff 1.059e-04  max diff / max|u| 1.205e-04
+== C++ periodic sheared T1 n=6 ==
+[STEPS] cell=sheared dist=multi n=6 | nboxes=2096 nleaves=1888 depth=4 | tree=2136 narrow_cascade=2159 wide=1228 total=5523 ms (narrow_drv=4295)
+== Julia periodic sheared T1 n=6 ==
+[JULIA-PERIODIC] threads=1 cell=sheared dist=multi n=6 | nboxes=1960 depth=4 target leaves=570 | total=1954 ms : forest=1070 setup+src=483 local+up=41 wide=30 pw=166 near=157
+[PARITY] boxes C++ 2096 / Julia 1960 | matched 570 / 570 target leaves | rel L2 diff 8.512e-08  max diff / max|u| 1.080e-07
+== C++ periodic sheared T48 n=6 ==
+[STEPS] cell=sheared dist=multi n=6 | nboxes=2096 nleaves=1888 depth=4 | tree=110 narrow_cascade=689 wide=143 total=942 ms (narrow_drv=799)
+== Julia periodic sheared T48 n=6 ==
+[JULIA-PERIODIC] threads=48 cell=sheared dist=multi n=6 | nboxes=1960 depth=4 target leaves=570 | total=306 ms : forest=107 setup+src=39 local+up=4 wide=117 pw=19 near=18
+[PARITY] boxes C++ 2096 / Julia 1960 | matched 570 / 570 target leaves | rel L2 diff 8.512e-08  max diff / max|u| 1.080e-07
+== C++ periodic sheared T1 n=9 ==
+[STEPS] cell=sheared dist=multi n=9 | nboxes=4216 nleaves=3743 depth=4 | tree=4362 narrow_cascade=10209 wide=3377 total=17947 ms (narrow_drv=14570)
+== Julia periodic sheared T1 n=9 ==
+[JULIA-PERIODIC] threads=1 cell=sheared dist=multi n=9 | nboxes=4048 depth=4 target leaves=996 | total=5565 ms : forest=2234 setup+src=852 local+up=254 wide=115 pw=1116 near=981
+[PARITY] boxes C++ 4216 / Julia 4048 | matched 996 / 996 target leaves | rel L2 diff 5.118e-11  max diff / max|u| 1.205e-10
+== C++ periodic sheared T48 n=9 ==
+[STEPS] cell=sheared dist=multi n=9 | nboxes=4216 nleaves=3743 depth=4 | tree=226 narrow_cascade=432 wide=225 total=882 ms (narrow_drv=658)
+== Julia periodic sheared T48 n=9 ==
+[JULIA-PERIODIC] threads=48 cell=sheared dist=multi n=9 | nboxes=4048 depth=4 target leaves=996 | total=491 ms : forest=161 setup+src=78 local+up=16 wide=69 pw=116 near=36
+[PARITY] boxes C++ 4216 / Julia 4048 | matched 996 / 996 target leaves | rel L2 diff 5.118e-11  max diff / max|u| 1.205e-10
+== C++ periodic hex T1 n=3 ==
+[STEPS] cell=hex dist=multi n=3 | nboxes=1632 nleaves=1491 depth=3 | tree=1646 narrow_cascade=407 wide=726 total=2779 ms (narrow_drv=2053)
+== Julia periodic hex T1 n=3 ==
+[JULIA-PERIODIC] threads=1 cell=hex dist=multi n=3 | nboxes=920 depth=3 target leaves=291 | total=832 ms : forest=459 setup+src=324 local+up=7 wide=8 pw=12 near=19
+[PARITY] boxes C++ 1632 / Julia 920 | matched 273 / 291 target leaves | rel L2 diff 1.017e-04  max diff / max|u| 1.390e-04
+== C++ periodic hex T48 n=3 ==
+[STEPS] cell=hex dist=multi n=3 | nboxes=1632 nleaves=1491 depth=3 | tree=76 narrow_cascade=167 wide=61 total=305 ms (narrow_drv=244)
+== Julia periodic hex T48 n=3 ==
+[JULIA-PERIODIC] threads=48 cell=hex dist=multi n=3 | nboxes=920 depth=3 target leaves=291 | total=152 ms : forest=69 setup+src=19 local+up=15 wide=33 pw=8 near=7
+[PARITY] boxes C++ 1632 / Julia 920 | matched 273 / 291 target leaves | rel L2 diff 1.017e-04  max diff / max|u| 1.390e-04
+== C++ periodic hex T1 n=6 ==
+[STEPS] cell=hex dist=multi n=6 | nboxes=2328 nleaves=2100 depth=4 | tree=2351 narrow_cascade=1534 wide=1283 total=5168 ms (narrow_drv=3885)
+== Julia periodic hex T1 n=6 ==
+[JULIA-PERIODIC] threads=1 cell=hex dist=multi n=6 | nboxes=2160 depth=4 target leaves=451 | total=1696 ms : forest=900 setup+src=462 local+up=42 wide=42 pw=133 near=110
+[PARITY] boxes C++ 2328 / Julia 2160 | matched 451 / 451 target leaves | rel L2 diff 8.316e-08  max diff / max|u| 1.570e-07
+== C++ periodic hex T48 n=6 ==
+[STEPS] cell=hex dist=multi n=6 | nboxes=2328 nleaves=2100 depth=4 | tree=120 narrow_cascade=478 wide=161 total=759 ms (narrow_drv=599)
+== Julia periodic hex T48 n=6 ==
+[JULIA-PERIODIC] threads=48 cell=hex dist=multi n=6 | nboxes=2160 depth=4 target leaves=451 | total=244 ms : forest=104 setup+src=47 local+up=4 wide=28 pw=44 near=15
+[PARITY] boxes C++ 2328 / Julia 2160 | matched 451 / 451 target leaves | rel L2 diff 8.316e-08  max diff / max|u| 1.570e-07
+== C++ periodic hex T1 n=9 ==
+[STEPS] cell=hex dist=multi n=9 | nboxes=5736 nleaves=5082 depth=4 | tree=5865 narrow_cascade=8077 wide=4080 total=18021 ms (narrow_drv=13941)
+== Julia periodic hex T1 n=9 ==
+[JULIA-PERIODIC] threads=1 cell=hex dist=multi n=9 | nboxes=5648 depth=4 target leaves=1086 | total=5875 ms : forest=2437 setup+src=1087 local+up=379 wide=165 pw=920 near=868
+[PARITY] boxes C++ 5736 / Julia 5648 | matched 1086 / 1086 target leaves | rel L2 diff 5.289e-11  max diff / max|u| 1.236e-10
+== C++ periodic hex T48 n=9 ==
+[STEPS] cell=hex dist=multi n=9 | nboxes=5736 nleaves=5082 depth=4 | tree=321 narrow_cascade=358 wide=246 total=925 ms (narrow_drv=679)
+== Julia periodic hex T48 n=9 ==
+[JULIA-PERIODIC] threads=48 cell=hex dist=multi n=9 | nboxes=5648 depth=4 target leaves=1086 | total=551 ms : forest=225 setup+src=92 local+up=34 wide=39 pw=118 near=42
+[PARITY] boxes C++ 5736 / Julia 5648 | matched 1086 / 1086 target leaves | rel L2 diff 5.289e-11  max diff / max|u| 1.236e-10
+PERIODIC_DONE
