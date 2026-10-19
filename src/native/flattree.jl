@@ -63,11 +63,13 @@ function FlatTree(tree::BoxTree)
     return FlatTree(nb, nl, order, laddr, level, parent, nchild, child, ncoll, coll, centers, boxsize)
 end
 
-# Boxes that need plane-wave expansions: the root, every nonleaf box, and
-# every leaf with a nonleaf colleague.
+# Boxes that need plane-wave expansions: the roots (every level-0 box of a
+# forest), every nonleaf box, and every leaf with a nonleaf colleague.
 function find_pwexp_boxes(ft::FlatTree)
     ifpwexp = falses(ft.nboxes)
-    ifpwexp[1] = true
+    for ibox in levelboxes(ft, 0)
+        ifpwexp[ibox] = true
+    end
     for ilev in 1:ft.nlevels, ibox in levelboxes(ft, ilev)
         if ft.nchild[ibox] == 0
             for j in 1:ft.ncoll[ibox]
@@ -102,7 +104,7 @@ end
 function compute_list1(ft::FlatTree)
     nb = ft.nboxes
     lists = [Int[] for _ in 1:nb]
-    if ft.nchild[1] == 0
+    if nb == 1
         push!(lists[1], 1)
     else
         for ilev in 0:ft.nlevels, ibox in levelboxes(ft, ilev)
@@ -122,6 +124,7 @@ function compute_list1(ft::FlatTree)
                 end
             end
             dad = ft.parent[ibox]
+            dad == 0 && continue
             for i in 1:ft.ncoll[dad]
                 jbox = ft.coll[i, dad]
                 ft.nchild[jbox] == 0 || continue

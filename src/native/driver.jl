@@ -42,6 +42,8 @@ struct DMKSetup
     loctabs::Vector{Vector{Union{Nothing,LocTab1D}}}   # [ilev+1][id]
     pwlevels::Vector{Union{Nothing,PWLevel}}            # [ilev+1]
     taylor::NTuple{3,Float64}
+    istarget::BitVector         # boxes whose potential is wanted (halo boxes are source-only)
+    need_mp::BitVector          # boxes whose outgoing expansion some target reads
     arena::Arena                # large buffers of this solve
 end
 
@@ -53,12 +55,20 @@ _nthreads() = Threads.nthreads()
 
 function DMKSetup(tree::BoxTree, nd::Int, kernel::AbstractKernel, eps::Float64, ifpgh::Int)
     ft = FlatTree(tree)
-    n = tree.norder
-    basis = tree.basis
+    r0, wdeltas, deltas = sog_nodes(kernel, eps, ft.boxsize[1], ft.nlevels, tree.norder)
+    taylor = taylor_coefficients(kernel, r0, wdeltas, deltas)
+    return DMKSetup(ft, tree.basis, tree.norder, nd, eps, ifpgh, r0, wdeltas, deltas, taylor)
+end
+
+# Setup on a flat tree (or forest) for the SOG Σ wdeltas exp(-r²/deltas) with
+# local correction `taylor`. `asym_safety` tightens the asymptotic-expansion
+# criterion (4δ/bs²)³ <= eps * asym_safety; `istarget` marks the boxes whose
+# potential is wanted (the others only act as sources).
+function DMKSetup(ft::FlatTree, basis::AbstractBasis, n::Int, nd::Int, eps::Float64, ifpgh::Int,
+                  r0::Float64, wdeltas::Vector{Float64}, deltas::Vector{Float64}, taylor;
+                  asym_safety::Float64 = 1.0, istarget::BitVector = trues(ft.nboxes))
     nl = ft.nlevels
     bs0 = ft.boxsize[1]
-
-    r0, wdeltas, deltas = sog_nodes(kernel, eps, bs0, nl, n)
     nde = length(deltas)
 
     nlv = _lvidx(nl + 1)
@@ -76,12 +86,20 @@ function DMKSetup(tree::BoxTree, nd::Int, kernel::AbstractKernel, eps::Float64, 
 
     idelta = zeros(Int, nl + 1)
     for ilev in 0:nl, k in nde:-1:1
-        (deltas[k] * 4 / ft.boxsize[ilev + 1]^2)^3 <= eps && (idelta[ilev + 1] += 1)
+        (deltas[k] * 4 / ft.boxsize[ilev + 1]^2)^3 <= eps * asym_safety && (idelta[ilev + 1] += 1)
     end
 
     ifpwexp = find_pwexp_boxes(ft)
     nlistpw, listpw = compute_listpw(ft)
     list1_ptr, list1 = compute_list1(ft)
+    need_mp = falses(ft.nboxes)
+    for ibox in 1:ft.nboxes
+        (ifpwexp[ibox] && istarget[ibox]) || continue
+        need_mp[ibox] = true
+        for j in 1:nlistpw[ibox]
+            need_mp[listpw[j, ibox]] = true
+        end
+    end
 
     porder = select_porder(eps)
     prox = ortho1d(LegendreBasis(), porder)
@@ -107,7 +125,7 @@ function DMKSetup(tree::BoxTree, nd::Int, kernel::AbstractKernel, eps::Float64, 
     q = LocTabQuad(basis, n)
     jobs = Tuple{Int,Int}[]
     for ilev in 0:nl
-        any(ibox -> isleafbox(ft, ibox), levelboxes(ft, ilev)) || continue
+        any(ibox -> isleafbox(ft, ibox) && istarget[ibox], levelboxes(ft, ilev)) || continue
         for id in ipwaddr[1, _lvidx(ilev)]:(nde - idelta[ilev + 1])
             push!(jobs, (ilev, id))
         end
@@ -131,7 +149,6 @@ function DMKSetup(tree::BoxTree, nd::Int, kernel::AbstractKernel, eps::Float64, 
                                      (den2pc .* (ft.boxsize[ilev + 1] / 2), poteval))
     end
 
-    taylor = taylor_coefficients(kernel, r0, wdeltas, deltas)
     D1 = inp.Vp * inp.U
     D2 = inp.Vpp * inp.U
 
@@ -141,10 +158,11 @@ function DMKSetup(tree::BoxTree, nd::Int, kernel::AbstractKernel, eps::Float64, 
                     c2p, map(m -> Matrix(transpose(m)), c2p),
                     map(m -> m * den2pc, c2p), map(m -> Matrix(transpose(m * den2pc)), c2p),
                     map(m -> poteval * m, p2c), map(m -> Matrix(transpose(poteval * m)), p2c), prox,
-                    loctabs, pwlevels, taylor, Arena())
+                    loctabs, pwlevels, Tuple(taylor), istarget, need_mp, Arena())
 end
 
 leafboxes(ft::FlatTree) = [ibox for ibox in 1:ft.nboxes if ft.nchild[ibox] == 0]
+targetleaves(s::DMKSetup) = [ibox for ibox in 1:s.ft.nboxes if s.ft.nchild[ibox] == 0 && s.istarget[ibox]]
 
 function _laplacian!(out, f, s::DMKSetup, sc2)
     n = s.n
@@ -165,7 +183,7 @@ function step2_local_expansions!(pot, grad, hess, s::DMKSetup, fv)
     c0, c1, c2 = s.taylor
     asym = [s.idelta[ilev + 1] > 0 ? _asym_coefs(s, s.idelta[ilev + 1]) : (0.0, 0.0, 0.0) for ilev in 0:ft.nlevels]
     wss = make_workspaces(() -> ntuple(_ -> alloc(s.arena, n, n, n), 5))
-    parallel_foreach(leafboxes(ft), wss) do ibox, (fl, fl2, gd, gld, tmp)
+    parallel_foreach(targetleaves(s), wss) do ibox, (fl, fl2, gd, gld, tmp)
         ilev = ft.level[ibox]
         a0, a2, a4 = asym[ilev + 1]
         b0 = c0 + a0; b1 = c1 + a2; b2 = c2 + a4
@@ -320,7 +338,7 @@ function steps456_planewave!(pot, grad, hess, pp, pc, nodeidx, s::DMKSetup, fv, 
     # (all levels >= 0 share the same number of plane waves).
     npw = pw_terms(eps, 0)
     nexp = npw * npw * (npw ÷ 2)
-    maxboxes = maximum(ilev -> count(ibox -> s.ifpwexp[ibox], levelboxes(ft, ilev)), 0:ft.nlevels)
+    maxboxes = maximum(ilev -> count(ibox -> s.need_mp[ibox], levelboxes(ft, ilev)), 0:ft.nlevels)
     ncols = npw * (npw ÷ 2)
     cb = min(ncols, cld(2048, npw))           # ~16 KB of a box's expansion per block
     nblk = cld(ncols, cb)
@@ -331,14 +349,20 @@ function steps456_planewave!(pot, grad, hess, pp, pc, nodeidx, s::DMKSetup, fv, 
     lay = PWLayout(npw, cb, npw * cb * nd * maxboxes)
     wss = make_workspaces(() -> PWWork(npw, max(p, s.n), s.arena, ifpgh))
     accs = [zeros(2 * 64) for _ in 1:_nthreads()]
+    tidx = zeros(Int, ft.nboxes)
     for ilev in 0:ft.nlevels
-        boxes = [ibox for ibox in levelboxes(ft, ilev) if s.ifpwexp[ibox]]
-        isempty(boxes) && continue
+        # sources: expansions some target reads; targets: wanted boxes
+        boxes = [ibox for ibox in levelboxes(ft, ilev) if s.need_mp[ibox]]
+        tboxes = [ibox for ibox in levelboxes(ft, ilev) if s.ifpwexp[ibox] && s.istarget[ibox]]
+        isempty(tboxes) && continue
         L = s.pwlevels[ilev + 1]
         if L !== nothing
-            nbl = length(boxes)
+            nbl = length(tboxes)
             for (k, ibox) in enumerate(boxes)
                 mpidx[ibox] = k
+            end
+            for (k, ibox) in enumerate(tboxes)
+                tidx[ibox] = k
             end
             @assert L.nexp == nexp
             # outgoing expansions, premultiplied by the kernel's Fourier transform
@@ -356,15 +380,15 @@ function steps456_planewave!(pot, grad, hess, pp, pc, nodeidx, s::DMKSetup, fv, 
                 end
             end
             t1 = time_ns(); tm[5] += (t1 - t0) / 1e9
-            lst = _m2l_list(s, boxes, mpidx, ft.boxsize[ilev + 1])
+            lst = _m2l_list(s, tboxes, mpidx, ft.boxsize[ilev + 1])
             nchunk = min(ncols, 8 * _nthreads())
             ranges = [(1 + div((i - 1) * ncols, nchunk)):div(i * ncols, nchunk) for i in 1:nchunk]
             parallel_foreach(ranges, accs) do cols, acc
                 m2l_columns!(locr, loci, mpr, mpi, lst, L, nd, nbl, cols, acc)
             end
             t2 = time_ns(); tm[6] += (t2 - t1) / 1e9
-            parallel_foreach(boxes, wss) do ibox, w
-                k = mpidx[ibox]
+            parallel_foreach(tboxes, wss) do ibox, w
+                k = tidx[ibox]
                 for ind in 1:nd
                     off0 = npw * cb * ((ind - 1) + nd * (k - 1))
                     if ft.nchild[ibox] == 0
@@ -379,7 +403,7 @@ function steps456_planewave!(pot, grad, hess, pp, pc, nodeidx, s::DMKSetup, fv, 
         # Downward pass: parent proxy potential -> children. Leaf children get
         # their (now complete) proxy potential evaluated on their grid directly.
         t3 = time_ns()
-        parents = [ibox for ibox in boxes if ft.nchild[ibox] > 0]
+        parents = [ibox for ibox in tboxes if ft.nchild[ibox] > 0]
         parallel_foreach(parents, tpw) do ibox, w
             for ind in 1:nd, c in 1:ncomb
                 phi = view(pp, :, ind, c, nodeidx[ibox])
@@ -394,11 +418,11 @@ function steps456_planewave!(pot, grad, hess, pp, pc, nodeidx, s::DMKSetup, fv, 
     return nothing
 end
 
-function _m2l_list(s::DMKSetup, boxes, mpidx, xmin)
+function _m2l_list(s::DMKSetup, tboxes, mpidx, xmin)
     ft = s.ft
-    srcs = [NTuple{4,Int}[] for _ in boxes]
-    for (t, ibox) in enumerate(boxes)
-        push!(srcs[t], (t, 0, 0, 0))
+    srcs = [NTuple{4,Int}[] for _ in tboxes]
+    for (t, ibox) in enumerate(tboxes)
+        push!(srcs[t], (mpidx[ibox], 0, 0, 0))
         for j in 1:s.nlistpw[ibox]
             jbox = s.listpw[j, ibox]
             dx = round(Int, (ft.centers[1, ibox] - ft.centers[1, jbox]) / xmin)
@@ -415,7 +439,7 @@ end
 function step7_local!(pot, grad, hess, s::DMKSetup, fv)
     ft, n = s.ft, s.n
     wss = make_workspaces(() -> (LocalWork(n, s.arena), alloc(s.arena, n^3), alloc(s.arena, n^3), zeros(Int, 27), Int[]))
-    parallel_foreach(leafboxes(ft), wss) do ibox, ws
+    parallel_foreach(targetleaves(s), wss) do ibox, ws
         if s.ifpgh == 1
             _local_pot_box!(pot, s, fv, ibox, ws)
         else
