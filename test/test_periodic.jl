@@ -134,6 +134,27 @@ end
         @test mx < 2e-9
     end
 
+    @testset "plan reuse and targets" begin
+        A = [1.0 0.35 0.15; 0 1 -0.2; 0 0 1]
+        xs = [Tuple(A * collect(t)) for t in _PXS]
+        g = neutral_mixture(A, xs, [2000.0, 200, 300, 400], [1.0, 0.7, -0.5, 0.9])
+        r1 = bdmk_periodic(g, A; eps = 1e-6)
+        p1 = copy(r1.pot)
+        plan = periodic_plan(g, A; eps = 1e-6)
+        @test periodic_solve!(plan, g).pot == p1                     # fresh samples
+        p2 = copy(periodic_solve!(plan, g).pot)                       # resampled
+        m = [i for i in 1:plan.ft.nboxes if plan.ft.nchild[i] == 0 && plan.istarget[i]]
+        um = maximum(abs, p1[:, :, :, m])
+        @test maximum(abs, p2[:, :, :, m] .- p1[:, :, :, m]) < 1e-8 * um
+        p3 = periodic_solve!(plan, x -> -3 * g(x)).pot
+        @test maximum(abs, p3[:, :, :, m] .+ 3 .* p1[:, :, :, m]) < 1e-8 * um
+        T = A * rand(MersenneTwister(5), 3, 20) .+ A * [0.0, 2, -1]
+        rt = bdmk_periodic(g, A; eps = 1e-6, targets = T)
+        @test count(rt.istarget) < count(r1.istarget)
+        @test rt.target_pot ≈ [evaluate_periodic(r1, T[:, j]) for j in 1:20] rtol = 1e-12
+        @test_throws ArgumentError evaluate_periodic(rt, A * [0.5, 0.01, 0.99] .+ 1e-3 .* (1:3))
+    end
+
     @testset "batch density" begin
         g = neutral_mixture((1.0, 1.0, 1.0), _PXS, [60.0, 120, 180, 240], [1.0, 0.7, -0.5, 0.9])
         gb!(v, pts) = (for i in axes(pts, 2); v[1, i] = g(view(pts, :, i)); end)

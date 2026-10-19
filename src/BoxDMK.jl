@@ -44,7 +44,7 @@ include("fortran/fortran_wrapper.jl")
 export LaplaceKernel, YukawaKernel, SqrtLaplaceKernel
 export LegendreBasis, ChebyshevBasis
 export build_tree, bdmk, bdmk_native
-export bdmk_periodic, evaluate_periodic, PeriodicResult
+export bdmk_periodic, evaluate_periodic, PeriodicResult, PeriodicPlan, periodic_plan, periodic_solve!
 export PotentialField, evaluate_potential, evaluate_gradient, evaluate_hessian
 export FortranTreeData, build_tree_fortran, pack_tree_fortran, bdmk_fortran
 

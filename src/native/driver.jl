@@ -96,15 +96,7 @@ function DMKSetup(ft::FlatTree, basis::AbstractBasis, n::Int, nd::Int, eps::Floa
     ifpwexp = find_pwexp_boxes(ft)
     nlistpw, listpw = compute_listpw(ft)
     list1_ptr, list1 = compute_list1(ft)
-    need_mp = falses(ft.nboxes)
-    for ibox in 1:ft.nboxes
-        (ifpwexp[ibox] && istarget[ibox]) || continue
-        need_mp[ibox] = issource[ibox]
-        for j in 1:nlistpw[ibox]
-            jbox = listpw[j, ibox]
-            issource[jbox] && (need_mp[jbox] = true)
-        end
-    end
+    need_mp = _need_mp!(falses(ft.nboxes), ifpwexp, istarget, issource, nlistpw, listpw)
 
     porder = select_porder(eps)
     prox = ortho1d(LegendreBasis(), porder)
@@ -164,6 +156,28 @@ function DMKSetup(ft::FlatTree, basis::AbstractBasis, n::Int, nd::Int, eps::Floa
                     map(m -> m * den2pc, c2p), map(m -> Matrix(transpose(m * den2pc)), c2p),
                     map(m -> poteval * m, p2c), map(m -> Matrix(transpose(poteval * m)), p2c), prox,
                     loctabs, pwlevels, Tuple(taylor), istarget, issource, need_mp, Arena())
+end
+
+# Boxes whose outgoing expansion some target reads: sources among the
+# plane-wave targets and their plane-wave lists.
+function _need_mp!(need_mp, ifpwexp, istarget, issource, nlistpw, listpw)
+    fill!(need_mp, false)
+    for ibox in eachindex(need_mp)
+        (ifpwexp[ibox] && istarget[ibox]) || continue
+        need_mp[ibox] = issource[ibox]
+        for j in 1:nlistpw[ibox]
+            jbox = listpw[j, ibox]
+            issource[jbox] && (need_mp[jbox] = true)
+        end
+    end
+    return need_mp
+end
+
+# Change the source boxes of a setup.
+function set_sources!(s::DMKSetup, issource::BitVector)
+    s.issource .= issource
+    _need_mp!(s.need_mp, s.ifpwexp, s.istarget, s.issource, s.nlistpw, s.listpw)
+    return s
 end
 
 leafboxes(ft::FlatTree) = [ibox for ibox in 1:ft.nboxes if ft.nchild[ibox] == 0]

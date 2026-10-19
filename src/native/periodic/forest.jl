@@ -369,8 +369,9 @@ end
 Adaptive forest over `grid` for the periodic density `f(x::AbstractVector) -> Real`
 (or the batch form `f_batch!(values::AbstractMatrix, points::AbstractMatrix)`,
 values `(1, npts)`, points `(3, npts)`).
-Returns `(ft::FlatTree, fvals::Array{Float64,4}, istarget::BitVector)` with boxes
-in level order, `fvals` of size `(n, n, n, nboxes)` and `istarget` false on halo
+Returns `(ft::FlatTree, fvals::Array{Float64,4}, istarget::BitVector, core::BitVector)` with boxes
+in level order, `fvals` of size `(n, n, n, nboxes)`, `core` false on the boxes
+interpolated from the others, and `istarget` false on halo
 boxes.
 """
 function build_periodic_forest(f, g::PeriodicGrid; norder::Int = 16, eps::Float64 = 1e-6, min_levels::Int = 1,
@@ -505,77 +506,93 @@ end
 
 function _interp_sample!(F::_Forest, bs::Vector{Int}, x::Vector{Float64})
     ci = F.ci::_CoreInterp
-    g = ci.g; n = F.n; U = ci.leg.U
+    g = ci.g; n = F.n
     # coefficients of the core leaves not seen yet
     need = [b for b in 1:_nbox(F) if F.core[b] && _isleaf(F, b) && !haskey(ci.coef, b)]
-    newc = [alloc(F.ar, n^3) for _ in need]
-    parallel_foreach(collect(eachindex(need)), [(zeros(n^3), zeros(n^3)) for _ in 1:_nthreads()]) do i, (w1, w2)
-        tp3!(newc[i], F.fvals[need[i]], U, Matrix(transpose(U)), Matrix(transpose(U)), w1, w2, 1.0, false)
-    end
+    newc = _leaf_coefs(F.ar, n, [F.fvals[b] for b in need])
     for (i, b) in enumerate(need)
         ci.coef[b] = newc[i]
     end
-    Ut = Matrix(transpose(U))
-    wks = [(leafof = zeros(Int, n^3), shift = zeros(3, n^3), w1 = zeros(n^3), w2 = zeros(n^3), out = zeros(n^3),
-            P = (zeros(n, n), zeros(n, n), zeros(n, n)), pv = zeros(n)) for _ in 1:_nthreads()]
-    parallel_foreach(bs, wks) do b, w
-        c = F.centers[b]
-        h = F.boxsize[F.level[b] + 1] / 2
-        v = F.fvals[b]
-        q = 0
-        y = zeros(3); t = zeros(3)
-        for iz in 1:n, iy in 1:n, ix in 1:n
-            q += 1
-            p = (c[1] + h * x[ix], c[2] + h * x[iy], c[3] + h * x[iz])
-            for d in 1:3
-                t[d] = g.Uinv[d, 1] * p[1] + g.Uinv[d, 2] * p[2] + g.Uinv[d, 3] * p[3]
-                t[d] = clamp(t[d] - floor(t[d]), 1e-12, 1 - 1e-12) - t[d]     # wrapped - unwrapped
-            end
-            for d in 1:3                                                       # image shift (rotated frame)
-                w.shift[d, q] = g.U[d, 1] * t[1] + g.U[d, 2] * t[2] + g.U[d, 3] * t[3]
-                y[d] = p[d] + w.shift[d, q]
-            end
-            w.leafof[q] = _core_leaf(F, g, y)
-        end
-        done = falses(n^3)
-        for q0 in 1:(n^3)
-            done[q0] && continue
-            L = w.leafof[q0]
-            cl = F.centers[L]; hl = F.boxsize[F.level[L] + 1] / 2
-            # index sets of this leaf's nodes along each axis
-            I = falses(n); J = falses(n); K = falses(n)
-            for q in q0:(n^3)
-                (done[q] || w.leafof[q] != L) && continue
-                i = (q - 1) % n + 1; j = ((q - 1) ÷ n) % n + 1; k = (q - 1) ÷ (n * n) + 1
-                I[i] = J[j] = K[k] = true
-            end
-            idx = (findall(I), findall(J), findall(K))
-            for d in 1:3
-                for (r, i) in enumerate(idx[d])
-                    ξ = (c[d] + h * x[i] + w.shift[d, q0] - cl[d]) / hl
-                    legepols!(w.pv, ξ, n)
-                    for a in 1:n
-                        w.P[d][a, r] = w.pv[a]
-                    end
-                end
-            end
-            ni, nj, nk = length.(idx)
-            A = Matrix(transpose(view(w.P[1], :, 1:ni)))
-            tp3!(view(w.out, 1:ni * nj * nk), ci.coef[L], A, view(w.P[2], :, 1:nj), view(w.P[3], :, 1:nk),
-                 w.w1, w.w2, 1.0, false)
-            pos = (zeros(Int, n), zeros(Int, n), zeros(Int, n))
-            for d in 1:3, (r, i) in enumerate(idx[d])
-                pos[d][i] = r
-            end
-            for q in q0:(n^3)
-                (done[q] || w.leafof[q] != L) && continue
-                i = (q - 1) % n + 1; j = ((q - 1) ÷ n) % n + 1; k = (q - 1) ÷ (n * n) + 1
-                v[q] = w.out[pos[1][i] + ni * ((pos[2][j] - 1) + nj * (pos[3][k] - 1))]
-                done[q] = true
-            end
-        end
+    locate = y -> _core_leaf(F, g, y)
+    geom = L -> (F.centers[L], F.boxsize[F.level[L] + 1] / 2)
+    coef = L -> ci.coef[L]
+    parallel_foreach(bs, _interp_workspaces(n)) do b, w
+        _interp_values!(F.fvals[b], F.centers[b], F.boxsize[F.level[b] + 1] / 2, x, g, n, locate, geom, coef, w)
     end
     return F
+end
+
+# Legendre coefficients of value arrays (n³ each).
+function _leaf_coefs(ar::Arena, n::Int, vals)
+    U = ortho1d(LegendreBasis(), n).U
+    Ut = Matrix(transpose(U))
+    out = [alloc(ar, n^3) for _ in vals]
+    parallel_foreach(collect(eachindex(vals)), [(zeros(n^3), zeros(n^3)) for _ in 1:_nthreads()]) do i, (w1, w2)
+        tp3!(out[i], vals[i], U, Ut, Ut, w1, w2, 1.0, false)
+    end
+    return out
+end
+
+_interp_workspaces(n::Int) = [(leafof = zeros(Int, n^3), shift = zeros(3, n^3), w1 = zeros(n^3), w2 = zeros(n^3),
+                               out = zeros(n^3), P = (zeros(n, n), zeros(n, n), zeros(n, n)), pv = zeros(n),
+                               y = zeros(3), t = zeros(3), done = falses(n^3)) for _ in 1:_nthreads()]
+
+# Values v at the nodes of the box (center c, half side h) from the core:
+# `locate(y)` is the core leaf at the in-cell point y, `geom(L)` its (center,
+# half side), `coef(L)` its Legendre coefficients.
+function _interp_values!(v, c, h::Float64, x::Vector{Float64}, g::PeriodicGrid, n::Int, locate, geom, coef, w)
+    y = w.y; t = w.t
+    q = 0
+    for iz in 1:n, iy in 1:n, ix in 1:n
+        q += 1
+        p = (c[1] + h * x[ix], c[2] + h * x[iy], c[3] + h * x[iz])
+        for d in 1:3
+            t[d] = g.Uinv[d, 1] * p[1] + g.Uinv[d, 2] * p[2] + g.Uinv[d, 3] * p[3]
+            t[d] = clamp(t[d] - floor(t[d]), 1e-12, 1 - 1e-12) - t[d]     # wrapped - unwrapped
+        end
+        for d in 1:3                                                       # image shift (rotated frame)
+            w.shift[d, q] = g.U[d, 1] * t[1] + g.U[d, 2] * t[2] + g.U[d, 3] * t[3]
+            y[d] = p[d] + w.shift[d, q]
+        end
+        w.leafof[q] = locate(y)
+    end
+    done = w.done
+    fill!(done, false)
+    for q0 in 1:(n^3)
+        done[q0] && continue
+        L = w.leafof[q0]
+        cl, hl = geom(L)
+        # index sets of this leaf's nodes along each axis (same image shift:
+        # a leaf is smaller than the lattice spacing)
+        I = falses(n); J = falses(n); K = falses(n)
+        for q in q0:(n^3)
+            (done[q] || w.leafof[q] != L) && continue
+            I[(q - 1) % n + 1] = J[((q - 1) ÷ n) % n + 1] = K[(q - 1) ÷ (n * n) + 1] = true
+        end
+        idx = (findall(I), findall(J), findall(K))
+        pos = (zeros(Int, n), zeros(Int, n), zeros(Int, n))
+        for d in 1:3
+            for (r, i) in enumerate(idx[d])
+                pos[d][i] = r
+                ξ = (c[d] + h * x[i] + w.shift[d, q0] - cl[d]) / hl
+                legepols!(w.pv, ξ, n)
+                for a in 1:n
+                    w.P[d][a, r] = w.pv[a]
+                end
+            end
+        end
+        ni, nj, nk = length.(idx)
+        A = Matrix(transpose(view(w.P[1], :, 1:ni)))
+        tp3!(view(w.out, 1:ni * nj * nk), coef(L), A, view(w.P[2], :, 1:nj), view(w.P[3], :, 1:nk),
+             w.w1, w.w2, 1.0, false)
+        for q in q0:(n^3)
+            (done[q] || w.leafof[q] != L) && continue
+            i = (q - 1) % n + 1; j = ((q - 1) ÷ n) % n + 1; k = (q - 1) ÷ (n * n) + 1
+            v[q] = w.out[pos[1][i] + ni * ((pos[2][j] - 1) + nj * (pos[3][k] - 1))]
+            done[q] = true
+        end
+    end
+    return v
 end
 
 # Central level-0 box whose lattice translate the level-0 box b is (tiled cells).
@@ -657,5 +674,5 @@ function _flatten_forest(F::_Forest, g::PeriodicGrid)
     # targets: boxes of the central grid that meet the cell
     istarget = BitVector([!_inhalo(g, view(centers, :, i)) && _meets_cell(g, view(centers, :, i), F.boxsize[level[i] + 1] / 2)
                           for i in 1:nb])
-    return ft, fvals, istarget
+    return ft, fvals, istarget, BitVector(F.core[order])
 end

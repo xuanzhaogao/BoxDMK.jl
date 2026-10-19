@@ -53,10 +53,12 @@ struct PeriodicResult
     pot::Array{Float64,4}
     istarget::BitVector
     norder::Int
+    target_pot::Union{Nothing,Vector{Float64}}
 end
 
 """
-    bdmk_periodic(f, cell; eps=1e-6, norder=16, rc_factor=0.25, nhalo=1, f_batch=nothing, timings=nothing)
+    bdmk_periodic(f, cell; eps=1e-6, norder=16, rc_factor=0.25, nhalo=1, f_batch=nothing,
+                  skip_negligible=true, interpolate=true, timings=nothing)
 
 Periodic Coulomb potential
 
@@ -74,35 +76,84 @@ boxes whose density is too small to change the potential by `eps` relative
 are left out of the real-space part (see `_source_boxes`). With `interpolate`
 (cells whose level-0 cubes do not tile the cell) only the boxes meeting the
 cell sample `f`, the others interpolate them at periodic images; `false` gives
-the forest of the C++ builder. `timings` (length ≥ 6)
+the forest of the C++ builder. `targets` (3 × N
+points) restricts the computation to the leaves holding them and returns the
+potential there in `target_pot`. `timings` (length ≥ 6)
 receives wall times (s): [1] forest, [2] setup and wide source, [3] local
 expansions + upward pass, [4] wide part, [5] plane waves, [6] near field, and
 if length ≥ 10 the plane-wave split [7] formation, [8] translation,
 [9] evaluation, [10] downward pass.
 """
-function bdmk_periodic(f, cell; eps::Real = 1e-6, norder::Int = 16, rc_factor::Real = 0.25, nhalo::Int = 1,
-                       f_batch = nothing, skip_negligible::Bool = true, interpolate::Bool = true,
-                       timings::Union{Nothing,Vector{Float64}} = nothing)
-    f_batch === nothing || (f = _BatchDensity(f_batch))
-    old_ftz = get_zero_subnormals()
-    set_zero_subnormals(true)
-    try
-        f === nothing && throw(ArgumentError("provide a density f or a batch density f_batch"))
-        return _bdmk_periodic(f, _cell_matrix(cell), Float64(eps), norder, Float64(rc_factor), nhalo, skip_negligible,
-                              interpolate, timings)
-    finally
-        set_zero_subnormals(old_ftz)
-    end
+function bdmk_periodic(f, cell; f_batch = nothing, timings::Union{Nothing,Vector{Float64}} = nothing, kwargs...)
+    tm = timings === nothing ? zeros(10) : timings
+    fill!(tm, 0.0)
+    t0 = time_ns()
+    plan = periodic_plan(f, cell; f_batch, kwargs...)
+    tb = (time_ns() - t0) / 1e9
+    res = periodic_solve!(plan, f; f_batch, timings = tm)
+    tm[1] = plan.tforest; tm[2] += tb - plan.tforest
+    return res
 end
 
 _cell_matrix(L::Real) = Matrix(Float64(L) * I, 3, 3)
 _cell_matrix(L::Tuple) = Matrix(Diagonal(collect(Float64.(L))))
 _cell_matrix(A::AbstractMatrix) = Matrix{Float64}(A)
 
-function _bdmk_periodic(f, A::Matrix{Float64}, eps::Float64, n::Int, rc_factor::Float64, nhalo::Int,
-                        skip_negligible::Bool, interpolate::Bool, timings)
-    tm = timings === nothing ? zeros(10) : timings
-    fill!(tm, 0.0)
+"""
+    PeriodicPlan
+
+Forest and precomputation of [`bdmk_periodic`](@ref) for repeated solves on a
+fixed forest (e.g. time stepping): `plan = periodic_plan(f, cell; kwargs...)`,
+then `periodic_solve!(plan, f)` for each new density (the first solve uses the
+samples taken by the plan). The result of a solve shares the plan's buffers
+(`pot`, `fvals`), which the next solve overwrites. The forest is adapted to
+the density given to `periodic_plan`; later densities must be resolved by it.
+"""
+mutable struct PeriodicPlan
+    g::PeriodicGrid
+    ft::FlatTree
+    n::Int
+    eps::Float64
+    istarget::BitVector
+    core::BitVector
+    copysrc::Vector{Int}          # tiled cells: box whose samples a box copies (0: sampled)
+    s::DMKSetup
+    wplan::WidePlan
+    wn::Vector{Float64}
+    dn::Vector{Float64}
+    taylor::NTuple{3,Float64}
+    skip::Bool
+    fvals::Array{Float64,4}
+    pot::Array{Float64,4}
+    fresh::Bool                   # fvals hold the samples of the plan's density
+    tforest::Float64
+    targets::Union{Nothing,Matrix{Float64}}
+end
+
+"""
+    periodic_plan(f, cell; eps=1e-6, norder=16, rc_factor=0.25, nhalo=1, f_batch=nothing,
+                  skip_negligible=true, interpolate=true, targets=nothing) -> PeriodicPlan
+
+With `targets` (3 × N points), only the leaves holding a target are computed
+and solves return the potential at the targets (`target_pot`).
+"""
+function periodic_plan(f, cell; eps::Real = 1e-6, norder::Int = 16, rc_factor::Real = 0.25, nhalo::Int = 1,
+                       f_batch = nothing, skip_negligible::Bool = true, interpolate::Bool = true,
+                       targets::Union{Nothing,AbstractMatrix} = nothing)
+    f_batch === nothing || (f = _BatchDensity(f_batch))
+    f === nothing && throw(ArgumentError("provide a density f or a batch density f_batch"))
+    old_ftz = get_zero_subnormals()
+    set_zero_subnormals(true)
+    try
+        return _periodic_plan(f, _cell_matrix(cell), Float64(eps), norder, Float64(rc_factor), nhalo,
+                              skip_negligible, interpolate, targets === nothing ? nothing : Matrix{Float64}(targets))
+    finally
+        set_zero_subnormals(old_ftz)
+    end
+end
+
+function _periodic_plan(f, A::Matrix{Float64}, eps::Float64, n::Int, rc_factor::Float64, nhalo::Int,
+                        skip::Bool, interpolate::Bool, targets)
     nhalo >= 1 || throw(ArgumentError("nhalo must be ≥ 1"))
     0 < rc_factor < 0.95 || throw(ArgumentError("need 0 < rc_factor < 0.95"))
     size(A) == (3, 3) && abs(det(A)) > 0 || throw(ArgumentError("degenerate cell"))
@@ -113,10 +164,9 @@ function _bdmk_periodic(f, A::Matrix{Float64}, eps::Float64, n::Int, rc_factor::
     g = PeriodicGrid(A, rc, nhalo)
 
     t0 = time_ns()
-    ft, fvals, istarget = build_periodic_forest(f, g; norder = n, eps = eps, min_levels = 1, interpolate)
-    tm[1] = (time_ns() - t0) / 1e9
+    ft, fvals, istarget, core = build_periodic_forest(f, g; norder = n, eps = eps, min_levels = 1, interpolate)
+    tforest = (time_ns() - t0) / 1e9
 
-    t0 = time_ns()
     r0, ws, ts = useries_sog(round(Int, -log10(eps)), rc)
     dmin > 2r0 || throw(ArgumentError("cell too small for the SOG"))
     iswide = [sqrt(t * log(1 / eps)) > rc for t in ts]
@@ -125,32 +175,168 @@ function _bdmk_periodic(f, A::Matrix{Float64}, eps::Float64, n::Int, rc_factor::
     dn, wn = ts[narrow], ws[narrow]
     tsw, wsw = ts[iswide], ws[iswide]
     taylor = taylor_coefficients(LaplaceKernel(), r0, wn, dn)
-    issource = skip_negligible ? _source_boxes(ft, fvals, eps, sum(wn .* (pi .* dn) .^ 1.5)) : trues(ft.nboxes)
-    s = DMKSetup(ft, LegendreBasis(), n, 1, eps, 1, r0, wn, dn, taylor; asym_safety = 1e-4, istarget, issource)
+    if targets !== nothing                 # the leaves holding a target, and their ancestors
+        size(targets, 1) == 3 || throw(ArgumentError("targets must be 3 × N"))
+        istarget = falses(ft.nboxes)
+        for j in axes(targets, 2)
+            b = _locate_leaf(ft, g, _wrap_into_cell(g, view(targets, :, j)))
+            while b > 0 && !istarget[b]
+                istarget[b] = true
+                b = ft.parent[b]
+            end
+        end
+    end
+    s = DMKSetup(ft, LegendreBasis(), n, 1, eps, 1, r0, wn, dn, taylor; asym_safety = 1e-4, istarget)
     wplan = WidePlan(g, eps, wide_orders(eps, s.porder, n, rc)..., tsw, wsw)
+    copysrc = g.tiled ? _copy_sources(ft, g) : zeros(Int, ft.nboxes)
+    pot = Array{Float64}(undef, n, n, n, ft.nboxes)
+    return PeriodicPlan(g, ft, n, eps, istarget, core, copysrc, s, wplan, wn, dn, Tuple(taylor), skip,
+                        fvals, pot, true, tforest, targets)
+end
+
+# Tiled cells: for each box below a halo root, the box at the same place
+# below its image root (0 if none, then the box samples the density).
+function _copy_sources(ft::FlatTree, g::PeriodicGrid)
+    nb = ft.nboxes
+    root = zeros(Int, nb)
+    for b in 1:nb
+        root[b] = ft.parent[b] == 0 ? b : root[ft.parent[b]]
+    end
+    key(b, c) = (ft.level[b], ntuple(d -> round(Int, (c[d] - g.xelo[d]) / ft.boxsize[ft.level[b] + 1] - 0.5), 3))
+    index = Dict(key(b, view(ft.centers, :, b)) => b for b in 1:nb if _image_root(g, root[b]) == root[b])
+    src = zeros(Int, nb)
+    for b in 1:nb
+        r = root[b]; ri = _image_root(g, r)
+        ri == r && continue
+        sh = ft.centers[:, ri] .- ft.centers[:, r]
+        src[b] = get(index, key(b, ft.centers[:, b] .+ sh), 0)
+    end
+    return src
+end
+
+"""
+    periodic_solve!(plan, f; f_batch=nothing, timings=nothing) -> PeriodicResult
+
+Solve on the plan's forest for the density `f` (resampled unless the plan's
+samples are fresh). `timings` as for [`bdmk_periodic`](@ref).
+"""
+function periodic_solve!(plan::PeriodicPlan, f; f_batch = nothing, timings::Union{Nothing,Vector{Float64}} = nothing)
+    f_batch === nothing || (f = _BatchDensity(f_batch))
+    f === nothing && throw(ArgumentError("provide a density f or a batch density f_batch"))
+    old_ftz = get_zero_subnormals()
+    set_zero_subnormals(true)
+    try
+        return _periodic_solve!(plan, f, timings === nothing ? zeros(10) : timings)
+    finally
+        set_zero_subnormals(old_ftz)
+    end
+end
+
+function _periodic_solve!(plan::PeriodicPlan, f, tm)
+    fill!(tm, 0.0)
+    g, ft, n, s, eps = plan.g, plan.ft, plan.n, plan.s, plan.eps
+    t0 = time_ns()
+    plan.fresh || _resample!(plan, f)
+    plan.fresh = false
+    fvals = plan.fvals
+    tm[1] = (time_ns() - t0) / 1e9
+
+    t0 = time_ns()
+    Sn = sum(plan.wn .* (pi .* plan.dn) .^ 1.5)
+    set_sources!(s, plan.skip ? _source_boxes(ft, fvals, eps, Sn) : trues(ft.nboxes))
     # Source moments of one period: from the level-0 cubes when they tile the
     # cell (after the upward pass), else from a tree in fractional coordinates
     # refined like the forest (threshold of its level-0 test).
     Msrc = nothing
     if !g.tiled
         w3 = _tensor_weights(n)
-        rint0 = sqrt(sum(b -> _box_l2sq(view(fvals, :, :, :, b), w3, rc^2 / 8), levelboxes(ft, 0)))
-        Msrc = fractional_moments(f, g, ft, n, wplan.pf, eps * rc^-1.5 * rint0)
+        rint0 = sqrt(sum(b -> _box_l2sq(view(fvals, :, :, :, b), w3, g.rc^2 / 8), levelboxes(ft, 0)))
+        Msrc = fractional_moments(f, g, ft, n, plan.wplan.pf, eps * g.rc^-1.5 * rint0)
     end
     tm[2] = (time_ns() - t0) / 1e9
     try
-        pot, fmean = _periodic_steps(s, g, fvals, wplan, Msrc, tm)
+        pot = plan.pot
+        fmean = _periodic_steps!(pot, s, g, fvals, plan.wplan, Msrc, tm)
         # neutralizing background: remove the k = 0 mode of the real-space parts
         # (narrow Gaussians and local correction); the wide part has none
-        dc = fmean * (sum(wn .* (pi .* dn) .^ 1.5) + taylor[1])
-        for ibox in 1:ft.nboxes
-            (ft.nchild[ibox] == 0 && istarget[ibox]) || continue
-            view(pot, :, :, :, ibox) .-= dc
+        dc = fmean * (Sn + plan.taylor[1])
+        parallel_foreach(collect(1:ft.nboxes), fill(nothing, _nthreads())) do ibox, _
+            (ft.nchild[ibox] == 0 && plan.istarget[ibox]) && (view(pot, :, :, :, ibox) .-= dc)
         end
-        return PeriodicResult(ft, g, fvals, pot, istarget, n)
+        res = PeriodicResult(ft, g, fvals, pot, plan.istarget, n, nothing)
+        plan.targets === nothing && return res
+        T = plan.targets
+        tp = zeros(size(T, 2))
+        parallel_foreach(collect(axes(T, 2)), fill(nothing, _nthreads())) do j, _
+            tp[j] = evaluate_periodic(res, view(T, :, j))
+        end
+        return PeriodicResult(ft, g, fvals, pot, plan.istarget, n, tp)
     finally
         release!(s.arena)
     end
+end
+
+# New density on the plan's forest: sample the boxes that sample, copy the
+# lattice images, interpolate the rest from the core leaves.
+function _resample!(plan::PeriodicPlan, f)
+    g, ft, n = plan.g, plan.ft, plan.n
+    x = ortho1d(LegendreBasis(), n).x
+    fvals = plan.fvals
+    sampled = [b for b in 1:ft.nboxes if plan.core[b] && plan.copysrc[b] == 0]
+    _sample_flat!(fvals, ft, g, f, sampled, x)
+    parallel_foreach([b for b in 1:ft.nboxes if plan.copysrc[b] > 0], fill(nothing, _nthreads())) do b, _
+        view(fvals, :, :, :, b) .= view(fvals, :, :, :, plan.copysrc[b])
+    end
+    others = [b for b in 1:ft.nboxes if !plan.core[b]]
+    isempty(others) && return plan
+    ar = Arena()
+    try
+        leaves = [b for b in 1:ft.nboxes if plan.core[b] && ft.nchild[b] == 0]
+        cf = _leaf_coefs(ar, n, [view(fvals, :, :, :, b) for b in leaves])
+        coefs = Dict(zip(leaves, cf))
+        locate = y -> _locate_leaf(ft, g, y)
+        geom = L -> (view(ft.centers, :, L), ft.boxsize[ft.level[L] + 1] / 2)
+        parallel_foreach(others, _interp_workspaces(n)) do b, w
+            _interp_values!(view(fvals, :, :, :, b), view(ft.centers, :, b), ft.boxsize[ft.level[b] + 1] / 2, x, g, n,
+                            locate, geom, L -> coefs[L], w)
+        end
+    finally
+        release!(ar)
+    end
+    return plan
+end
+
+# Density samples on the grids of boxes `bs` of a flat forest.
+function _sample_flat!(fvals, ft::FlatTree, g::PeriodicGrid, f, bs, x::Vector{Float64})
+    n = length(x); np = n^3
+    R = g.Q
+    if f isa _BatchDensity
+        parallel_foreach(bs, [zeros(3, np) for _ in 1:_nthreads()]) do b, pts
+            h = ft.boxsize[ft.level[b] + 1] / 2
+            i = 0
+            for iz in 1:n, iy in 1:n, ix in 1:n
+                i += 1
+                y1 = ft.centers[1, b] + h * x[ix]; y2 = ft.centers[2, b] + h * x[iy]; y3 = ft.centers[3, b] + h * x[iz]
+                for d in 1:3
+                    pts[d, i] = R[d, 1] * y1 + R[d, 2] * y2 + R[d, 3] * y3
+                end
+            end
+            f.f!(reshape(view(fvals, :, :, :, b), 1, np), pts)
+        end
+        return fvals
+    end
+    parallel_foreach(bs, [zeros(3) for _ in 1:_nthreads()]) do b, pt
+        h = ft.boxsize[ft.level[b] + 1] / 2
+        i = (b - 1) * np
+        for iz in 1:n, iy in 1:n, ix in 1:n
+            y1 = ft.centers[1, b] + h * x[ix]; y2 = ft.centers[2, b] + h * x[iy]; y3 = ft.centers[3, b] + h * x[iz]
+            @inbounds for d in 1:3
+                pt[d] = R[d, 1] * y1 + R[d, 2] * y2 + R[d, 3] * y3
+            end
+            @inbounds fvals[i += 1] = f(pt)
+        end
+    end
+    return fvals
 end
 
 # Boxes whose density can matter in the narrow (real-space) part. A leaf with
@@ -180,11 +366,11 @@ _tensor_weights(n::Int) = (w = ortho1d(LegendreBasis(), n).w; vec([w[i] * w[j] *
 _cell_mean(P::WidePlan, M::Array{Float64,3}) =
     sum(M[1 + P.pf * s1, 1 + P.pf * s2, 1 + P.pf * s3] for s1 in 0:(P.mt[1] - 1), s2 in 0:(P.mt[2] - 1), s3 in 0:(P.mt[3] - 1)) / prod(P.mt)
 
-function _periodic_steps(s::DMKSetup, g::PeriodicGrid, fvals::Array{Float64,4}, wplan::WidePlan, Msrc, tm)
+function _periodic_steps!(pot4, s::DMKSetup, g::PeriodicGrid, fvals::Array{Float64,4}, wplan::WidePlan, Msrc, tm)
     ft, n, p = s.ft, s.n, s.porder
     nb = ft.nboxes
     fv = reshape(fvals, n, n, n, 1, nb)
-    pot = pzeros(n, n, n, 1, nb)
+    pot = reshape(pfill!(pot4), n, n, n, 1, nb)
     gdum = alloc(s.arena, n, n, n, 1, 3, 0)
     hdum = alloc(s.arena, n, n, n, 1, 6, 0)
 
@@ -211,7 +397,7 @@ function _periodic_steps(s::DMKSetup, g::PeriodicGrid, fvals::Array{Float64,4}, 
     step7_local!(pot, gdum, hdum, s, fv)
     step9_proxy2pot!(pot, gdum, hdum, pp, nodeidx, s, tpw)
     tm[6] = (time_ns() - t0) / 1e9
-    return reshape(pot, n, n, n, nb), fmean
+    return fmean
 end
 
 # Central level-0 box (0-based central grid indices) of each level-0 box, or nothing.
@@ -265,6 +451,13 @@ function _wide_inject!(pot, pp, pc, nodeidx, s::DMKSetup, g::PeriodicGrid, fv, P
     return _cell_mean(P, M)
 end
 
+# Rotated-frame image in the cell of the point x (original frame).
+function _wrap_into_cell(g::PeriodicGrid, x::AbstractVector)
+    t = g.Uinv * (transpose(g.Q) * x)            # fractional coordinates
+    t .-= floor.(t)
+    return g.U * t
+end
+
 """
     evaluate_periodic(res::PeriodicResult, x::AbstractVector) -> Float64
 
@@ -273,10 +466,9 @@ leaf containing it.
 """
 function evaluate_periodic(res::PeriodicResult, x::AbstractVector)
     g, ft, n = res.grid, res.ft, res.norder
-    t = g.Uinv * (transpose(g.Q) * x)            # fractional coordinates
-    t .-= floor.(t)
-    y = g.U * t                                    # in-cell point, rotated frame
+    y = _wrap_into_cell(g, x)
     ibox = _locate_leaf(ft, g, y)
+    res.istarget[ibox] || throw(ArgumentError("the potential was not computed at $x (not a target)"))
     leg = ortho1d(LegendreBasis(), n)
     sc = 2.0 / ft.boxsize[ft.level[ibox] + 1]
     pv = zeros(n)
