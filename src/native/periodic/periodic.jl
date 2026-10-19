@@ -71,20 +71,25 @@ density with nonzero mean is taken with a uniform neutralizing background
 instead of `f`. The level-0 boxes have side `rc = d_min / ⌈1/rc_factor⌉`,
 `d_min` the smallest distance between lattice planes. With `skip_negligible`
 boxes whose density is too small to change the potential by `eps` relative
-are left out of the real-space part (see `_source_boxes`). `timings` (length ≥ 6)
+are left out of the real-space part (see `_source_boxes`). With `interpolate`
+(cells whose level-0 cubes do not tile the cell) only the boxes meeting the
+cell sample `f`, the others interpolate them at periodic images; `false` gives
+the forest of the C++ builder. `timings` (length ≥ 6)
 receives wall times (s): [1] forest, [2] setup and wide source, [3] local
 expansions + upward pass, [4] wide part, [5] plane waves, [6] near field, and
 if length ≥ 10 the plane-wave split [7] formation, [8] translation,
 [9] evaluation, [10] downward pass.
 """
 function bdmk_periodic(f, cell; eps::Real = 1e-6, norder::Int = 16, rc_factor::Real = 0.25, nhalo::Int = 1,
-                       f_batch = nothing, skip_negligible::Bool = true, timings::Union{Nothing,Vector{Float64}} = nothing)
+                       f_batch = nothing, skip_negligible::Bool = true, interpolate::Bool = true,
+                       timings::Union{Nothing,Vector{Float64}} = nothing)
     f_batch === nothing || (f = _BatchDensity(f_batch))
     old_ftz = get_zero_subnormals()
     set_zero_subnormals(true)
     try
         f === nothing && throw(ArgumentError("provide a density f or a batch density f_batch"))
-        return _bdmk_periodic(f, _cell_matrix(cell), Float64(eps), norder, Float64(rc_factor), nhalo, skip_negligible, timings)
+        return _bdmk_periodic(f, _cell_matrix(cell), Float64(eps), norder, Float64(rc_factor), nhalo, skip_negligible,
+                              interpolate, timings)
     finally
         set_zero_subnormals(old_ftz)
     end
@@ -95,7 +100,7 @@ _cell_matrix(L::Tuple) = Matrix(Diagonal(collect(Float64.(L))))
 _cell_matrix(A::AbstractMatrix) = Matrix{Float64}(A)
 
 function _bdmk_periodic(f, A::Matrix{Float64}, eps::Float64, n::Int, rc_factor::Float64, nhalo::Int,
-                        skip_negligible::Bool, timings)
+                        skip_negligible::Bool, interpolate::Bool, timings)
     tm = timings === nothing ? zeros(10) : timings
     fill!(tm, 0.0)
     nhalo >= 1 || throw(ArgumentError("nhalo must be ≥ 1"))
@@ -108,7 +113,7 @@ function _bdmk_periodic(f, A::Matrix{Float64}, eps::Float64, n::Int, rc_factor::
     g = PeriodicGrid(A, rc, nhalo)
 
     t0 = time_ns()
-    ft, fvals, istarget = build_periodic_forest(f, g; norder = n, eps = eps, min_levels = 1)
+    ft, fvals, istarget = build_periodic_forest(f, g; norder = n, eps = eps, min_levels = 1, interpolate)
     tm[1] = (time_ns() - t0) / 1e9
 
     t0 = time_ns()

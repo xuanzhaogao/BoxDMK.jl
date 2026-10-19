@@ -105,7 +105,12 @@ mutable struct _Forest
     boxsize::Vector{Float64}        # boxsize[ilev + 1]
     ar::Arena
     R::Matrix{Float64}              # the density is sampled at R * (box point)
+    core::Vector{Bool}              # sampled from the density (else interpolated from the core)
+    ci::Any                         # nothing, or the _CoreInterp of the non-core boxes
 end
+
+_Forest(n::Int, bs0::Float64, ar::Arena, R::Matrix{Float64}) =
+    _Forest(n, NTuple{3,Float64}[], Int[], Int[], NTuple{8,Int}[], Vector{Float64}[], [bs0], ar, R, Bool[], nothing)
 
 _nbox(F::_Forest) = length(F.level)
 _isleaf(F::_Forest, b::Int) = F.child[b][1] == 0
@@ -114,6 +119,7 @@ _fbox(F::_Forest, b::Int) = F.fvals[b]
 function _addbox!(F::_Forest, c::NTuple{3,Float64}, lev::Int, par::Int)
     push!(F.centers, c); push!(F.level, lev); push!(F.parent, par)
     push!(F.child, ntuple(_ -> 0, 8))
+    push!(F.core, par == 0 ? true : F.core[par])
     return _nbox(F)
 end
 
@@ -123,13 +129,24 @@ struct _BatchDensity{B}
     f!::B
 end
 
-# Sample the density on the grids of boxes `bs` (appended at the end).
+# Sample the density on the grids of boxes `bs` (appended at the end);
+# non-core boxes are interpolated from the core forest.
 function _sample!(F::_Forest, f, bs, x::Vector{Float64})
-    n = F.n; np = n^3
+    np = F.n^3
     length(F.fvals) < _nbox(F) && resize!(F.fvals, _nbox(F))
     for b in bs
         F.fvals[b] = alloc(F.ar, np)
     end
+    if F.ci === nothing || all(b -> F.core[b], bs)
+        return _sample_density!(F, f, bs, x)
+    end
+    _sample_density!(F, f, [b for b in bs if F.core[b]], x)     # core first: the others read it
+    return _interp_sample!(F, [b for b in bs if !F.core[b]], x)
+end
+
+function _sample_density!(F::_Forest, f, bs, x::Vector{Float64})
+    n = F.n; np = n^3
+    isempty(bs) && return F
     if f isa _BatchDensity
         parallel_foreach(bs, [zeros(3, np) for _ in 1:_nthreads()]) do b, pts
             c = F.centers[b]
@@ -357,18 +374,18 @@ in level order, `fvals` of size `(n, n, n, nboxes)` and `istarget` false on halo
 boxes.
 """
 function build_periodic_forest(f, g::PeriodicGrid; norder::Int = 16, eps::Float64 = 1e-6, min_levels::Int = 1,
-                               f_batch = nothing)
+                               f_batch = nothing, interpolate::Bool = true)
     f_batch === nothing || (f = _BatchDensity(f_batch))
     f === nothing && throw(ArgumentError("provide a density f or a batch density f_batch"))
-    F = _Forest(norder, NTuple{3,Float64}[], Int[], Int[], NTuple{8,Int}[], Vector{Float64}[], [g.rc], Arena(), g.Q)
+    F = _Forest(norder, g.rc, Arena(), g.Q)
     try
-        return _build_forest!(F, f, g, eps, min_levels)
+        return _build_forest!(F, f, g, eps, min_levels, interpolate)
     finally
         release!(F.ar)
     end
 end
 
-function _build_forest!(F::_Forest, f, g::PeriodicGrid, eps::Float64, min_levels::Int)
+function _build_forest!(F::_Forest, f, g::PeriodicGrid, eps::Float64, min_levels::Int, interpolate::Bool)
     n = F.n
     leg = ortho1d(LegendreBasis(), n)
     x = leg.x
@@ -379,38 +396,53 @@ function _build_forest!(F::_Forest, f, g::PeriodicGrid, eps::Float64, min_levels
     for k in 0:(m3 - 1), j in 0:(m2 - 1), i in 0:(m1 - 1)
         _addbox!(F, (g.xelo[1] + (i + 0.5) * rc, g.xelo[2] + (j + 0.5) * rc, g.xelo[3] + (k + 0.5) * rc), 0, 0)
     end
-    # When the central cubes tile the cell, each halo cube is a lattice
-    # translate of a central one: only the central forest is sampled and
-    # refined, and the halo subtrees are copied from their images. The norm
-    # estimate counts every central box once per image (as if the halo had been
-    # refined on its own, like the C++ builder).
+    # Only part of the forest samples the density:
+    # - when the central cubes tile the cell, each halo cube is a lattice
+    #   translate of a central one; only the central forest is sampled and
+    #   refined, and the halo subtrees are copied from their images;
+    # - otherwise (with `interpolate`) the core of boxes that meet the cell is
+    #   sampled and refined first; every other box takes its values from the
+    #   core leaves at the periodic images of its nodes, and refines by the
+    #   same test with the thresholds of the core levels.
+    # The norm estimate counts every sampled box once per box it stands for,
+    # as if the whole extended grid had been refined (like the C++ builder).
     nroot = _nbox(F)
     img = g.tiled ? [_image_root(g, b) for b in 1:nroot] : collect(1:nroot)
-    active = [b for b in 1:nroot if img[b] == b]
+    if !g.tiled && interpolate
+        for b in 1:nroot
+            F.core[b] = _meets_cell(g, F.centers[b], rc / 2)
+        end
+    end
+    active = [b for b in 1:nroot if img[b] == b && F.core[b]]
     mult = zeros(nroot)
     for b in 1:nroot
         mult[img[b]] += 1
     end
+    g.tiled || (mult[active] .= nroot / length(active))
     _sample!(F, f, active, x)
 
     # Adaptive refinement, level by level, against the forest-wide L2 norm
     # estimate rint (the per-box scales follow the C++/Fortran builder).
     rintbs = zeros(nroot)
-    wbox = copy(mult)                      # images per box (inherited by children)
+    wbox = copy(mult)                      # boxes stood for (inherited by children)
     for b in active
         rintbs[b] = _box_l2sq(_fbox(F, b), w3, rc^2 / 8)
     end
     rint = sqrt(sum(wbox .* rintbs))
     level_boxes = active
     wss = [(zeros(n, n, n), zeros(n, n, n)) for _ in 1:_nthreads()]
+    thr = Float64[]                        # refinement threshold per level
+    function refine_level(boxes, t)
+        errs = zeros(length(boxes))
+        parallel_foreach(collect(eachindex(boxes)), wss) do i, (w1, w2)
+            errs[i] = _tail_error(_fbox(F, boxes[i]), leg.U, tail, w1, w2)
+        end
+        return [boxes[i] for i in eachindex(boxes) if errs[i] > t]
+    end
     nlevels = 0
     while true
-        rsc = sqrt(1 / rc^3) * rint
-        errs = zeros(length(level_boxes))
-        parallel_foreach(collect(eachindex(level_boxes)), wss) do i, (w1, w2)
-            errs[i] = _tail_error(_fbox(F, level_boxes[i]), leg.U, tail, w1, w2)
-        end
-        flag = [level_boxes[i] for i in eachindex(level_boxes) if errs[i] > eps * rsc]
+        push!(thr, eps * sqrt(1 / rc^3) * rint)
+        flag = refine_level(level_boxes, thr[end])
         isempty(flag) && break
         new = _refine!(F, f, flag, x)
         nlevels += 1
@@ -426,6 +458,19 @@ function _build_forest!(F::_Forest, f, g::PeriodicGrid, eps::Float64, min_levels
         rint = sqrt(rintsq)
         level_boxes = new
     end
+    if !g.tiled && interpolate
+        F.ci = _CoreInterp(g, leg)
+        level_boxes = [b for b in 1:nroot if !F.core[b]]
+        _sample!(F, f, level_boxes, x)
+        L = 0
+        while !isempty(level_boxes)
+            flag = refine_level(level_boxes, 2 * thr[min(L + 1, end)])   # slack: the data are piecewise (core leaves)
+            isempty(flag) && break
+            level_boxes = _refine!(F, f, flag, x)
+            L += 1
+        end
+        nlevels = maximum(F.level)
+    end
     # The narrow cascade needs a plane-wave level: refine one interior box.
     while nlevels < min_levels
         b = findfirst(b -> _isleaf(F, b) && !_inhalo(g, F.centers[b]), 1:_nbox(F))
@@ -436,6 +481,101 @@ function _build_forest!(F::_Forest, f, g::PeriodicGrid, eps::Float64, min_levels
     g.tiled && _copy_images!(F, img)
     maximum(F.level) >= 2 && _balance!(F, g, f, x; img = g.tiled ? img : nothing)
     return _flatten_forest(F, g)
+end
+
+# Interpolation of the non-core boxes from the core leaves: their Legendre
+# coefficients (computed on demand) and, per box, the nodes grouped by the
+# core leaf holding their periodic image; on each leaf the nodes are a subset
+# of a tensor grid, evaluated by three small products.
+mutable struct _CoreInterp
+    g::PeriodicGrid
+    leg::Ortho1D
+    coef::Dict{Int,Vector{Float64}}
+end
+_CoreInterp(g::PeriodicGrid, leg::Ortho1D) = _CoreInterp(g, leg, Dict{Int,Vector{Float64}}())
+
+function _core_leaf(F::_Forest, g::PeriodicGrid, y)
+    b = 1 + _gridcell(g, y[1], 1) + g.mle[1] * (_gridcell(g, y[2], 2) + g.mle[2] * _gridcell(g, y[3], 3))
+    while !_isleaf(F, b)
+        c = F.centers[b]
+        b = F.child[b][1 + (y[1] > c[1]) + 2 * (y[2] > c[2]) + 4 * (y[3] > c[3])]
+    end
+    return b
+end
+
+function _interp_sample!(F::_Forest, bs::Vector{Int}, x::Vector{Float64})
+    ci = F.ci::_CoreInterp
+    g = ci.g; n = F.n; U = ci.leg.U
+    # coefficients of the core leaves not seen yet
+    need = [b for b in 1:_nbox(F) if F.core[b] && _isleaf(F, b) && !haskey(ci.coef, b)]
+    newc = [alloc(F.ar, n^3) for _ in need]
+    parallel_foreach(collect(eachindex(need)), [(zeros(n^3), zeros(n^3)) for _ in 1:_nthreads()]) do i, (w1, w2)
+        tp3!(newc[i], F.fvals[need[i]], U, Matrix(transpose(U)), Matrix(transpose(U)), w1, w2, 1.0, false)
+    end
+    for (i, b) in enumerate(need)
+        ci.coef[b] = newc[i]
+    end
+    Ut = Matrix(transpose(U))
+    wks = [(leafof = zeros(Int, n^3), shift = zeros(3, n^3), w1 = zeros(n^3), w2 = zeros(n^3), out = zeros(n^3),
+            P = (zeros(n, n), zeros(n, n), zeros(n, n)), pv = zeros(n)) for _ in 1:_nthreads()]
+    parallel_foreach(bs, wks) do b, w
+        c = F.centers[b]
+        h = F.boxsize[F.level[b] + 1] / 2
+        v = F.fvals[b]
+        q = 0
+        y = zeros(3); t = zeros(3)
+        for iz in 1:n, iy in 1:n, ix in 1:n
+            q += 1
+            p = (c[1] + h * x[ix], c[2] + h * x[iy], c[3] + h * x[iz])
+            for d in 1:3
+                t[d] = g.Uinv[d, 1] * p[1] + g.Uinv[d, 2] * p[2] + g.Uinv[d, 3] * p[3]
+                t[d] = clamp(t[d] - floor(t[d]), 1e-12, 1 - 1e-12) - t[d]     # wrapped - unwrapped
+            end
+            for d in 1:3                                                       # image shift (rotated frame)
+                w.shift[d, q] = g.U[d, 1] * t[1] + g.U[d, 2] * t[2] + g.U[d, 3] * t[3]
+                y[d] = p[d] + w.shift[d, q]
+            end
+            w.leafof[q] = _core_leaf(F, g, y)
+        end
+        done = falses(n^3)
+        for q0 in 1:(n^3)
+            done[q0] && continue
+            L = w.leafof[q0]
+            cl = F.centers[L]; hl = F.boxsize[F.level[L] + 1] / 2
+            # index sets of this leaf's nodes along each axis
+            I = falses(n); J = falses(n); K = falses(n)
+            for q in q0:(n^3)
+                (done[q] || w.leafof[q] != L) && continue
+                i = (q - 1) % n + 1; j = ((q - 1) ÷ n) % n + 1; k = (q - 1) ÷ (n * n) + 1
+                I[i] = J[j] = K[k] = true
+            end
+            idx = (findall(I), findall(J), findall(K))
+            for d in 1:3
+                for (r, i) in enumerate(idx[d])
+                    ξ = (c[d] + h * x[i] + w.shift[d, q0] - cl[d]) / hl
+                    legepols!(w.pv, ξ, n)
+                    for a in 1:n
+                        w.P[d][a, r] = w.pv[a]
+                    end
+                end
+            end
+            ni, nj, nk = length.(idx)
+            A = Matrix(transpose(view(w.P[1], :, 1:ni)))
+            tp3!(view(w.out, 1:ni * nj * nk), ci.coef[L], A, view(w.P[2], :, 1:nj), view(w.P[3], :, 1:nk),
+                 w.w1, w.w2, 1.0, false)
+            pos = (zeros(Int, n), zeros(Int, n), zeros(Int, n))
+            for d in 1:3, (r, i) in enumerate(idx[d])
+                pos[d][i] = r
+            end
+            for q in q0:(n^3)
+                (done[q] || w.leafof[q] != L) && continue
+                i = (q - 1) % n + 1; j = ((q - 1) ÷ n) % n + 1; k = (q - 1) ÷ (n * n) + 1
+                v[q] = w.out[pos[1][i] + ni * ((pos[2][j] - 1) + nj * (pos[3][k] - 1))]
+                done[q] = true
+            end
+        end
+    end
+    return F
 end
 
 # Central level-0 box whose lattice translate the level-0 box b is (tiled cells).
@@ -505,7 +645,7 @@ function _flatten_forest(F::_Forest, g::PeriodicGrid)
     # colleagues on the renumbered forest
     G = _Forest(F.n, [Tuple(centers[:, i]) for i in 1:nb], level, parent,
                 [nchild[i] == 0 ? ntuple(_ -> 0, 8) : Tuple(child[:, i]) for i in 1:nb],
-                Vector{Float64}[], F.boxsize, F.ar, F.R)
+                Vector{Float64}[], F.boxsize, F.ar, F.R, F.core[order], nothing)
     ncoll, coll = _colleagues(G, g, [collect(laddr[1, l]:laddr[2, l]) for l in 1:nl + 1])
     ft = FlatTree(nb, nl, collect(1:nb), laddr, level, parent, nchild, child, ncoll, coll, centers,
                   F.boxsize[1:nl + 1])

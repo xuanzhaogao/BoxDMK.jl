@@ -34,7 +34,7 @@ function fractional_moments(f, g::PeriodicGrid, ft::FlatTree, n::Int, pf::Int, t
     mt = source_cells(g)
     R = g.Q * g.U * Diagonal(1 ./ collect(mt))         # u -> original frame
     Ur = g.U * Diagonal(1 ./ collect(mt))               # u -> rotated frame
-    F = _Forest(n, NTuple{3,Float64}[], Int[], Int[], NTuple{8,Int}[], Vector{Float64}[], [1.0], Arena(), R)
+    F = _Forest(n, 1.0, Arena(), R)
     try
         return _fractional_moments!(F, f, g, ft, Ur, mt, pf, thr)
     finally
