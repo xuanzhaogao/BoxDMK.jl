@@ -19,6 +19,8 @@ struct LocTab1D
     tabZ::NTuple{3,Array{Float64,3}}
     tabZT::NTuple{3,Array{Float64,3}}
     krange::Matrix{Int}
+    tab32::Array{Float32,3}     # Float32 copies for the single-precision dense path
+    tabT32::Array{Float32,3}
 end
 
 const _SQRTPIH = 0.886226925452757940959713778283913
@@ -308,5 +310,5 @@ function mk_loctab_all(eps::Float64, basis::AbstractBasis, n::Int, delta::Float6
         krange[:, slot] .= (klo, khi, jlo, jhi)
     end
     tabZT = map(Z -> permutedims(Z, (2, 1, 3)), tabZ)
-    return LocTab1D(tab, tabT, tabx, tabxx, ind, tabZ, tabZT, krange)
+    return LocTab1D(tab, tabT, tabx, tabxx, ind, tabZ, tabZT, krange, Float32.(tab), Float32.(tabT))
 end

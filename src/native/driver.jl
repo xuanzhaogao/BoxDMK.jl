@@ -43,6 +43,7 @@ struct DMKSetup
     pwlevels::Vector{Union{Nothing,PWLevel}}            # [ilev+1]
     taylor::NTuple{3,Float64}
     istarget::BitVector         # boxes whose potential is wanted (halo boxes are source-only)
+    near32::Bool                # dense same-level near field in single precision
     issource::BitVector         # boxes whose density matters (outgoing expansions, near field)
     need_mp::BitVector          # boxes whose outgoing expansion some target reads
     arena::Arena                # large buffers of this solve
@@ -70,7 +71,7 @@ end
 function DMKSetup(ft::FlatTree, basis::AbstractBasis, n::Int, nd::Int, eps::Float64, ifpgh::Int,
                   r0::Float64, wdeltas::Vector{Float64}, deltas::Vector{Float64}, taylor;
                   asym_safety::Float64 = 1.0, istarget::BitVector = trues(ft.nboxes),
-                  issource::BitVector = trues(ft.nboxes))
+                  issource::BitVector = trues(ft.nboxes), near32::Bool = false)
     nl = ft.nlevels
     bs0 = ft.boxsize[1]
     nde = length(deltas)
@@ -155,7 +156,7 @@ function DMKSetup(ft::FlatTree, basis::AbstractBasis, n::Int, nd::Int, eps::Floa
                     c2p, map(m -> Matrix(transpose(m)), c2p),
                     map(m -> m * den2pc, c2p), map(m -> Matrix(transpose(m * den2pc)), c2p),
                     map(m -> poteval * m, p2c), map(m -> Matrix(transpose(poteval * m)), p2c), prox,
-                    loctabs, pwlevels, Tuple(taylor), istarget, issource, need_mp, Arena())
+                    loctabs, pwlevels, Tuple(taylor), istarget, near32 && nd == 1 && ifpgh == 1, issource, need_mp, Arena())
 end
 
 # Boxes whose outgoing expansion some target reads: sources among the
@@ -459,10 +460,12 @@ end
 
 function step7_local!(pot, grad, hess, s::DMKSetup, fv)
     ft, n = s.ft, s.n
-    wss = make_workspaces(() -> (LocalWork(n, s.arena), alloc(s.arena, n^3), alloc(s.arena, n^3), zeros(Int, 27), Int[]))
+    wss = make_workspaces(() -> (LocalWork(n, s.arena), alloc(s.arena, n^3), alloc(s.arena, n^3), zeros(Int, 27), Int[],
+                                 zeros(Float32, n^3), zeros(Float32, n^3), zeros(Float32, n^3)))
+    fv32 = s.near32 && s.ifpgh == 1 ? _float32_copy(fv) : Float32[]
     parallel_foreach(targetleaves(s), wss) do ibox, ws
         if s.ifpgh == 1
-            _local_pot_box!(pot, s, fv, ibox, ws)
+            _local_pot_box!(pot, s, fv, fv32, ibox, ws)
         else
             _local_pgh_box!(pot, grad, hess, s, fv, ibox, ws[1])
         end
@@ -495,7 +498,19 @@ end
 # Potential-only near field of one leaf. Same-level dense interactions are
 # evaluated target-centrically: pot += w Σ_dz Tz(Σ_dy Ty(Σ_dx Tx f_s)), which
 # shares the y and z stages among the sources; everything else per pair.
-function _local_pot_box!(pot, s::DMKSetup, fv, ibox::Int, (lw, Abuf, Bbuf, stencil, others))
+function _float32_copy(a)
+    b = Vector{Float32}(undef, length(a))
+    nt = _nthreads()
+    parallel_foreach(collect(1:nt), fill(nothing, nt)) do t, _
+        r = (1 + div((t - 1) * length(a), nt)):div(t * length(a), nt)
+        @inbounds for i in r
+            b[i] = a[i]
+        end
+    end
+    return b
+end
+
+function _local_pot_box!(pot, s::DMKSetup, fv, fv32, ibox::Int, (lw, Abuf, Bbuf, stencil, others, A32, B32, P32))
     ft, n, nd = s.ft, s.n, s.nd
     ilev = ft.level[ibox]
     iend = _ldelta(s, ilev)
@@ -517,13 +532,16 @@ function _local_pot_box!(pot, s::DMKSetup, fv, ibox::Int, (lw, Abuf, Bbuf, stenc
     end
     selfpw_end = s.ifpwexp[ibox] ? ipwstart(s, ilev + 1) : 0
     nn = n * n
+    f32 = s.near32
+    f32 && fill!(P32, 0.0f0)
     for id in ipwstart(s, ilev):iend
         T = tabsl[id]::LocTab1D
         wd = s.wdeltas[id]
         for ind in 1:nd
             potb = view(pot, :, :, :, ind, ibox)
-            GC.@preserve potb fv T Abuf Bbuf begin
+            GC.@preserve potb fv fv32 T Abuf Bbuf A32 B32 P32 begin
                 pA = pointer(Abuf); pB = pointer(Bbuf)
+                qA = pointer(A32); qB = pointer(B32)
                 for kz in 1:3
                     # slot of the table: source at -d relative offset -> slot 7 - 4d
                     sz = NLOCTAB + 1 - 4 * (kz - 2)
@@ -543,22 +561,43 @@ function _local_pot_box!(pot, s::DMKSetup, fv, ibox::Int, (lw, Abuf, Bbuf, stenc
                                 continue
                             end
                             # stage x: A += Tx' f
-                            gemm!(pA, n, pointer(T.tabT, (sx - 1) * nn + 1), n,
-                                  pointer(fv, 1 + nn * n * ((ind - 1) + nd * (jbox - 1))), n,
-                                  n, nn, n, 1.0, haveA)
+                            if f32
+                                gemm!(qA, n, pointer(T.tabT32, (sx - 1) * nn + 1), n,
+                                      pointer(fv32, 1 + nn * n * ((ind - 1) + nd * (jbox - 1))), n,
+                                      n, nn, n, 1.0, haveA)
+                            else
+                                gemm!(pA, n, pointer(T.tabT, (sx - 1) * nn + 1), n,
+                                      pointer(fv, 1 + nn * n * ((ind - 1) + nd * (jbox - 1))), n,
+                                      n, nn, n, 1.0, haveA)
+                            end
                             haveA = true
                         end
                         haveA || continue
                         # stage y: B[:, :, k] += A[:, :, k] * Ty
-                        gemm_batch!(pB, n, nn, pA, n, nn, pointer(T.tab, (sy - 1) * nn + 1), n,
-                                    n, n, n, n, 1.0, haveB)
+                        if f32
+                            gemm_batch!(qB, n, nn, qA, n, nn, pointer(T.tab32, (sy - 1) * nn + 1), n,
+                                        n, n, n, n, 1.0, haveB)
+                        else
+                            gemm_batch!(pB, n, nn, pA, n, nn, pointer(T.tab, (sy - 1) * nn + 1), n,
+                                        n, n, n, n, 1.0, haveB)
+                        end
                         haveB = true
                     end
                     haveB || continue
                     # stage z: pot += w B * Tz
-                    gemm!(pointer(potb), nn, pB, nn, pointer(T.tab, (sz - 1) * nn + 1), n, nn, n, n, wd, true)
+                    if f32
+                        gemm!(pointer(P32), nn, qB, nn, pointer(T.tab32, (sz - 1) * nn + 1), n, nn, n, n, wd, true)
+                    else
+                        gemm!(pointer(potb), nn, pB, nn, pointer(T.tab, (sz - 1) * nn + 1), n, nn, n, n, wd, true)
+                    end
                 end
             end
+        end
+    end
+    if f32                          # single-precision part, accumulated per box
+        potb = view(pot, :, :, :, 1, ibox)
+        @inbounds for i in 1:(n^3)
+            potb[i] += P32[i]
         end
     end
     # Coarser/finer neighbours and Gaussians not handled above, pair by pair.

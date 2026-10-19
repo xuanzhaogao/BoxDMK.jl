@@ -132,28 +132,30 @@ end
 
 """
     periodic_plan(f, cell; eps=1e-6, norder=16, rc_factor=0.25, nhalo=1, f_batch=nothing,
-                  skip_negligible=true, interpolate=true, targets=nothing) -> PeriodicPlan
+                  skip_negligible=true, interpolate=true, targets=nothing, near32=nothing) -> PeriodicPlan
 
 With `targets` (3 × N points), only the leaves holding a target are computed
-and solves return the potential at the targets (`target_pot`).
+and solves return the potential at the targets (`target_pot`). `near32`
+runs the dense same-level near field in single precision (default: when
+eps ≥ 1e-6).
 """
 function periodic_plan(f, cell; eps::Real = 1e-6, norder::Int = 16, rc_factor::Real = 0.25, nhalo::Int = 1,
                        f_batch = nothing, skip_negligible::Bool = true, interpolate::Bool = true,
-                       targets::Union{Nothing,AbstractMatrix} = nothing)
+                       targets::Union{Nothing,AbstractMatrix} = nothing, near32::Union{Nothing,Bool} = nothing)
     f_batch === nothing || (f = _BatchDensity(f_batch))
     f === nothing && throw(ArgumentError("provide a density f or a batch density f_batch"))
     old_ftz = get_zero_subnormals()
     set_zero_subnormals(true)
     try
         return _periodic_plan(f, _cell_matrix(cell), Float64(eps), norder, Float64(rc_factor), nhalo,
-                              skip_negligible, interpolate, targets === nothing ? nothing : Matrix{Float64}(targets))
+                              skip_negligible, interpolate, targets === nothing ? nothing : Matrix{Float64}(targets), near32)
     finally
         set_zero_subnormals(old_ftz)
     end
 end
 
 function _periodic_plan(f, A::Matrix{Float64}, eps::Float64, n::Int, rc_factor::Float64, nhalo::Int,
-                        skip::Bool, interpolate::Bool, targets)
+                        skip::Bool, interpolate::Bool, targets, near32)
     nhalo >= 1 || throw(ArgumentError("nhalo must be ≥ 1"))
     0 < rc_factor < 0.95 || throw(ArgumentError("need 0 < rc_factor < 0.95"))
     size(A) == (3, 3) && abs(det(A)) > 0 || throw(ArgumentError("degenerate cell"))
@@ -186,7 +188,9 @@ function _periodic_plan(f, A::Matrix{Float64}, eps::Float64, n::Int, rc_factor::
             end
         end
     end
-    s = DMKSetup(ft, LegendreBasis(), n, 1, eps, 1, r0, wn, dn, taylor; asym_safety = 1e-4, istarget)
+    # dense same-level near field in single precision at eps ≥ 1e-6 (as the C++ code)
+    s = DMKSetup(ft, LegendreBasis(), n, 1, eps, 1, r0, wn, dn, taylor; asym_safety = 1e-4, istarget,
+                 near32 = near32 === nothing ? eps >= 0.99e-6 : near32)
     wplan = WidePlan(g, eps, wide_orders(eps, s.porder, n, rc)..., tsw, wsw)
     copysrc = g.tiled ? _copy_sources(ft, g) : zeros(Int, ft.nboxes)
     pot = Array{Float64}(undef, n, n, n, ft.nboxes)
