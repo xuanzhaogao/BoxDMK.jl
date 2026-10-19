@@ -204,31 +204,12 @@ end
 
 # Tail-coefficient refinement error of one box (C++ `bdmk_box_refine_error`
 # with eta = 0): sqrt(Σ_tail c²) / sqrt(#tail), c the Legendre coefficients.
-function _tail_error(fb, U::Matrix{Float64}, tail::BitArray{3}, w1::Array{Float64,3}, w2::Array{Float64,3})
-    n = size(U, 1)
-    v = reshape(fb, n, n, n)
-    @inbounds for k in 1:n, j in 1:n, i in 1:n          # x
-        s = 0.0
-        for m in 1:n
-            s += U[i, m] * v[m, j, k]
-        end
-        w1[i, j, k] = s
-    end
-    @inbounds for k in 1:n, j in 1:n, i in 1:n          # y
-        s = 0.0
-        for m in 1:n
-            s += U[j, m] * w1[i, m, k]
-        end
-        w2[i, j, k] = s
-    end
+function _tail_error(fb, U::Matrix{Float64}, Ut::Matrix{Float64}, tail::BitArray{3},
+                     c::Vector{Float64}, w1::Vector{Float64}, w2::Vector{Float64})
+    tp3!(c, fb, U, Ut, Ut, w1, w2, 1.0, false)
     acc = 0.0
-    @inbounds for k in 1:n, j in 1:n, i in 1:n          # z
-        tail[i, j, k] || continue
-        s = 0.0
-        for m in 1:n
-            s += U[k, m] * w2[i, j, m]
-        end
-        acc += s * s
+    @inbounds for i in eachindex(c)
+        tail[i] && (acc += c[i] * c[i])
     end
     return sqrt(acc / count(tail))
 end
@@ -431,12 +412,13 @@ function _build_forest!(F::_Forest, f, g::PeriodicGrid, eps::Float64, min_levels
     end
     rint = sqrt(sum(wbox .* rintbs))
     level_boxes = active
-    wss = [(zeros(n, n, n), zeros(n, n, n)) for _ in 1:_nthreads()]
+    wss = [(zeros(n^3), zeros(n^3), zeros(n^3)) for _ in 1:_nthreads()]
+    Ut = Matrix(transpose(leg.U))
     thr = Float64[]                        # refinement threshold per level
     function refine_level(boxes, t)
         errs = zeros(length(boxes))
-        parallel_foreach(collect(eachindex(boxes)), wss) do i, (w1, w2)
-            errs[i] = _tail_error(_fbox(F, boxes[i]), leg.U, tail, w1, w2)
+        parallel_foreach(collect(eachindex(boxes)), wss) do i, (c, w1, w2)
+            errs[i] = _tail_error(_fbox(F, boxes[i]), leg.U, Ut, tail, c, w1, w2)
         end
         return [boxes[i] for i in eachindex(boxes) if errs[i] > t]
     end
