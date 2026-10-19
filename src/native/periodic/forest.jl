@@ -246,13 +246,22 @@ function _colleagues(F::_Forest, g::PeriodicGrid, levorder::Vector{Vector{Int}})
             jb = coll[q, dad]
             _isleaf(F, jb) && continue
             for kb in F.child[jb]
-                ck = F.centers[kb]
-                (abs(ck[1] - c[1]) <= tol && abs(ck[2] - c[2]) <= tol && abs(ck[3] - c[3]) <= tol) &&
-                    (coll[ncoll[b] += 1, b] = kb)
+                _near(g, F.centers[kb], c, tol, false) && (coll[ncoll[b] += 1, b] = kb)
             end
         end
     end
     return ncoll, coll
+end
+
+# |a - b| ≤ tol per axis (minimum image along the cell sides if periodic;
+# tiled cells only).
+@inline function _near(g::PeriodicGrid, a, b, tol::Float64, periodic::Bool)
+    for d in 1:3
+        dx = a[d] - b[d]
+        periodic && (dx -= g.U[d, d] * round(dx / g.U[d, d]))
+        abs(dx) <= tol || return false
+    end
+    return true
 end
 
 function _levelorder(F::_Forest)
@@ -266,7 +275,7 @@ end
 
 # Forest-wide 2:1 balance (C++ `forest_balance_21`): refine every leaf that a
 # box two or more levels finer touches, until none does.
-function _balance!(F::_Forest, g::PeriodicGrid, f, x::Vector{Float64})
+function _balance!(F::_Forest, g::PeriodicGrid, f, x::Vector{Float64}; img = nothing)
     while true
         lv = _levelorder(F)
         ncoll, coll = _colleagues(F, g, lv)
@@ -282,8 +291,7 @@ function _balance!(F::_Forest, g::PeriodicGrid, f, x::Vector{Float64})
                 _isleaf(F, jb) && continue
                 for kb in F.child[jb]
                     _isleaf(F, kb) && continue
-                    ck = F.centers[kb]
-                    if abs(ck[1] - c[1]) <= dist && abs(ck[2] - c[2]) <= dist && abs(ck[3] - c[3]) <= dist
+                    if _near(g, F.centers[kb], c, dist, false)
                         viol = true
                         break
                     end
@@ -293,8 +301,49 @@ function _balance!(F::_Forest, g::PeriodicGrid, f, x::Vector{Float64})
             viol && push!(flag, b)
         end
         isempty(flag) && return F
-        _refine!(F, f, flag, x)
+        img === nothing ? _refine!(F, f, flag, x) : _refine_from_images!(F, g, img, f, flag, x)
     end
+end
+
+# Tiled cells: refine `flag`, copying children (and samples) from the
+# lattice image of a halo box when that image is already refined.
+function _refine_from_images!(F::_Forest, g::PeriodicGrid, img::Vector{Int}, f, flag::Vector{Int}, x::Vector{Float64})
+    nb = _nbox(F)
+    root = zeros(Int, nb)
+    for b in 1:nb
+        root[b] = F.parent[b] == 0 ? b : root[F.parent[b]]
+    end
+    # central boxes first, so that their halo images can copy them
+    _refine!(F, f, [b for b in flag if img[root[b]] == root[b]], x)
+    nb = _nbox(F)
+    resize!(root, nb)
+    for b in 1:nb
+        root[b] = F.parent[b] == 0 ? b : root[F.parent[b]]
+    end
+    key(b, c) = (F.level[b], ntuple(d -> round(Int, (c[d] - g.xelo[d]) / F.boxsize[F.level[b] + 1] - 0.5), 3))
+    index = Dict(key(b, F.centers[b]) => b for b in 1:nb if img[root[b]] == root[b])
+    sample = Int[]
+    for b in flag
+        img[root[b]] == root[b] && continue
+        r = root[b]
+        src = 0
+        if img[r] != r
+            sh = F.centers[img[r]] .- F.centers[r]
+            src = get(index, key(b, F.centers[b] .+ sh), 0)
+        end
+        if src == 0 || _isleaf(F, src)
+            push!(sample, b)
+            continue
+        end
+        sh = F.centers[b] .- F.centers[src]
+        F.child[b] = ntuple(slot -> _addbox!(F, F.centers[F.child[src][slot]] .+ sh, F.level[b] + 1, b), 8)
+        resize!(F.fvals, _nbox(F))
+        for slot in 1:8
+            F.fvals[F.child[b][slot]] = F.fvals[F.child[src][slot]]
+        end
+    end
+    _refine!(F, f, sample, x)
+    return F
 end
 
 """
@@ -330,13 +379,29 @@ function _build_forest!(F::_Forest, f, g::PeriodicGrid, eps::Float64, min_levels
     for k in 0:(m3 - 1), j in 0:(m2 - 1), i in 0:(m1 - 1)
         _addbox!(F, (g.xelo[1] + (i + 0.5) * rc, g.xelo[2] + (j + 0.5) * rc, g.xelo[3] + (k + 0.5) * rc), 0, 0)
     end
-    _sample!(F, f, 1:_nbox(F), x)
+    # When the central cubes tile the cell, each halo cube is a lattice
+    # translate of a central one: only the central forest is sampled and
+    # refined, and the halo subtrees are copied from their images. The norm
+    # estimate counts every central box once per image (as if the halo had been
+    # refined on its own, like the C++ builder).
+    nroot = _nbox(F)
+    img = g.tiled ? [_image_root(g, b) for b in 1:nroot] : collect(1:nroot)
+    active = [b for b in 1:nroot if img[b] == b]
+    mult = zeros(nroot)
+    for b in 1:nroot
+        mult[img[b]] += 1
+    end
+    _sample!(F, f, active, x)
 
     # Adaptive refinement, level by level, against the forest-wide L2 norm
     # estimate rint (the per-box scales follow the C++/Fortran builder).
-    rintbs = [_box_l2sq(_fbox(F, b), w3, rc^2 / 8) for b in 1:_nbox(F)]
-    rint = sqrt(sum(rintbs))
-    level_boxes = collect(1:_nbox(F))
+    rintbs = zeros(nroot)
+    wbox = copy(mult)                      # images per box (inherited by children)
+    for b in active
+        rintbs[b] = _box_l2sq(_fbox(F, b), w3, rc^2 / 8)
+    end
+    rint = sqrt(sum(wbox .* rintbs))
+    level_boxes = active
     wss = [(zeros(n, n, n), zeros(n, n, n)) for _ in 1:_nthreads()]
     nlevels = 0
     while true
@@ -349,13 +414,14 @@ function _build_forest!(F::_Forest, f, g::PeriodicGrid, eps::Float64, min_levels
         isempty(flag) && break
         new = _refine!(F, f, flag, x)
         nlevels += 1
-        rintsq = rint^2 - sum(rintbs[b] for b in flag)
+        rintsq = rint^2 - sum(wbox[b] * rintbs[b] for b in flag)
         rintsq = max(rintsq, 0.0)
         rsc_child = F.boxsize[nlevels + 1]^3 / 8
-        resize!(rintbs, _nbox(F))
+        resize!(rintbs, _nbox(F)); resize!(wbox, _nbox(F))
         for b in new
+            wbox[b] = wbox[F.parent[b]]
             rintbs[b] = _box_l2sq(_fbox(F, b), w3, rsc_child)
-            rintsq += rintbs[b]
+            rintsq += wbox[b] * rintbs[b]
         end
         rint = sqrt(rintsq)
         level_boxes = new
@@ -367,8 +433,39 @@ function _build_forest!(F::_Forest, f, g::PeriodicGrid, eps::Float64, min_levels
         _refine!(F, f, [b], x)
         nlevels = maximum(F.level)
     end
-    nlevels >= 2 && _balance!(F, g, f, x)
+    g.tiled && _copy_images!(F, img)
+    maximum(F.level) >= 2 && _balance!(F, g, f, x; img = g.tiled ? img : nothing)
     return _flatten_forest(F, g)
+end
+
+# Central level-0 box whose lattice translate the level-0 box b is (tiled cells).
+function _image_root(g::PeriodicGrid, b::Int)
+    m1, m2 = g.mle[1], g.mle[2]
+    e = ((b - 1) % m1, ((b - 1) ÷ m1) % m2, (b - 1) ÷ (m1 * m2))
+    c = ntuple(d -> mod(e[d] - g.nhalo, g.mgrid[d]) + g.nhalo, 3)
+    return 1 + c[1] + m1 * (c[2] + m2 * c[3])
+end
+
+# Give every halo root the subtree (and samples, shared) of its image.
+function _copy_images!(F::_Forest, img::Vector{Int})
+    function copysub!(src, dst)
+        F.fvals[dst] = F.fvals[src]
+        _isleaf(F, src) && return
+        sh = F.centers[dst] .- F.centers[src]
+        F.child[dst] = ntuple(8) do slot
+            c = F.child[src][slot]
+            _addbox!(F, F.centers[c] .+ sh, F.level[c], dst)
+        end
+        length(F.fvals) < _nbox(F) && resize!(F.fvals, _nbox(F))
+        for slot in 1:8
+            copysub!(F.child[src][slot], F.child[dst][slot])
+        end
+    end
+    length(F.fvals) < _nbox(F) && resize!(F.fvals, _nbox(F))
+    for b in eachindex(img)
+        img[b] == b || copysub!(img[b], b)
+    end
+    return F
 end
 
 # Renumber in level order (level 0 in grid order, then children in parent
