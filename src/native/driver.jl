@@ -43,6 +43,7 @@ struct DMKSetup
     pwlevels::Vector{Union{Nothing,PWLevel}}            # [ilev+1]
     taylor::NTuple{3,Float64}
     istarget::BitVector         # boxes whose potential is wanted (halo boxes are source-only)
+    issource::BitVector         # boxes whose density matters (outgoing expansions, near field)
     need_mp::BitVector          # boxes whose outgoing expansion some target reads
     arena::Arena                # large buffers of this solve
 end
@@ -63,10 +64,13 @@ end
 # Setup on a flat tree (or forest) for the SOG Σ wdeltas exp(-r²/deltas) with
 # local correction `taylor`. `asym_safety` tightens the asymptotic-expansion
 # criterion (4δ/bs²)³ <= eps * asym_safety; `istarget` marks the boxes whose
-# potential is wanted (the others only act as sources).
+# potential is wanted (the others only act as sources); `issource` the boxes
+# whose density is used in the far (plane-wave) and near fields; a nonleaf box
+# should be a source if any leaf below it is. The upward pass covers all boxes.
 function DMKSetup(ft::FlatTree, basis::AbstractBasis, n::Int, nd::Int, eps::Float64, ifpgh::Int,
                   r0::Float64, wdeltas::Vector{Float64}, deltas::Vector{Float64}, taylor;
-                  asym_safety::Float64 = 1.0, istarget::BitVector = trues(ft.nboxes))
+                  asym_safety::Float64 = 1.0, istarget::BitVector = trues(ft.nboxes),
+                  issource::BitVector = trues(ft.nboxes))
     nl = ft.nlevels
     bs0 = ft.boxsize[1]
     nde = length(deltas)
@@ -95,9 +99,10 @@ function DMKSetup(ft::FlatTree, basis::AbstractBasis, n::Int, nd::Int, eps::Floa
     need_mp = falses(ft.nboxes)
     for ibox in 1:ft.nboxes
         (ifpwexp[ibox] && istarget[ibox]) || continue
-        need_mp[ibox] = true
+        need_mp[ibox] = issource[ibox]
         for j in 1:nlistpw[ibox]
-            need_mp[listpw[j, ibox]] = true
+            jbox = listpw[j, ibox]
+            issource[jbox] && (need_mp[jbox] = true)
         end
     end
 
@@ -158,7 +163,7 @@ function DMKSetup(ft::FlatTree, basis::AbstractBasis, n::Int, nd::Int, eps::Floa
                     c2p, map(m -> Matrix(transpose(m)), c2p),
                     map(m -> m * den2pc, c2p), map(m -> Matrix(transpose(m * den2pc)), c2p),
                     map(m -> poteval * m, p2c), map(m -> Matrix(transpose(poteval * m)), p2c), prox,
-                    loctabs, pwlevels, Tuple(taylor), istarget, need_mp, Arena())
+                    loctabs, pwlevels, Tuple(taylor), istarget, issource, need_mp, Arena())
 end
 
 leafboxes(ft::FlatTree) = [ibox for ibox in 1:ft.nboxes if ft.nchild[ibox] == 0]
@@ -338,7 +343,8 @@ function steps456_planewave!(pot, grad, hess, pp, pc, nodeidx, s::DMKSetup, fv, 
     # (all levels >= 0 share the same number of plane waves).
     npw = pw_terms(eps, 0)
     nexp = npw * npw * (npw ÷ 2)
-    maxboxes = maximum(ilev -> count(ibox -> s.need_mp[ibox], levelboxes(ft, ilev)), 0:ft.nlevels)
+    maxboxes = maximum(ilev -> max(count(ibox -> s.need_mp[ibox], levelboxes(ft, ilev)),
+                                   count(ibox -> s.ifpwexp[ibox] && s.istarget[ibox], levelboxes(ft, ilev))), 0:ft.nlevels)
     ncols = npw * (npw ÷ 2)
     cb = min(ncols, cld(2048, npw))           # ~16 KB of a box's expansion per block
     nblk = cld(ncols, cb)
@@ -422,9 +428,10 @@ function _m2l_list(s::DMKSetup, tboxes, mpidx, xmin)
     ft = s.ft
     srcs = [NTuple{4,Int}[] for _ in tboxes]
     for (t, ibox) in enumerate(tboxes)
-        push!(srcs[t], (mpidx[ibox], 0, 0, 0))
+        s.need_mp[ibox] && push!(srcs[t], (mpidx[ibox], 0, 0, 0))
         for j in 1:s.nlistpw[ibox]
             jbox = s.listpw[j, ibox]
+            s.need_mp[jbox] || continue
             dx = round(Int, (ft.centers[1, ibox] - ft.centers[1, jbox]) / xmin)
             dy = round(Int, (ft.centers[2, ibox] - ft.centers[2, jbox]) / xmin)
             dz = round(Int, (ft.centers[3, ibox] - ft.centers[3, jbox]) / xmin)
@@ -484,6 +491,7 @@ function _local_pot_box!(pot, s::DMKSetup, fv, ibox::Int, (lw, Abuf, Bbuf, stenc
     empty!(others)
     for jj in s.list1_ptr[ibox]:(s.list1_ptr[ibox + 1] - 1)
         jbox = s.list1[jj]
+        s.issource[jbox] || continue
         if ft.level[jbox] == ilev
             dx = round(Int, (ft.centers[1, jbox] - ft.centers[1, ibox]) / bsl)
             dy = round(Int, (ft.centers[2, jbox] - ft.centers[2, ibox]) / bsl)
@@ -573,6 +581,7 @@ function _local_pgh_box!(pot, grad, hess, s::DMKSetup, fv, ibox::Int, lw::LocalW
     tabsl = s.loctabs[ilev + 1]
     for jj in s.list1_ptr[ibox]:(s.list1_ptr[ibox + 1] - 1)
         jbox = s.list1[jj]
+        s.issource[jbox] || continue
         jlev = ft.level[jbox]
         bs = ft.boxsize[jlev + 1] / 4
         sx = _loctab_slot(ft.centers[1, ibox], ft.centers[1, jbox], bs)

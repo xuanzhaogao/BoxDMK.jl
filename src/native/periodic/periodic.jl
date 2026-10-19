@@ -69,20 +69,22 @@ density with nonzero mean is taken with a uniform neutralizing background
 (the k = 0 mode of the whole potential is dropped).
 `f_batch!(values, points)` (values `(1, npts)`, points `(3, npts)`) may be given
 instead of `f`. The level-0 boxes have side `rc = d_min / ⌈1/rc_factor⌉`,
-`d_min` the smallest distance between lattice planes. `timings` (length ≥ 6)
+`d_min` the smallest distance between lattice planes. With `skip_negligible`
+boxes whose density is too small to change the potential by `eps` relative
+are left out of the real-space part (see `_source_boxes`). `timings` (length ≥ 6)
 receives wall times (s): [1] forest, [2] setup and wide source, [3] local
 expansions + upward pass, [4] wide part, [5] plane waves, [6] near field, and
 if length ≥ 10 the plane-wave split [7] formation, [8] translation,
 [9] evaluation, [10] downward pass.
 """
 function bdmk_periodic(f, cell; eps::Real = 1e-6, norder::Int = 16, rc_factor::Real = 0.25, nhalo::Int = 1,
-                       f_batch = nothing, timings::Union{Nothing,Vector{Float64}} = nothing)
+                       f_batch = nothing, skip_negligible::Bool = true, timings::Union{Nothing,Vector{Float64}} = nothing)
     f_batch === nothing || (f = _BatchDensity(f_batch))
     old_ftz = get_zero_subnormals()
     set_zero_subnormals(true)
     try
         f === nothing && throw(ArgumentError("provide a density f or a batch density f_batch"))
-        return _bdmk_periodic(f, _cell_matrix(cell), Float64(eps), norder, Float64(rc_factor), nhalo, timings)
+        return _bdmk_periodic(f, _cell_matrix(cell), Float64(eps), norder, Float64(rc_factor), nhalo, skip_negligible, timings)
     finally
         set_zero_subnormals(old_ftz)
     end
@@ -92,7 +94,8 @@ _cell_matrix(L::Real) = Matrix(Float64(L) * I, 3, 3)
 _cell_matrix(L::Tuple) = Matrix(Diagonal(collect(Float64.(L))))
 _cell_matrix(A::AbstractMatrix) = Matrix{Float64}(A)
 
-function _bdmk_periodic(f, A::Matrix{Float64}, eps::Float64, n::Int, rc_factor::Float64, nhalo::Int, timings)
+function _bdmk_periodic(f, A::Matrix{Float64}, eps::Float64, n::Int, rc_factor::Float64, nhalo::Int,
+                        skip_negligible::Bool, timings)
     tm = timings === nothing ? zeros(10) : timings
     fill!(tm, 0.0)
     nhalo >= 1 || throw(ArgumentError("nhalo must be ≥ 1"))
@@ -117,7 +120,8 @@ function _bdmk_periodic(f, A::Matrix{Float64}, eps::Float64, n::Int, rc_factor::
     dn, wn = ts[narrow], ws[narrow]
     tsw, wsw = ts[iswide], ws[iswide]
     taylor = taylor_coefficients(LaplaceKernel(), r0, wn, dn)
-    s = DMKSetup(ft, LegendreBasis(), n, 1, eps, 1, r0, wn, dn, taylor; asym_safety = 1e-4, istarget = istarget)
+    issource = skip_negligible ? _source_boxes(ft, fvals, eps, sum(wn .* (pi .* dn) .^ 1.5)) : trues(ft.nboxes)
+    s = DMKSetup(ft, LegendreBasis(), n, 1, eps, 1, r0, wn, dn, taylor; asym_safety = 1e-4, istarget, issource)
     wplan = WidePlan(g, eps, wide_orders(eps, s.porder, n, rc)..., tsw, wsw)
     # Source moments of one period: from the level-0 cubes when they tile the
     # cell (after the upward pass), else from a tree in fractional coordinates
@@ -142,6 +146,27 @@ function _bdmk_periodic(f, A::Matrix{Float64}, eps::Float64, n::Int, rc_factor::
     finally
         release!(s.arena)
     end
+end
+
+# Boxes whose density can matter in the narrow (real-space) part. A leaf with
+# max|f| ≤ τ changes the potential anywhere by at most τ ∫ K_narrow = τ S_n
+# (K_narrow > 0), in all at most that much since the boxes are disjoint; τ is
+# eps U / S_n with U = max over leaves of max|f| min(S_n, 2.4 h²), the
+# potential scale of the strongest box (2.4 h² ≥ ∫_cube 1/r). A nonleaf box is
+# a source if a leaf below it is. The wide part still uses every box.
+function _source_boxes(ft::FlatTree, fvals, eps::Float64, Sn::Float64)
+    nb = ft.nboxes
+    bmax = zeros(nb)
+    parallel_foreach(collect(1:nb), fill(nothing, _nthreads())) do b, _
+        ft.nchild[b] == 0 && (bmax[b] = maximum(abs, view(fvals, :, :, :, b)))
+    end
+    U = maximum(b -> ft.nchild[b] == 0 ? bmax[b] * min(Sn, 2.4 * ft.boxsize[ft.level[b] + 1]^2) : 0.0, 1:nb)
+    τ = eps * U / Sn
+    src = falses(nb)
+    for b in nb:-1:1                       # level order: children after parents
+        src[b] = ft.nchild[b] == 0 ? bmax[b] > τ : any(c -> c > 0 && src[c], view(ft.child, :, b))
+    end
+    return src
 end
 
 _tensor_weights(n::Int) = (w = ortho1d(LegendreBasis(), n).w; vec([w[i] * w[j] * w[k] for i in 1:n, j in 1:n, k in 1:n]))
