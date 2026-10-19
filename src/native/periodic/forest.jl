@@ -8,25 +8,79 @@
 """
     PeriodicGrid
 
-Level-0 geometry of the periodic forest for the orthorhombic cell
-`[0, L₁) × [0, L₂) × [0, L₃)`: `mgrid[d] = L[d] / rc` central boxes per axis,
-`nhalo` image layers, `mle = mgrid .+ 2nhalo` boxes per axis in all, lower
-corner `xelo = -nhalo * rc`.
+Lattice and level-0 geometry of the periodic forest. The cell
+`{A t : t ∈ [0,1)³}` (lattice vectors = columns of `A`) is handled in the
+rotated frame `x_rot = Qᵀ x` with `A = Q U`, `U` upper triangular with a
+positive diagonal (C++ `BdmkLattice`). The level-0 grid has `mgrid[d]`
+cubes of side `rc` covering the bounding box of the cell from `xgrid0`,
+plus `nhalo` image layers: `mle = mgrid .+ 2nhalo` boxes per axis from
+`xelo = xgrid0 .- nhalo * rc`.
 """
 struct PeriodicGrid
-    L::NTuple{3,Float64}
+    A::Matrix{Float64}
+    Q::Matrix{Float64}
+    U::Matrix{Float64}
+    Uinv::Matrix{Float64}
+    V::Float64
+    dmin::Float64               # smallest distance between lattice planes
     rc::Float64
     mgrid::NTuple{3,Int}
+    xgrid0::NTuple{3,Float64}
     nhalo::Int
     mle::NTuple{3,Int}
     xelo::NTuple{3,Float64}
+    diagonal::Bool              # orthorhombic (U diagonal)
+    tiled::Bool                 # orthorhombic with sides multiple of rc: the central cubes tile the cell
 end
 
-function PeriodicGrid(L::NTuple{3,Float64}, rc::Float64, nhalo::Int)
-    mgrid = map(l -> round(Int, l / rc), L)
-    all(d -> abs(mgrid[d] * rc - L[d]) <= 1e-9 * L[d], 1:3) ||
-        throw(ArgumentError("cell sides $L are not integer multiples of rc = $rc"))
-    return PeriodicGrid(L, rc, mgrid, nhalo, mgrid .+ 2nhalo, ntuple(_ -> -nhalo * rc, 3))
+# A = Q U with U upper triangular, diag(U) > 0.
+function _lattice_qr(A::AbstractMatrix)
+    F = qr(Matrix{Float64}(A))
+    D = Diagonal(sign.(diag(F.R)))
+    Q = Matrix(F.Q) * D
+    U = D * F.R
+    for j in 1:3, i in (j + 1):3
+        U[i, j] = 0.0
+    end
+    return Q, Matrix(U)
+end
+
+function PeriodicGrid(A::AbstractMatrix, rc::Float64, nhalo::Int)
+    size(A) == (3, 3) || throw(ArgumentError("the cell must be a 3×3 matrix of lattice vectors (columns)"))
+    abs(det(A)) > 0 || throw(ArgumentError("degenerate cell"))
+    Q, U = _lattice_qr(A)
+    Uinv = inv(UpperTriangular(U)) |> Matrix
+    dmin = minimum(1 / norm(Uinv[i, :]) for i in 1:3)
+    # bounding box of the cell along each rotated axis (C++ compute_grid)
+    xg = zeros(3); mg = zeros(Int, 3)
+    for i in 3:-1:1
+        lo = 0.0; hi = U[i, i]
+        for j in (i + 1):3
+            lo += min(0.0, U[i, j]); hi += max(0.0, U[i, j])
+        end
+        mg[i] = max(1, ceil(Int, (hi - lo) / rc))
+        xg[i] = lo
+    end
+    scale = maximum(abs, U)
+    diagonal = all(abs(U[i, j]) <= 1e-12 * scale for j in 1:3 for i in 1:3 if i != j)
+    tiled = diagonal && all(abs(round(U[d, d] / rc) * rc - U[d, d]) <= 1e-9 * U[d, d] for d in 1:3)
+    tiled && (mg .= [round(Int, U[d, d] / rc) for d in 1:3])
+    mgrid = Tuple(mg); xgrid0 = Tuple(xg)
+    return PeriodicGrid(Matrix{Float64}(A), Q, U, Uinv, abs(det(U)), dmin, rc, mgrid, xgrid0, nhalo,
+                        mgrid .+ 2nhalo, xgrid0 .- nhalo * rc, diagonal, tiled)
+end
+
+PeriodicGrid(L::NTuple{3,Float64}, rc::Float64, nhalo::Int) = PeriodicGrid(Matrix(Diagonal(collect(L))), rc, nhalo)
+
+# Does the cube (center c, half side h, rotated frame) meet the cell? Slab test
+# on the fractional coordinates (conservative).
+function _meets_cell(g::PeriodicGrid, c, h::Float64)
+    for d in 1:3
+        t = g.Uinv[d, 1] * c[1] + g.Uinv[d, 2] * c[2] + g.Uinv[d, 3] * c[3]
+        r = h * (abs(g.Uinv[d, 1]) + abs(g.Uinv[d, 2]) + abs(g.Uinv[d, 3]))
+        (t + r <= 1e-12 || t - r >= 1 - 1e-12) && return false
+    end
+    return true
 end
 
 # Level-0 grid cell (0-based, clamped) containing x along axis d.
@@ -50,6 +104,7 @@ mutable struct _Forest
     fvals::Vector{Vector{Float64}}  # n³ values per box, x fastest (arena memory)
     boxsize::Vector{Float64}        # boxsize[ilev + 1]
     ar::Arena
+    R::Matrix{Float64}              # the density is sampled at R * (box point)
 end
 
 _nbox(F::_Forest) = length(F.level)
@@ -79,10 +134,14 @@ function _sample!(F::_Forest, f, bs, x::Vector{Float64})
         parallel_foreach(bs, [zeros(3, np) for _ in 1:_nthreads()]) do b, pts
             c = F.centers[b]
             h = F.boxsize[F.level[b] + 1] / 2
+            R = F.R
             i = 0
             for iz in 1:n, iy in 1:n, ix in 1:n
                 i += 1
-                pts[1, i] = c[1] + h * x[ix]; pts[2, i] = c[2] + h * x[iy]; pts[3, i] = c[3] + h * x[iz]
+                y1 = c[1] + h * x[ix]; y2 = c[2] + h * x[iy]; y3 = c[3] + h * x[iz]
+                for d in 1:3
+                    pts[d, i] = R[d, 1] * y1 + R[d, 2] * y2 + R[d, 3] * y3
+                end
             end
             f.f!(reshape(F.fvals[b], 1, np), pts)
         end
@@ -92,9 +151,13 @@ function _sample!(F::_Forest, f, bs, x::Vector{Float64})
         c = F.centers[b]
         h = F.boxsize[F.level[b] + 1] / 2
         v = F.fvals[b]
+        R = F.R
         i = 0
         for iz in 1:n, iy in 1:n, ix in 1:n
-            pt[1] = c[1] + h * x[ix]; pt[2] = c[2] + h * x[iy]; pt[3] = c[3] + h * x[iz]
+            y1 = c[1] + h * x[ix]; y2 = c[2] + h * x[iy]; y3 = c[3] + h * x[iz]
+            @inbounds for d in 1:3
+                pt[d] = R[d, 1] * y1 + R[d, 2] * y2 + R[d, 3] * y3
+            end
             @inbounds v[i += 1] = f(pt)
         end
     end
@@ -248,7 +311,7 @@ function build_periodic_forest(f, g::PeriodicGrid; norder::Int = 16, eps::Float6
                                f_batch = nothing)
     f_batch === nothing || (f = _BatchDensity(f_batch))
     f === nothing && throw(ArgumentError("provide a density f or a batch density f_batch"))
-    F = _Forest(norder, NTuple{3,Float64}[], Int[], Int[], NTuple{8,Int}[], Vector{Float64}[], [g.rc], Arena())
+    F = _Forest(norder, NTuple{3,Float64}[], Int[], Int[], NTuple{8,Int}[], Vector{Float64}[], [g.rc], Arena(), g.Q)
     try
         return _build_forest!(F, f, g, eps, min_levels)
     finally
@@ -345,7 +408,7 @@ function _flatten_forest(F::_Forest, g::PeriodicGrid)
     # colleagues on the renumbered forest
     G = _Forest(F.n, [Tuple(centers[:, i]) for i in 1:nb], level, parent,
                 [nchild[i] == 0 ? ntuple(_ -> 0, 8) : Tuple(child[:, i]) for i in 1:nb],
-                Vector{Float64}[], F.boxsize, F.ar)
+                Vector{Float64}[], F.boxsize, F.ar, F.R)
     ncoll, coll = _colleagues(G, g, [collect(laddr[1, l]:laddr[2, l]) for l in 1:nl + 1])
     ft = FlatTree(nb, nl, collect(1:nb), laddr, level, parent, nchild, child, ncoll, coll, centers,
                   F.boxsize[1:nl + 1])
@@ -354,6 +417,8 @@ function _flatten_forest(F::_Forest, g::PeriodicGrid)
     parallel_foreach(collect(1:nb), fill(nothing, _nthreads())) do i, _
         copyto!(fvals, (i - 1) * np + 1, F.fvals[order[i]], 1, np)
     end
-    istarget = BitVector([!_inhalo(g, centers[:, i]) for i in 1:nb])
+    # targets: boxes of the central grid that meet the cell
+    istarget = BitVector([!_inhalo(g, view(centers, :, i)) && _meets_cell(g, view(centers, :, i), F.boxsize[level[i] + 1] / 2)
+                          for i in 1:nb])
     return ft, fvals, istarget
 end

@@ -8,17 +8,20 @@ const _PXS = [(0.20, 0.25, 0.40), (0.72, 0.65, 0.55), (0.95, 0.30, 0.80), (0.45,
 
 # Errors of the solution at `nsamp` random in-cell leaf nodes against Ewald.
 function _periodic_errors(res, g; nsamp = 300)
-    ft, n = res.ft, res.norder
+    ft, n, G = res.ft, res.norder, res.grid
     x = BoxDMK.ortho1d(LegendreBasis(), n).x
     leaves = [i for i in 1:ft.nboxes if ft.nchild[i] == 0 && res.istarget[i]]
     rng = MersenneTwister(7)
     e2 = r2 = emax = rmax = 0.0
-    for _ in 1:nsamp
+    k = 0
+    while k < nsamp
         ib = rand(rng, leaves)
         a, b, c = rand(rng, 1:n, 3)
         h = ft.boxsize[ft.level[ib] + 1] / 2
-        p = [ft.centers[1, ib] + h * x[a], ft.centers[2, ib] + h * x[b], ft.centers[3, ib] + h * x[c]]
-        uref = ewald_potential(g, p; mmax = 16)
+        y = [ft.centers[1, ib] + h * x[a], ft.centers[2, ib] + h * x[b], ft.centers[3, ib] + h * x[c]]
+        all(0 .<= G.Uinv * y .< 1) || continue          # node in the cell
+        k += 1
+        uref = ewald_potential(g, G.Q * y)
         u = res.pot[a, b, c, ib]
         e2 += (u - uref)^2; r2 += uref^2
         emax = max(emax, abs(u - uref)); rmax = max(rmax, abs(uref))
@@ -101,6 +104,36 @@ end
         @test u ≈ ewald_potential(g, p) rtol = 1e-5 atol = 1e-6 * maximum(abs, res.pot)
     end
 
+    @testset "$name cell, $(neutral ? "neutral" : "charged") $dist, eps=1e-$nd" for (name, A, dist, neutral, nd) in (
+            ("sheared", [1.0 0.35 0.15; 0 1 -0.2; 0 0 1], "multiscale", false, 6),
+            ("sheared", [1.0 0.35 0.15; 0 1 -0.2; 0 0 1], "smooth", true, 3),
+            ("hexagonal", [1.0 0.5 0; 0 0.8660254037844386 0; 0 0 1.2], "smooth", false, 6),
+            ("1:√2:√3", [1.0 0 0; 0 sqrt(2) 0; 0 0 sqrt(3)], "multiscale", true, 6),
+            ("cubic", [1.0 0 0; 0 1 0; 0 0 1], "multiscale", false, 6))
+        alpha = dist == "smooth" ? [60.0, 120, 180, 240] : [20000.0, 200, 300, 400]
+        xs = [Tuple(A * collect(t)) for t in _PXS]
+        c = [1.0, 0.7, -0.5, 0.9]
+        g = neutral ? neutral_mixture(A, xs, alpha, c) : GaussMixture(A, xs, alpha, c)
+        res = bdmk_periodic(g, A; eps = 10.0^-nd)
+        @test res.grid.tiled == (name == "cubic")
+        l2, mx = _periodic_errors(res, g)
+        @test l2 < 5 * 10.0^-nd
+        @test mx < 2 * 10.0^-nd
+        p = [0.3, 0.7, 0.9]
+        @test evaluate_periodic(res, p .+ A * [1.0, -2.0, 1.0]) ≈ evaluate_periodic(res, p) rtol = 1e-12
+    end
+
+    # A spike far narrower than the coarse cells (the C++ known failure): the
+    # fractional source tree must follow the main forest's refinement.
+    @testset "lone spike, sheared cell, eps=1e-9" begin
+        A = [1.0 0.35 0.15; 0 1 -0.2; 0 0 1]
+        tf = [(0.52, 0.48, 0.51), _PXS[1], _PXS[2], _PXS[3]]
+        g = neutral_mixture(A, [Tuple(A * collect(t)) for t in tf], [5e5, 200, 300, 400], [1.0, 0.7, -0.5, 0.9])
+        res = bdmk_periodic(g, A; eps = 1e-9)
+        l2, mx = _periodic_errors(res, g; nsamp = 200)
+        @test mx < 2e-9
+    end
+
     @testset "batch density" begin
         g = neutral_mixture((1.0, 1.0, 1.0), _PXS, [60.0, 120, 180, 240], [1.0, 0.7, -0.5, 0.9])
         gb!(v, pts) = (for i in axes(pts, 2); v[1, i] = g(view(pts, :, i)); end)
@@ -110,7 +143,7 @@ end
     end
 
     @testset "argument checks" begin
-        @test_throws ArgumentError bdmk_periodic(x -> 0.0, (1.0, 1.3, 1.0); eps = 1e-3)  # 1.3 not a multiple of rc
+        @test_throws ArgumentError bdmk_periodic(x -> 0.0, [1.0 2; 2 4; 0 0][:, [1, 2, 2]]; eps = 1e-3)   # degenerate
         @test_throws ArgumentError bdmk_periodic(x -> 0.0, 1.0; eps = 1e-3, nhalo = 0)
     end
 end

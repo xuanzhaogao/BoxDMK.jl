@@ -56,41 +56,53 @@ struct PeriodicResult
 end
 
 """
-    bdmk_periodic(f, L; eps=1e-6, norder=16, rc_factor=0.25, nhalo=1, f_batch=nothing, timings=nothing)
+    bdmk_periodic(f, cell; eps=1e-6, norder=16, rc_factor=0.25, nhalo=1, f_batch=nothing, timings=nothing)
 
-Periodic Coulomb potential `u(x) = ∫_cell Σ_n f(y) / |x - y - n∘L| dy` (k = 0
-mode dropped) of the charge-neutral, `L`-periodic density
-`f(x::AbstractVector) -> Real` on the orthorhombic cell `[0, L₁) × [0, L₂) × [0, L₃)`
-(`L` a number for a cube); `f_batch!(values, points)` (values `(1, npts)`,
-points `(3, npts)`) may be given instead of `f`. The level-0 boxes have side
-`rc ≈ rc_factor * minimum(L)`, rounded so that every side is a multiple of it.
-`timings` (length ≥ 6) receives wall times (s): [1] forest, [2] setup,
-[3] local expansions + upward pass, [4] wide part, [5] plane waves,
-[6] near field, and if length ≥ 10 the plane-wave split [7] formation,
-[8] translation, [9] evaluation, [10] downward pass.
+Periodic Coulomb potential
+
+    u(x) = ∫_cell Σ_n f(y) / |x - y - A n| dy        (k = 0 mode dropped)
+
+of the cell-periodic density `f(x::AbstractVector) -> Real`. `cell` is the
+3×3 matrix `A` of lattice vectors (columns), a 3-tuple `L` for the
+orthorhombic cell `[0, L₁) × [0, L₂) × [0, L₃)`, or a number for a cube. A
+density with nonzero mean is taken with a uniform neutralizing background
+(the k = 0 mode of the whole potential is dropped).
+`f_batch!(values, points)` (values `(1, npts)`, points `(3, npts)`) may be given
+instead of `f`. The level-0 boxes have side `rc = d_min / ⌈1/rc_factor⌉`,
+`d_min` the smallest distance between lattice planes. `timings` (length ≥ 6)
+receives wall times (s): [1] forest, [2] setup and wide source, [3] local
+expansions + upward pass, [4] wide part, [5] plane waves, [6] near field, and
+if length ≥ 10 the plane-wave split [7] formation, [8] translation,
+[9] evaluation, [10] downward pass.
 """
-function bdmk_periodic(f, L; eps::Real = 1e-6, norder::Int = 16, rc_factor::Real = 0.25, nhalo::Int = 1,
+function bdmk_periodic(f, cell; eps::Real = 1e-6, norder::Int = 16, rc_factor::Real = 0.25, nhalo::Int = 1,
                        f_batch = nothing, timings::Union{Nothing,Vector{Float64}} = nothing)
     f_batch === nothing || (f = _BatchDensity(f_batch))
     old_ftz = get_zero_subnormals()
     set_zero_subnormals(true)
     try
         f === nothing && throw(ArgumentError("provide a density f or a batch density f_batch"))
-        return _bdmk_periodic(f, L isa Real ? (Float64(L), Float64(L), Float64(L)) : Float64.(Tuple(L)),
-                              Float64(eps), norder, Float64(rc_factor), nhalo, timings)
+        return _bdmk_periodic(f, _cell_matrix(cell), Float64(eps), norder, Float64(rc_factor), nhalo, timings)
     finally
         set_zero_subnormals(old_ftz)
     end
 end
 
-function _bdmk_periodic(f, L::NTuple{3,Float64}, eps::Float64, n::Int, rc_factor::Float64, nhalo::Int, timings)
+_cell_matrix(L::Real) = Matrix(Float64(L) * I, 3, 3)
+_cell_matrix(L::Tuple) = Matrix(Diagonal(collect(Float64.(L))))
+_cell_matrix(A::AbstractMatrix) = Matrix{Float64}(A)
+
+function _bdmk_periodic(f, A::Matrix{Float64}, eps::Float64, n::Int, rc_factor::Float64, nhalo::Int, timings)
     tm = timings === nothing ? zeros(10) : timings
     fill!(tm, 0.0)
     nhalo >= 1 || throw(ArgumentError("nhalo must be ≥ 1"))
-    dmin = minimum(L)
-    rc = dmin / ceil(dmin / (rc_factor * dmin) * (1 - 1e-12))
-    0 < rc < 0.95 * dmin || throw(ArgumentError("need 0 < rc < 0.95 min(L)"))
-    g = PeriodicGrid(L, rc, nhalo)
+    0 < rc_factor < 0.95 || throw(ArgumentError("need 0 < rc_factor < 0.95"))
+    size(A) == (3, 3) && abs(det(A)) > 0 || throw(ArgumentError("degenerate cell"))
+    _, U = _lattice_qr(A)
+    Uinv = inv(UpperTriangular(U))
+    dmin = minimum(1 / norm(Uinv[i, :]) for i in 1:3)
+    rc = dmin / ceil(1 / rc_factor * (1 - 1e-12))
+    g = PeriodicGrid(A, rc, nhalo)
 
     t0 = time_ns()
     ft, fvals, istarget = build_periodic_forest(f, g; norder = n, eps = eps, min_levels = 1)
@@ -100,22 +112,45 @@ function _bdmk_periodic(f, L::NTuple{3,Float64}, eps::Float64, n::Int, rc_factor
     r0, ws, ts = useries_sog(round(Int, -log10(eps)), rc)
     dmin > 2r0 || throw(ArgumentError("cell too small for the SOG"))
     iswide = [sqrt(t * log(1 / eps)) > rc for t in ts]
+    any(iswide) || throw(ArgumentError("no wide Gaussians; increase rc_factor"))
     narrow = sort(findall(.!iswide); by = i -> -ts[i])     # δ descending
     dn, wn = ts[narrow], ws[narrow]
     tsw, wsw = ts[iswide], ws[iswide]
     taylor = taylor_coefficients(LaplaceKernel(), r0, wn, dn)
     s = DMKSetup(ft, LegendreBasis(), n, 1, eps, 1, r0, wn, dn, taylor; asym_safety = 1e-4, istarget = istarget)
-    wplan = isempty(tsw) ? nothing : WidePlan(g, eps, wide_orders(eps, s.porder, n, rc)..., tsw, wsw)
+    wplan = WidePlan(g, eps, wide_orders(eps, s.porder, n, rc)..., tsw, wsw)
+    # Source moments of one period: from the level-0 cubes when they tile the
+    # cell (after the upward pass), else from a tree in fractional coordinates
+    # refined like the forest (threshold of its level-0 test).
+    Msrc = nothing
+    if !g.tiled
+        w3 = _tensor_weights(n)
+        rint0 = sqrt(sum(b -> _box_l2sq(view(fvals, :, :, :, b), w3, rc^2 / 8), levelboxes(ft, 0)))
+        Msrc = fractional_moments(f, g, ft, n, wplan.pf, eps * rc^-1.5 * rint0)
+    end
     tm[2] = (time_ns() - t0) / 1e9
     try
-        pot = _periodic_steps(s, g, fvals, wplan, tm)
+        pot, fmean = _periodic_steps(s, g, fvals, wplan, Msrc, tm)
+        # neutralizing background: remove the k = 0 mode of the real-space parts
+        # (narrow Gaussians and local correction); the wide part has none
+        dc = fmean * (sum(wn .* (pi .* dn) .^ 1.5) + taylor[1])
+        for ibox in 1:ft.nboxes
+            (ft.nchild[ibox] == 0 && istarget[ibox]) || continue
+            view(pot, :, :, :, ibox) .-= dc
+        end
         return PeriodicResult(ft, g, fvals, pot, istarget, n)
     finally
         release!(s.arena)
     end
 end
 
-function _periodic_steps(s::DMKSetup, g::PeriodicGrid, fvals::Array{Float64,4}, wplan, tm)
+_tensor_weights(n::Int) = (w = ortho1d(LegendreBasis(), n).w; vec([w[i] * w[j] * w[k] for i in 1:n, j in 1:n, k in 1:n]))
+
+# Mean of f over the cell from the root-cell moments (u-measure).
+_cell_mean(P::WidePlan, M::Array{Float64,3}) =
+    sum(M[1 + P.pf * s1, 1 + P.pf * s2, 1 + P.pf * s3] for s1 in 0:(P.mt[1] - 1), s2 in 0:(P.mt[2] - 1), s3 in 0:(P.mt[3] - 1)) / prod(P.mt)
+
+function _periodic_steps(s::DMKSetup, g::PeriodicGrid, fvals::Array{Float64,4}, wplan::WidePlan, Msrc, tm)
     ft, n, p = s.ft, s.n, s.porder
     nb = ft.nboxes
     fv = reshape(fvals, n, n, n, 1, nb)
@@ -133,7 +168,7 @@ function _periodic_steps(s::DMKSetup, g::PeriodicGrid, fvals::Array{Float64,4}, 
     tm[3] = (time_ns() - t0) / 1e9
 
     t0 = time_ns()
-    wplan === nothing || _wide_inject!(pot, pp, pc, nodeidx, s, g, fv, wplan, tpw)
+    fmean = _wide_inject!(pot, pp, pc, nodeidx, s, g, fv, wplan, Msrc)
     tm[4] = (time_ns() - t0) / 1e9
 
     t0 = time_ns()
@@ -146,7 +181,7 @@ function _periodic_steps(s::DMKSetup, g::PeriodicGrid, fvals::Array{Float64,4}, 
     step7_local!(pot, gdum, hdum, s, fv)
     step9_proxy2pot!(pot, gdum, hdum, pp, nodeidx, s, tpw)
     tm[6] = (time_ns() - t0) / 1e9
-    return reshape(pot, n, n, n, nb)
+    return reshape(pot, n, n, n, nb), fmean
 end
 
 # Central level-0 box (0-based central grid indices) of each level-0 box, or nothing.
@@ -159,29 +194,35 @@ function _central_index(g::PeriodicGrid, ibox::Int)
     return (i, j, k)
 end
 
-# Moments of the central boxes -> u_wide Legendre coefficients, added to the
-# proxy potentials of nonleaf boxes (spread by the downward pass) and
-# evaluated directly on leaf boxes.
-function _wide_inject!(pot, pp, pc, nodeidx, s::DMKSetup, g::PeriodicGrid, fv, P::WidePlan, tpw)
+# Root-cell moments -> modes -> u_wide Legendre coefficients on the central
+# cubes, added to the proxy potentials of nonleaf boxes (spread by the
+# downward pass) and evaluated directly on leaf boxes. For a tiled cell the
+# moments are those of the central cubes (proxy charges of the upward pass).
+# Returns the mean of f over the cell.
+function _wide_inject!(pot, pp, pc, nodeidx, s::DMKSetup, g::PeriodicGrid, fv, P::WidePlan, Msrc)
     ft, p = s.ft, s.porder
     pf, pe = P.pf, P.pe
     boxes = [(ibox, c) for ibox in levelboxes(ft, 0) for c in (_central_index(g, ibox),) if c !== nothing]
-    M = alloc(s.arena, pf * g.mgrid[1], pf * g.mgrid[2], pf * g.mgrid[3])
-    sc3 = (g.rc / 2)^3
     wks = make_workspaces(() -> (w1 = alloc(s.arena, max(p, s.n)^3), w2 = alloc(s.arena, max(p, s.n)^3),
                                   w3 = alloc(s.arena, p^3)))
-    parallel_foreach(boxes, wks) do (ibox, (i, j, k)), w
-        q = if ft.nchild[ibox] == 0
-            out = reshape(view(w.w3, 1:p^3), p, p, p)
-            tp3!(out, view(fv, :, :, :, 1, ibox), s.den2pc, s.den2pcT, s.den2pcT, w.w1, w.w2, sc3, false)
-            out
-        else
-            reshape(view(pc, :, 1, nodeidx[ibox]), p, p, p)
+    M = Msrc
+    if M === nothing
+        M = alloc(s.arena, pf * g.mgrid[1], pf * g.mgrid[2], pf * g.mgrid[3])
+        rc3 = g.rc^3
+        parallel_foreach(boxes, wks) do (ibox, (i, j, k)), w
+            q = if ft.nchild[ibox] == 0
+                out = reshape(view(w.w3, 1:p^3), p, p, p)
+                tp3!(out, view(fv, :, :, :, 1, ibox), s.den2pc, s.den2pcT, s.den2pcT, w.w1, w.w2, 1 / 8, false)
+                out
+            else
+                reshape(view(pc, :, 1, nodeidx[ibox]), p, p, p) ./ rc3
+            end
+            M[pf * i + 1:pf * (i + 1), pf * j + 1:pf * (j + 1), pf * k + 1:pf * (k + 1)] .= view(q, 1:pf, 1:pf, 1:pf)
         end
-        M[pf * i + 1:pf * (i + 1), pf * j + 1:pf * (j + 1), pf * k + 1:pf * (k + 1)] .= view(q, 1:pf, 1:pf, 1:pf)
     end
-    C = wide_coefficients(P, M, s.arena)
-    parallel_foreach(boxes, wks) do (ibox, (i, j, k)), w
+    G = wide_modes(P, M, s.arena)
+    C = wide_coefficients(P, G, s.arena)
+    parallel_foreach([b for b in boxes if s.istarget[b[1]]], wks) do (ibox, (i, j, k)), w
         cb = reshape(view(w.w3, 1:p^3), p, p, p)
         fill!(cb, 0.0)
         cb[1:pe, 1:pe, 1:pe] .= view(C, pe * i + 1:pe * (i + 1), pe * j + 1:pe * (j + 1), pe * k + 1:pe * (k + 1))
@@ -191,7 +232,7 @@ function _wide_inject!(pot, pp, pc, nodeidx, s::DMKSetup, g::PeriodicGrid, fv, P
             vec(view(pp, :, 1, 1, nodeidx[ibox])) .+= vec(cb)
         end
     end
-    return nothing
+    return _cell_mean(P, M)
 end
 
 """
@@ -202,16 +243,10 @@ leaf containing it.
 """
 function evaluate_periodic(res::PeriodicResult, x::AbstractVector)
     g, ft, n = res.grid, res.ft, res.norder
-    y = ntuple(d -> mod(x[d], g.L[d]), 3)
-    i, j, k = ntuple(d -> min(floor(Int, y[d] / g.rc), g.mgrid[d] - 1) + g.nhalo, 3)
-    ibox = 1 + i + g.mle[1] * (j + g.mle[2] * k)
-    while ft.nchild[ibox] > 0
-        slot = 1
-        y[1] > ft.centers[1, ibox] && (slot += 1)
-        y[2] > ft.centers[2, ibox] && (slot += 2)
-        y[3] > ft.centers[3, ibox] && (slot += 4)
-        ibox = ft.child[slot, ibox]
-    end
+    t = g.Uinv * (transpose(g.Q) * x)            # fractional coordinates
+    t .-= floor.(t)
+    y = g.U * t                                    # in-cell point, rotated frame
+    ibox = _locate_leaf(ft, g, y)
     leg = ortho1d(LegendreBasis(), n)
     sc = 2.0 / ft.boxsize[ft.level[ibox] + 1]
     pv = zeros(n)
