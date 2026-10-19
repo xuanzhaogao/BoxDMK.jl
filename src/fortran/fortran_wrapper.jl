@@ -114,9 +114,15 @@ function _fortran_callback(
     return
 end
 
+const _FORTRAN_HANDLES = Dict{String, Ptr{Cvoid}}()
+
+# The Fortran reference library is optional: it is only opened on first use.
+function _fortran_sym(path::AbstractString, sym::Symbol)
+    handle = get!(() -> Libdl.dlopen(path), _FORTRAN_HANDLES, path)
+    return Libdl.dlsym(handle, sym)
+end
+
 function __init__()
-    _require_fortran_solve_library!()
-    _init_fortran_hotpaths()
     _FORTRAN_CALLBACK_PTR[] = @cfunction(
         _fortran_callback,
         Cvoid,
@@ -157,7 +163,7 @@ function _fortran_vol_tree_mem!(
     ifnewtree_ref = Ref{Cint}(ifnewtree)
 
     ccall(
-        (:boxdmk_vol_tree_mem, _fortran_libboxdmk_path()),
+        _fortran_sym(_fortran_libboxdmk_path(), :boxdmk_vol_tree_mem),
         Cvoid,
         (
             Ref{Cint},
@@ -239,7 +245,7 @@ function _fortran_vol_tree_build!(
     nd_ref = Ref{Cint}(nd)
 
     ccall(
-        (:boxdmk_vol_tree_build, _fortran_libboxdmk_path()),
+        _fortran_sym(_fortran_libboxdmk_path(), :boxdmk_vol_tree_build),
         Cvoid,
         (
             Ref{Cint},
@@ -338,7 +344,7 @@ function _fortran_bdmk!(
     ifpghtarg_ref = Ref{Cint}(ifpghtarg)
 
     ccall(
-        (:boxdmk_bdmk, _fortran_solve_libboxdmk_path()),
+        _fortran_sym(_fortran_solve_libboxdmk_path(), :boxdmk_bdmk),
         Cvoid,
         (
             Ref{Cint},

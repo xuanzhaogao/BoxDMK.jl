@@ -15,26 +15,19 @@ u(x) = \int_{\Omega} K(x, y) f(y)\,dy
 
 on tensor-product box nodes, with optional interpolation to user targets and optional derivative recovery.
 
-This repository contains both:
-
-- a pure Julia implementation producing exact Fortran-parity tree data,
-- a vendored Fortran reference build used for the solve backend and parity testing.
+Everything — tree construction and the volume-potential solve — is pure Julia.
+A vendored copy of the Fortran reference is kept only for parity testing and
+benchmarking; it is optional and not needed at runtime.
 
 ## Current Status
 
-The default workflow is:
+1. `build_tree(...)` builds the adaptive tree in Julia; it produces exactly the same tree as the Fortran builder (same refinement, `zk` forcing, 4-phase level restriction, colleague construction — bit-for-bit across all kernel/basis/dimension configurations).
+2. `bdmk(...)` solves with the pure-Julia box-DMK solver (`src/native/`), a port of the Fortran `bdmk` for 3D: Laplace, Yukawa and square-root Laplace kernels; Legendre and Chebyshev bases; potential, gradient and Hessian; arbitrary targets; any number of densities `nd`.
+3. `bdmk_periodic(...)` computes the periodic Coulomb potential on any triclinic cell, for neutral or charged densities (pure-Julia port of the C++ periodic box-DMK of PeriodicDMK); see [Periodic Solver](#periodic-solver).
 
-1. Build the tree in Julia with `build_tree(...)` — produces exactly the same tree structure as the vendored Fortran builder
-2. Solve through the public `bdmk(...)` API — uses the Fortran solve backend for Laplace
-
-The Julia tree builder mirrors the Fortran algorithm exactly: same adaptive refinement with incremental `update_rints`, same `zk`-based forced refinement, same 4-phase level restriction (`flag`/`flag+`/`flag++` with `vol_tree_reorg`), and same `computecoll` colleague construction. Tree data matches Fortran bit-for-bit across all supported kernel/basis/dimension configurations.
-
-Performance: with a type-stable user function, `build_tree(...)` runs within 1.1-1.2x of a pure Fortran tree builder with a native Fortran callback.
-
-The direct Fortran entrypoints remain available for advanced use:
-
-- `bdmk_fortran(tree, fvals, ...)` for parity/debug work
-- `build_tree_fortran(...)` when you explicitly want the Fortran tree builder (slower for Julia-defined functions due to Fortran-to-Julia callbacks)
+The solver reproduces the Fortran results to ~1e-13 relative (same SOG and
+plane-wave tables, same interaction lists, same sparse/dense near-field rules)
+while being several times faster; see [Performance](#performance).
 
 ## Installation
 
@@ -45,19 +38,17 @@ Pkg.add(url = "https://github.com/xuanzhaogao/BoxDMK.jl")
 
 Requires Julia `1.10+`.
 
-## Build The Vendored Fortran Libraries
+## Optional: The Fortran Reference
 
-The public solver requires the vendored Fortran shared libraries at package load.
-
-From the package root, build them with:
+Only needed for `bdmk_fortran` / `build_tree_fortran` (parity tests and
+benchmarks). Build it from the package root with
 
 ```bash
 julia --project deps/build_fortran_ref.jl
 ```
 
-This produces repo-local libraries under `deps/usr/lib/`.
-
-If the solve library is missing, `using BoxDMK` will throw an error telling you to run that command.
+which produces `deps/usr/lib/libboxdmk{,_hot}.so` (requires `cmake`, `gfortran`
+and OpenBLAS). Set `BOXDMK_FORTRAN_LIBDIR` to use libraries built elsewhere.
 
 ## Quick Start
 
@@ -91,7 +82,9 @@ The returned `SolverResult` contains:
 - `target_grad` or `nothing`
 - `target_hess` or `nothing`
 
-`bdmk(...)` is the normal entrypoint. For Laplace solves, it uses the Fortran solve backend behind the public Julia API.
+`bdmk(...)` is the normal entrypoint. Pass `timings = zeros(10)` to receive
+the wall time of the solver stages (precomputation, local expansions, proxy
+upward pass, plane waves, near field, …).
 
 ## Performance: Writing Fast User Functions
 
@@ -182,6 +175,85 @@ potential, discretization error for derivatives).
 
 The raw Fortran reference uses a box centered at the origin. The wrappers handle that coordinate shift internally for `build_tree_fortran(...)` and `bdmk_fortran(...)`.
 
+## Periodic Solver
+
+`bdmk_periodic` computes the periodic Coulomb potential of a cell-periodic
+density on any (triclinic) cell `{A t : t ∈ [0,1)³}`, lattice vectors the columns of `A`:
+
+```math
+u(x) = \int_{\text{cell}} \sum_{n \in \mathbb{Z}^3} \frac{f(y)}{|x - y - A n|}\,dy \qquad (k = 0 \text{ mode dropped})
+```
+
+A density with nonzero mean is taken with a uniform neutralizing background (the
+`k = 0` mode of the whole potential is dropped; for a neutral density this is the
+usual periodic potential).
+
+```julia
+f(x) = ...                                       # periodic density
+A = [1.0 0.35 0.15; 0 1 -0.2; 0 0 1]             # lattice vectors as columns
+res = bdmk_periodic(f, A; eps = 1e-6)            # or a tuple (L₁, L₂, L₃), or a number for a cube
+
+evaluate_periodic(res, [0.3, 0.7, 0.9])          # anywhere (wrapped into the cell)
+res.pot                                          # (n, n, n, nboxes) on each box's Legendre grid
+res.ft, res.istarget, res.grid                   # forest (rotated frame x_rot = Qᵀx, A = QU), boxes computed, geometry
+```
+
+`f` must be defined (periodically) slightly outside the cell; `f_batch!(values, points)`
+may be passed instead, as for `build_tree`. Options: `norder = 16`, `rc_factor = 0.25`
+(level-0 box side `rc = d_min / ⌈1/rc_factor⌉`, `d_min` the smallest distance between
+lattice planes), `timings`.
+
+How it works (`src/native/periodic/`, after the C++ `bdmk_laplace3d_pot_periodic`):
+
+- **Forest**: in the frame where the cell matrix is upper triangular, a grid of
+  cubic boxes of side `rc` covering the cell plus a one-box image halo, each box
+  refined adaptively (the C++ refinement test, which it reproduces box for box)
+  and the whole forest 2:1 balanced. Only boxes that meet the cell are targets.
+- **Kernel split**: `1/r` is the u-series sum of Gaussians; the Gaussians that
+  decay within `rc` run through the free-space box machinery of `bdmk` on the
+  forest (halo boxes carry the image density and act as sources only).
+- **Wide Gaussians** are summed in reciprocal space, exactly per axis with
+  `e^{-iαξ} = Σ (2l+1)(-i)^l j_l(α) P_l(ξ)`. Source: Legendre moments of one period, from
+  the level-0 proxy charges when the cubes tile the cell (orthorhombic, sides
+  multiple of `rc`), else from an adaptive tree in fractional coordinates, where
+  `e^{-2πi m·t}` is separable. That tree refines with the same test and, in
+  addition, wherever the main forest is much finer, so narrow features cannot hide
+  between its sample points. Target: the Legendre coefficients of the wide
+  potential on each level-0 cube (a separable product for orthorhombic cells, a
+  slice-by-slice triangular contraction otherwise, as `k = 2πU⁻ᵀm` is lower
+  triangular), injected into the level-0 proxy potentials before the downward
+  pass. No FFT is needed.
+
+Accuracy against an Ewald-summed Gaussian mixture is about `eps` relative to
+max|u| (1.0–1.25 `eps` in the worst cases) at `eps = 1e-3, 1e-6, 1e-9` on cubic,
+orthorhombic (1:1.5:2, 1:√2:√3), sheared, hexagonal and elongated (1:1:4)
+triclinic cells, neutral and charged densities (`test/test_periodic.jl`). A lone
+spike of width 1.4e-3 on a sheared cell (a known failure of the C++ wide source,
+1.9e-5) is computed to 6e-10 at `eps = 1e-9`. On the C++ benchmark problems both
+codes build the same forest and the potentials agree to 1.2e-10 at `eps = 1e-9`.
+
+Wall time against the C++ solver (PeriodicDMK `bench_steps <cell> multi`: four
+Gaussians down to width 0.007, `norder = 16`; same forest, same density callback;
+genoa node, one socket, threads pinned; `benchmark/run_periodic_node.sh`,
+`benchmark/results/periodic/genoa_triclinic.log`):
+
+| cell | eps | boxes | 1 thread C++ / Julia | 48 threads C++ / Julia |
+|---|---|---|---|---|
+| cubic    | 1e-3 | 624  | 0.80 / 0.84 s | 118 / 81 ms |
+| cubic    | 1e-6 | 1416 | 2.38 / 2.33 s | 378 / 259 ms |
+| cubic    | 1e-9 | 2560 | 6.80 / 5.98 s | 452 / 393 ms |
+| sheared  | 1e-3 | 1320 | 2.33 / 2.00 s | 315 / 156 ms |
+| sheared  | 1e-6 | 2096 | 5.25 / 3.78 s | 945 / 326 ms |
+| sheared  | 1e-9 | 4216 | 17.3 / 9.51 s | 863 / 583 ms |
+| hexagonal | 1e-3 | 1632 | 2.67 / 2.35 s | 295 / 156 ms |
+| hexagonal | 1e-6 | 2328 | 4.95 / 3.92 s | 756 / 279 ms |
+| hexagonal | 1e-9 | 5736 | 17.4 / 11.7 s | 928 / 640 ms |
+
+Both include the tree build with density sampling, which dominates the
+single-thread times (e.g. 3.1 s of the Julia 6.0 s for the cube at 1e-9); the
+triclinic cells sample the density a second time for the fractional source tree,
+as the C++ code does.
+
 ## Kernels And Bases
 
 Supported kernels:
@@ -199,68 +271,101 @@ LegendreBasis()
 ChebyshevBasis()
 ```
 
-## Fortran And Hybrid APIs
-
-The default public workflow is:
+## Fortran Reference APIs
 
 ```julia
-tree, fvals = build_tree(...)      # Julia tree builder (Fortran-parity)
-result = bdmk(tree, fvals, kernel; eps = 1e-6)  # Fortran solve backend
-```
-
-The Fortran entrypoints remain available:
-
-```julia
-# Explicit Fortran solve (same as bdmk for Laplace)
-result = bdmk_fortran(tree, fvals, LaplaceKernel(); eps = 1e-6)
-
-# Fortran tree builder (slower for Julia functions due to callbacks)
+result = bdmk_fortran(tree, fvals, LaplaceKernel(); eps = 1e-6)   # Fortran solve, same API
 ftree = build_tree_fortran(f, LaplaceKernel(), LegendreBasis(); ndim=3, norder=8, eps=1e-6, boxlen=1.0, nd=1)
 ```
 
-Since `build_tree(...)` now produces identical tree data to the Fortran builder, `build_tree_fortran(...)` is mainly useful for parity testing.
+## Performance
+
+Wall time of `bdmk` vs `bdmk_fortran` on the same tree (Laplace kernel,
+best of 3, Fortran built with `-O3 -march=native` + OpenBLAS + OpenMP). The
+density is `f = -Δu/(4π)` for a sum of three Gaussians in a box of size 1.18,
+so the exact potential is `u`; both codes reach the same error against `u`
+and agree with each other to ~1e-13 (`benchmark/native_vs_fortran.jl`; full
+tables in `benchmark/results/`).
+
+Rusty genoa node (2× AMD EPYC 9474F, 96 cores), seconds:
+
+| norder | eps | outputs | boxes | 1 thread F / Julia | 16 threads F / Julia | 48 threads F / Julia | 96 threads F / Julia |
+|---|---|---|---|---|---|---|---|
+| 8  | 1e-6 | pot | 14265 | 15.5 / 3.47 (4.5×) | 5.27 / 0.40 (13×) | 4.60 / 0.29 (16×) | 4.66 / 0.30 (15×) |
+| 16 | 1e-3 | pot | 849   | 0.59 / 0.16 (3.6×) | 0.13 / 0.020 (6.3×) | 0.12 / 0.016 (7.3×) | 0.12 / 0.025 (4.8×) |
+| 16 | 1e-6 | pot | 1225  | 3.05 / 0.88 (3.4×) | 0.52 / 0.10 (5.1×) | 0.45 / 0.066 (6.8×) | 0.46 / 0.082 (5.6×) |
+| 16 | 1e-9 | pot | 2129  | 16.9 / 4.37 (3.9×) | 2.29 / 0.41 (5.7×) | 1.87 / 0.25 (7.5×) | 1.87 / 0.25 (7.5×) |
+| 12 | 1e-9 | pot | 6553  | 41.6 / 9.87 (4.2×) | 6.80 / 0.84 (8.1×) | 5.57 / 0.45 (13×) | 5.56 / 0.41 (14×) |
+| 16 | 1e-6 | pot+grad+hess | 1225 | 28.4 / 4.91 (5.8×) | 2.59 / 0.48 (5.4×) | 1.15 / 0.27 (4.3×) | 0.78 / 0.23 (3.3×) |
+
+Workstation (2× Xeon Gold 6234, 16 cores), seconds:
+
+| norder | eps | outputs | 1 thread F / Julia | 16 threads F / Julia |
+|---|---|---|---|---|
+| 8  | 1e-6 | pot | 23.7 / 5.88 (4.0×) | 6.01 / 0.64 (9.3×) |
+| 16 | 1e-6 | pot | 5.54 / 1.02 (5.4×) | 0.83 / 0.14 (6.1×) |
+| 16 | 1e-9 | pot | 25.0 / 5.23 (4.8×) | 3.89 / 0.63 (6.2×) |
+| 16 | 1e-6 | pot+grad | 28.1 / 2.70 (10×) | 2.43 / 0.31 (7.7×) |
+| 16 | 1e-6 | pot+grad+hess | 47.1 / 5.29 (8.9×) | 4.18 / 0.58 (7.2×) |
+
+Part of the single-thread gain is flushing subnormals to zero (see below):
+run with FTZ as well, the Fortran solve of the 2081-box n=16, eps=1e-6
+problem takes 7.3 s instead of 13.3 s on the workstation; Julia takes 2.0 s.
+Repeated solves reuse the internal buffers; call `BoxDMK.release_memory!()`
+to return them to the OS.
+
+## Implementation Notes
+
+The solver (`src/native/`) follows the nine steps of the Fortran `bdmk` and
+keeps its numerical choices (SOG nodes, plane-wave quadratures and lengths,
+proxy orders, interaction lists, local tables and their sparsity patterns,
+the dense-versus-sparse switch of the near field), which is why results agree
+with Fortran to rounding. The speed comes from restructuring the work:
+
+- **SIMD GEMM kernels** (`gemm.jl`, via SIMD.jl): every tensor-product stage
+  is a small register-blocked matrix product, with no data transposes.
+- **Near field**: same-level neighbours are evaluated target-centrically,
+  `pot += w Σ_dz Tz(Σ_dy Ty(Σ_dx Tx f_s))`, sharing the y/z stages among
+  sources (≈2× fewer flops); sparse pairs use GEMMs on pattern-zeroed tables.
+- **Plane waves**: conjugate symmetry halves all complex transforms, which run
+  as real GEMMs; leaves form/evaluate plane waves directly from/to grid values;
+  the kernel's Fourier transform is folded into the outgoing expansions; the
+  translation (M2L) runs over frequency blocks of all boxes, cache-blocked and
+  partitioned over threads, with shift factors grouped by offset.
+- **Tree passes**: parent↔child transfers share stages among the 8 children
+  and fuse the leaf value↔proxy maps; proxy data is stored only for nonleaf
+  boxes.
+- **Local expansions**: the Taylor correction and the asymptotic expansion of
+  the narrowest Gaussians are one linear combination per leaf.
+- **Runtime**: subnormal numbers are flushed to zero during the solve (the
+  Gaussian tails otherwise hit slow subnormal arithmetic); large buffers come
+  from a malloc arena (no GC pressure); dynamic scheduling over boxes.
+
+`scripts/generate_fortran_tables.jl` regenerates `src/native/tables/` from the
+Fortran DATA statements.
 
 ## Repository Layout
 
-The source tree is grouped by responsibility:
-
-- `src/core/`: types, utilities, basis/tensor/kernel primitives
-- `src/tree/`: adaptive tree construction, tree data transforms, interaction lists
-- `src/solver/`: SOG tables, proxy/passes, plane-wave pipeline, local tables, derivatives, top-level solver
-- `src/fortran/`: vendored-library paths, hotpaths, wrappers, debug snapshots
-- `benchmark/`: performance and parity drivers
-- `test/`: package regression tests
+- `src/core/`: types, utilities, basis/tensor primitives
+- `src/tree/`: adaptive tree construction
+- `src/native/`: the box-DMK solver (tables, flat tree and lists, local tables, GEMM and tensor kernels, plane waves, driver); `src/native/periodic/`: periodic solver (forest, fractional source tree, wide term, driver)
+- `src/solver/`: public `bdmk` entry point, target helpers, `PotentialField`
+- `src/fortran/`: optional Fortran reference wrappers
+- `benchmark/`: `native_vs_fortran.jl` (speed and accuracy against an analytic solution), `periodic_vs_cpp.jl` (periodic solver vs the C++ code), cluster/node runners
+- `test/`: regression tests (Fortran parity tests run when the reference is built)
 - `deps/boxdmk_fortran/`: vendored Fortran reference sources
-
-Generated build outputs under `deps/usr/` and `deps/boxdmk_fortran/build*` are local artifacts and should not be committed.
 
 ## Development Workflow
 
-Useful commands:
-
-Run a focused test:
-
 ```bash
-julia --project --threads=1 -e 'using BoxDMK; include("test/test_solver.jl")'
-```
-
-Run wrapper and hybrid parity checks:
-
-```bash
-julia --project --threads=1 -e 'using BoxDMK; include("test/test_fortran_wrapper.jl"); include("test/test_hybrid_parity.jl")'
-```
-
-Run the reference hybrid benchmark:
-
-```bash
-JULIA_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 julia --project benchmark/hybrid_parity.jl
+julia --project -t auto -e 'using Pkg; Pkg.test()'
+OMP_NUM_THREADS=16 julia --project -t 16 benchmark/native_vs_fortran.jl results.md
 ```
 
 ## Limitations
 
-- The vendored Fortran solve library is a required runtime dependency for the public solver.
-- Tree construction is verified for exact Fortran parity across Laplace, Yukawa, and SqrtLaplace kernels, with Legendre and Chebyshev bases, in 1D/2D/3D.
-- The native Julia solver internals remain in the repo for debugging and development and are still used for kernels outside the validated Laplace-backed path.
+- The native solver is 3D only (the tree builder also supports 1D/2D).
+- `eps` must lie in `(1e-12, 1e-2]`, the range covered by the Fortran tables (SOG nodes exist for 3/6/9/12 digits, plane-wave tables for 2–11).
 
 ## License
 

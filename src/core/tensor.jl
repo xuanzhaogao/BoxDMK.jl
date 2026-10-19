@@ -206,3 +206,58 @@ function c2p_transform(basis::AbstractBasis, norder, ndim)
 
     return c2p
 end
+
+# Workspace helpers for tensor_product_apply! (used by the tree builder).
+function _rect_tensor_scratch_cols(from_order::Int, to_order::Int, ndim::Int)
+    ndim == 1 && return max(from_order, to_order)
+    return maximum(to_order^dim * from_order^(ndim - dim) for dim in 1:(ndim - 1))
+end
+function _rect_tensor_middle_rows(from_order::Int, to_order::Int, ndim::Int)
+    ndim <= 2 && return 0
+    return maximum(to_order^(dim - 1) * from_order^(ndim - dim) for dim in 2:(ndim - 1))
+end
+function _rect_tensor_apply_workspace(::Type{T}, nd::Int, from_order::Int, to_order::Int, ndim::Int) where {T}
+    scratch_cols = _rect_tensor_scratch_cols(from_order, to_order, ndim)
+    middle_rows = _rect_tensor_middle_rows(from_order, to_order, ndim)
+    tensor_in_len = ndim == 3 ? from_order^3 : 0
+    tensor_out_len = ndim == 3 ? to_order^3 : 0
+    ff_rows = ndim == 3 ? from_order^2 : 0
+    fft_cols = ndim == 3 ? to_order * from_order : 0
+    ff2_rows = ndim == 3 ? to_order^2 : 0
+
+    return (
+        scratch_a = Matrix{T}(undef, nd, scratch_cols),
+        scratch_b = Matrix{T}(undef, nd, scratch_cols),
+        tmp_perm = Matrix{T}(undef, middle_rows, from_order),
+        result_2d = Matrix{T}(undef, middle_rows, to_order),
+        packed_src = Vector{T}(undef, tensor_in_len),
+        packed_dest = Vector{T}(undef, tensor_out_len),
+        ff = Matrix{T}(undef, ff_rows, to_order),
+        fft = Matrix{T}(undef, from_order, fft_cols),
+        ff2 = Matrix{T}(undef, ff2_rows, from_order),
+    )
+end
+function _check_rect_tensor_3d_workspace(workspace, from_order::Int, to_order::Int)
+    for name in (:packed_src, :packed_dest, :ff, :fft, :ff2)
+        hasproperty(workspace, name) || throw(ArgumentError("3D tensor workspace must provide $name"))
+    end
+
+    length(workspace.packed_src) >= from_order^3 ||
+        throw(DimensionMismatch("workspace packed_src must have at least $(from_order^3) entries"))
+    length(workspace.packed_dest) >= to_order^3 ||
+        throw(DimensionMismatch("workspace packed_dest must have at least $(to_order^3) entries"))
+    size(workspace.ff, 1) >= from_order^2 ||
+        throw(DimensionMismatch("workspace ff must have at least $(from_order^2) rows"))
+    size(workspace.ff, 2) >= to_order ||
+        throw(DimensionMismatch("workspace ff must have at least $to_order columns"))
+    size(workspace.fft, 1) >= from_order ||
+        throw(DimensionMismatch("workspace fft must have at least $from_order rows"))
+    size(workspace.fft, 2) >= to_order * from_order ||
+        throw(DimensionMismatch("workspace fft must have at least $(to_order * from_order) columns"))
+    size(workspace.ff2, 1) >= to_order^2 ||
+        throw(DimensionMismatch("workspace ff2 must have at least $(to_order^2) rows"))
+    size(workspace.ff2, 2) >= from_order ||
+        throw(DimensionMismatch("workspace ff2 must have at least $from_order columns"))
+
+    return workspace
+end
