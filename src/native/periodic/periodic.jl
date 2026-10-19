@@ -101,6 +101,43 @@ function bdmk_periodic(f, cell; f_batch = nothing, timings::Union{Nothing,Vector
     return res
 end
 
+"""
+    bdmk_q2d(f, L, zlim; eps=1e-6, norder=16, rc_factor=0.25, rc=nothing, zres=nothing, f_batch=nothing, timings=nothing, ...)
+
+Quasi-2D (slab) Coulomb potential: periodic in x and y with the rectangular
+cell `L = (L₁, L₂)` (or a number for a square), free in z,
+
+    u(x) = ∫ Σ_{n ∈ ℤ²} f(y) / |x - y - (n₁L₁, n₂L₂, 0)| dy,
+
+for a neutral density `f` that vanishes outside the slab `zlim = (z₀, z₁)`.
+The potential is computed in the slab (`evaluate_periodic(res, x)` for
+z₀ ≤ x₃ ≤ z₁). The level-0 boxes have side `rc = min(L₁, L₂) / ⌈1/rc_factor⌉`
+(or `rc`), which must divide both sides; boxes meeting the slab are refined
+to side ≤ `zres` (default: the slab thickness) so that the samples resolve
+it. The real-space (narrow) part is
+that of [`bdmk_periodic`](@ref) with images in x and y only; the wide part is
+summed in the plane over the modes `k̇ = 2π(m₁/L₁, m₂/L₂)` and applied in z
+through exact Gaussian kernel matrices on the level-0 z-cells, the mode
+`k̇ = 0` through the kernel `-2π|z - z'|/(L₁L₂)` of all wide Gaussians. Other
+options and `timings` as for `bdmk_periodic`; the forest and `res.pot` are
+in the frame `(x, y, z - z₀)`.
+"""
+bdmk_q2d(f, L, zlim; kwargs...) = bdmk_periodic(f, _slab_cell(L, zlim); slab = true, zorg = Float64(zlim[1]), kwargs...)
+
+"""
+    q2d_plan(f, L, zlim; kwargs...) -> PeriodicPlan
+
+Plan of [`bdmk_q2d`](@ref) for repeated solves with [`periodic_solve!`](@ref).
+"""
+q2d_plan(f, L, zlim; kwargs...) = periodic_plan(f, _slab_cell(L, zlim); slab = true, zorg = Float64(zlim[1]), kwargs...)
+
+function _slab_cell(L, zlim)
+    L1, L2 = L isa Real ? (L, L) : (L[1], L[2])
+    H = zlim[2] - zlim[1]
+    (L1 > 0 && L2 > 0 && H > 0) || throw(ArgumentError("need positive sides and z₀ < z₁"))
+    return Matrix{Float64}(Diagonal([L1, L2, H]))
+end
+
 _cell_matrix(L::Real) = Matrix(Float64(L) * I, 3, 3)
 _cell_matrix(L::Tuple) = Matrix(Diagonal(collect(Float64.(L))))
 _cell_matrix(A::AbstractMatrix) = Matrix{Float64}(A)
@@ -126,7 +163,7 @@ mutable struct PeriodicPlan
     sample_once::Bool
     copysrc::Vector{Int}          # tiled cells: box whose samples a box copies (0: sampled)
     s::DMKSetup
-    wplan::WidePlan
+    wplan::Union{WidePlan,SlabWide}
     wn::Vector{Float64}
     dn::Vector{Float64}
     taylor::NTuple{3,Float64}
@@ -154,30 +191,32 @@ eps ≥ 1e-6).
 """
 function periodic_plan(f, cell; eps::Real = 1e-6, norder::Int = 16, rc_factor::Real = 0.25, nhalo::Int = 1,
                        f_batch = nothing, skip_negligible::Bool = true, interpolate::Bool = true, sample_once::Bool = true,
-                       targets::Union{Nothing,AbstractMatrix} = nothing, near32::Union{Nothing,Bool} = nothing)
-    f_batch === nothing || (f = _BatchDensity(f_batch))
-    f === nothing && throw(ArgumentError("provide a density f or a batch density f_batch"))
+                       targets::Union{Nothing,AbstractMatrix} = nothing, near32::Union{Nothing,Bool} = nothing,
+                       slab::Bool = false, zorg::Real = 0.0, rc::Union{Nothing,Real} = nothing,
+                       zres::Union{Nothing,Real} = nothing)
+    f = _density(f, f_batch, Float64(zorg))
     old_ftz = get_zero_subnormals()
     set_zero_subnormals(true)
     try
         return _periodic_plan(f, _cell_matrix(cell), Float64(eps), norder, Float64(rc_factor), nhalo,
                               skip_negligible, interpolate, sample_once, targets === nothing ? nothing : Matrix{Float64}(targets),
-                              near32)
+                              near32, slab, Float64(zorg), rc, zres === nothing ? nothing : Float64(zres))
     finally
         set_zero_subnormals(old_ftz)
     end
 end
 
 function _periodic_plan(f, A::Matrix{Float64}, eps::Float64, n::Int, rc_factor::Float64, nhalo::Int,
-                        skip::Bool, interpolate::Bool, sample_once::Bool, targets, near32)
+                        skip::Bool, interpolate::Bool, sample_once::Bool, targets, near32,
+                        slab::Bool = false, zorg::Float64 = 0.0, rcin = nothing, zres = nothing)
     nhalo >= 1 || throw(ArgumentError("nhalo must be ≥ 1"))
     0 < rc_factor < 0.95 || throw(ArgumentError("need 0 < rc_factor < 0.95"))
     size(A) == (3, 3) && abs(det(A)) > 0 || throw(ArgumentError("degenerate cell"))
     _, U = _lattice_qr(A)
     Uinv = inv(UpperTriangular(U))
-    dmin = minimum(1 / norm(Uinv[i, :]) for i in 1:3)
-    rc = dmin / ceil(1 / rc_factor * (1 - 1e-12))
-    g = PeriodicGrid(A, rc, nhalo)
+    dmin = slab ? min(A[1, 1], A[2, 2]) : minimum(1 / norm(Uinv[i, :]) for i in 1:3)
+    rc = rcin === nothing ? dmin / ceil(1 / rc_factor * (1 - 1e-12)) : Float64(rcin)
+    g = PeriodicGrid(A, rc, nhalo; slab, zorg, zres)
 
     t0 = time_ns()
     ft, fvals, istarget, core, origin, tsample = build_periodic_forest(f, g; norder = n, eps = eps, min_levels = 1,
@@ -206,7 +245,7 @@ function _periodic_plan(f, A::Matrix{Float64}, eps::Float64, n::Int, rc_factor::
     # dense same-level near field in single precision at eps ≥ 1e-6 (as the C++ code)
     s = DMKSetup(ft, LegendreBasis(), n, 1, eps, 1, r0, wn, dn, taylor; asym_safety = 1e-4, istarget,
                  near32 = near32 === nothing ? eps >= 0.99e-6 : near32)
-    wplan = WidePlan(g, eps, wide_orders(eps, s.porder, n, rc)..., tsw, wsw)
+    wplan = (slab ? SlabWide : WidePlan)(g, eps, wide_orders(eps, s.porder, n, rc)..., tsw, wsw)
     copysrc = g.tiled ? _copy_sources(ft, g) : zeros(Int, ft.nboxes)
     all(b -> origin[b] != _COPY || copysrc[b] > 0, 1:ft.nboxes) || error("copied box without a source")
     pot = Array{Float64}(undef, n, n, n, ft.nboxes)
@@ -241,8 +280,7 @@ Solve on the plan's forest for the density `f` (resampled unless the plan's
 samples are fresh). `timings` as for [`bdmk_periodic`](@ref).
 """
 function periodic_solve!(plan::PeriodicPlan, f; f_batch = nothing, timings::Union{Nothing,Vector{Float64}} = nothing)
-    f_batch === nothing || (f = _BatchDensity(f_batch))
-    f === nothing && throw(ArgumentError("provide a density f or a batch density f_batch"))
+    f = _density(f, f_batch, plan.g.zorg)
     old_ftz = get_zero_subnormals()
     set_zero_subnormals(true)
     try
@@ -433,13 +471,51 @@ function _source_boxes(ft::FlatTree, fvals, eps::Float64, Sn::Float64)
     return src
 end
 
+# ∫|f| over a box (side h) from its node values; w3 the tensor Gauss-Legendre weights.
+function _box_l1(fb, w3::Vector{Float64}, h::Float64)
+    s = 0.0
+    @inbounds for i in eachindex(w3)
+        s += abs(fb[i]) * w3[i]
+    end
+    return s * (h / 2)^3
+end
+
+# The density as given (point by point or batch), in the solver frame: the
+# slab frame starts at z = zorg of the caller's frame.
+function _density(f, f_batch, zorg::Float64)
+    if f_batch !== nothing
+        zorg == 0 && return _BatchDensity(f_batch)
+        return _BatchDensity((v, p) -> begin
+            p3 = view(p, 3, :)
+            p3 .+= zorg
+            f_batch(v, p)
+            p3 .-= zorg
+            v
+        end)
+    end
+    f === nothing && throw(ArgumentError("provide a density f or a batch density f_batch"))
+    zorg == 0 && return f
+    return _ZShifted(f, zorg)
+end
+
+struct _ZShifted{F}
+    f::F
+    z0::Float64
+end
+function (s::_ZShifted)(p)
+    p[3] += s.z0
+    v = s.f(p)
+    p[3] -= s.z0
+    return v
+end
+
 _tensor_weights(n::Int) = (w = ortho1d(LegendreBasis(), n).w; vec([w[i] * w[j] * w[k] for i in 1:n, j in 1:n, k in 1:n]))
 
 # Mean of f over the cell from the root-cell moments (u-measure).
 _cell_mean(P::WidePlan, M::Array{Float64,3}) =
     sum(M[1 + P.pf * s1, 1 + P.pf * s2, 1 + P.pf * s3] for s1 in 0:(P.mt[1] - 1), s2 in 0:(P.mt[2] - 1), s3 in 0:(P.mt[3] - 1)) / prod(P.mt)
 
-function _periodic_steps!(pot4, s::DMKSetup, g::PeriodicGrid, fvals::Array{Float64,4}, wplan::WidePlan, Msrc, tm)
+function _periodic_steps!(pot4, s::DMKSetup, g::PeriodicGrid, fvals::Array{Float64,4}, wplan, Msrc, tm)
     ft, n, p = s.ft, s.n, s.porder
     nb = ft.nboxes
     fv = reshape(fvals, n, n, n, 1, nb)
@@ -476,9 +552,9 @@ end
 # Central level-0 box (0-based central grid indices) of each level-0 box, or nothing.
 function _central_index(g::PeriodicGrid, ibox::Int)
     m1, m2 = g.mle[1], g.mle[2]
-    i = (ibox - 1) % m1 - g.nhalo
-    j = ((ibox - 1) ÷ m1) % m2 - g.nhalo
-    k = (ibox - 1) ÷ (m1 * m2) - g.nhalo
+    i = (ibox - 1) % m1 - g.halo[1]
+    j = ((ibox - 1) ÷ m1) % m2 - g.halo[2]
+    k = (ibox - 1) ÷ (m1 * m2) - g.halo[3]
     (0 <= i < g.mgrid[1] && 0 <= j < g.mgrid[2] && 0 <= k < g.mgrid[3]) || return nothing
     return (i, j, k)
 end
@@ -488,7 +564,7 @@ end
 # downward pass) and evaluated directly on leaf boxes. For a tiled cell the
 # moments are those of the central cubes (proxy charges of the upward pass).
 # Returns the mean of f over the cell.
-function _wide_inject!(pot, pp, pc, nodeidx, s::DMKSetup, g::PeriodicGrid, fv, P::WidePlan, Msrc)
+function _wide_inject!(pot, pp, pc, nodeidx, s::DMKSetup, g::PeriodicGrid, fv, P, Msrc)
     ft, p = s.ft, s.porder
     pf, pe = P.pf, P.pe
     boxes = [(ibox, c) for ibox in levelboxes(ft, 0) for c in (_central_index(g, ibox),) if c !== nothing]
@@ -509,8 +585,23 @@ function _wide_inject!(pot, pp, pc, nodeidx, s::DMKSetup, g::PeriodicGrid, fv, P
             M[pf * i + 1:pf * (i + 1), pf * j + 1:pf * (j + 1), pf * k + 1:pf * (k + 1)] .= sc .* view(q, 1:pf, 1:pf, 1:pf)
         end
     end
-    G = wide_modes(P, M, s.arena)
-    C = wide_coefficients(P, G, s.arena)
+    if P isa SlabWide
+        # (names not shared with the threaded closure above, which would capture them)
+        qtot = _slab_charge(P, M, g.rc)
+        w3 = _tensor_weights(s.n)
+        lv = [b for b in 1:ft.nboxes if ft.nchild[b] == 0 && !_inhalo(g, view(ft.centers, :, b))]
+        l1 = zeros(length(lv))
+        parallel_foreach(collect(eachindex(lv)), fill(nothing, _nthreads())) do i, _
+            l1[i] = _box_l1(view(fv, :, :, :, 1, lv[i]), w3, ft.boxsize[ft.level[lv[i]] + 1])
+        end
+        qabs = sum(l1)
+        abs(qtot) <= max(10 * s.eps, 1e-12) * qabs ||
+            throw(ArgumentError("a quasi-2D density must be neutral (total charge $qtot, ∫|f| ≈ $qabs)"))
+        C = slab_coefficients(P, M, s.arena)
+    else
+        G = wide_modes(P, M, s.arena)
+        C = wide_coefficients(P, G, s.arena)
+    end
     parallel_foreach([b for b in boxes if s.istarget[b[1]]], wks) do (ibox, (i, j, k)), w
         cb = reshape(view(w.w3, 1:p^3), p, p, p)
         fill!(cb, 0.0)
@@ -523,11 +614,16 @@ function _wide_inject!(pot, pp, pc, nodeidx, s::DMKSetup, g::PeriodicGrid, fv, P
             vec(view(pp, :, 1, 1, nodeidx[ibox])) .+= vec(cb)
         end
     end
-    return _cell_mean(P, M)
+    return P isa SlabWide ? 0.0 : _cell_mean(P, M)
 end
 
 # Rotated-frame image in the cell of the point x (original frame).
 function _wrap_into_cell(g::PeriodicGrid, x::AbstractVector)
+    if g.slab                                    # periodic in x, y; z inside the slab
+        z = x[3] - g.zorg
+        0 <= z <= g.U[3, 3] || throw(ArgumentError("z = $(x[3]) is outside the slab"))
+        return [mod(x[1], g.U[1, 1]), mod(x[2], g.U[2, 2]), z]
+    end
     t = g.Uinv * (transpose(g.Q) * x)            # fractional coordinates
     t .-= floor.(t)
     return g.U * t

@@ -16,6 +16,7 @@ makedocs(;
         "Home" => "index.md",
         "Free-space potentials" => "freespace.md",
         "Periodic potentials" => "periodic.md",
+        "Quasi-2D potentials" => "q2d.md",
         "Performance" => "performance.md",
         "Implementation notes" => "implementation.md",
         "API reference" => "api.md",

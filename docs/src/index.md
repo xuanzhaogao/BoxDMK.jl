@@ -16,6 +16,8 @@ kernel-splitting method (box DMK), in pure Julia:
   triclinic cell, neutral or charged (uniform neutralizing background). A port
   of the C++ periodic box DMK (PeriodicDMK), with exact reciprocal-space
   transforms of the long-range part, faster than the C++ code.
+- **Quasi-2D**: the Coulomb potential of a neutral density in a slab,
+  periodic in x and y and free in z, without zero padding in z.
 
 ## Installation
 
@@ -58,6 +60,7 @@ evaluate_periodic(res, [0.3, 0.7, 0.9])
   density functions.
 - [Periodic potentials](@ref): cells, plans for repeated solves, options, the
   method and its accuracy.
+- [Quasi-2D (slab) potentials](@ref): slabs periodic in two directions.
 - [Performance](@ref): benchmarks against the Fortran and C++ codes.
 - [Implementation notes](@ref): how the solvers are organized and where the
   speed comes from.

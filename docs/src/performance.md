@@ -92,3 +92,23 @@ GEMM-bound stages dominate: plane waves 0.92 s, near field 0.87 s, upward pass
 0.38 s. Their kernels run at the FP64 peak. At 48 threads the plane
 waves (≈ 75 ms) are bound by memory bandwidth: the expansions of a level are
 hundreds of MB.
+
+## Quasi-2D slab
+
+`benchmark/q2d_bench.jl`: a 100 × 100 × 1 slab (periodic in x and y) with a
+neutral mixture of 64 Gaussians (exponents 200–2000) near the mid-plane,
+evaluated through a cell list. The defaults are used (`rc = 25`, so the slab
+boxes are refined to side ≤ 1), `norder = 16`, genoa, one socket. "Points"
+counts the nodes of the leaves in the slab. The error is measured at 40 points
+near the charges against the 2-periodic Ewald sum
+(`benchmark/results/q2d/genoa_100x100x1.log`).
+
+| eps | points | 48 threads: sampling + rest | 1 thread: sampling + rest | rest, 1 / 48 threads | max error / max\|u\| |
+|---|---|---|---|---|---|
+| 1e-3 | 169 M | 0.55 + 0.96 s | 11.0 + 5.2 s | 32 / 175 Mpoints/s | 3.5e-6 |
+| 1e-6 | 213 M | 0.59 + 1.74 s | 12.4 + 19.2 s | 11 / 122 Mpoints/s | 3.0e-9 |
+| 1e-9 | 284 M | 0.82 + 4.42 s | 16.1 + 101.6 s | 2.8 / 64 Mpoints/s | 1.8e-10 |
+
+The wide part (in-plane modes and z-kernel matrices) takes 13–28 ms of this at
+48 threads. Most leaves are empty slab boxes, which is why the throughput is
+higher than in the 3D benchmarks.

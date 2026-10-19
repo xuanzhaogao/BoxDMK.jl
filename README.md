@@ -14,6 +14,8 @@ method (box DMK), in pure Julia.
 - **Periodic**: the Coulomb potential of a periodic density on any triclinic
   cell, neutral or charged. A port of the C++ periodic box DMK (PeriodicDMK)
   with exact reciprocal-space transforms, faster than the C++ code.
+- **Quasi-2D**: slabs periodic in x and y and free in z (`bdmk_q2d`), with
+  exact Gaussian kernel matrices in z instead of zero padding.
 
 ## Installation
 

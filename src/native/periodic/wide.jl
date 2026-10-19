@@ -266,7 +266,7 @@ wide_coefficients(P::WidePlan, G::NTuple{2,Array{Float64,3}}, ar::Arena) =
     P.E2 === nothing ? _wide_coefs_triangular(P, G..., ar) : _wide_coefs_separable(P, G..., ar)
 
 # Ct[r₃, r₂, r₁] = Re Σ_{m₁ ≥ 0} A[r₃, r₂, m₁] E₁[m₁, r₁] (weighted rows of E₁).
-function _wide_coefs_final(P::WidePlan, Ar::Array{Float64,3}, Ai::Array{Float64,3}, ar::Arena)
+function _wide_coefs_final(P, Ar::Array{Float64,3}, Ai::Array{Float64,3}, ar::Arena)
     R3, R2, H1 = size(Ar)
     E1r, E1i = P.E1
     Ct = alloc(ar, R3, R2, size(E1r, 2))

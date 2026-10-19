@@ -22,6 +22,13 @@ PeriodicPlan
 periodic_solve!
 ```
 
+## Quasi-2D
+
+```@docs
+bdmk_q2d
+q2d_plan
+```
+
 ## Kernels and bases
 
 ```@docs

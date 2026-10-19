@@ -46,6 +46,10 @@ the work:
   real) and keep real and imaginary parts as separate arrays. Every
   contraction is a set of real GEMMs threaded over slices or row blocks, so
   OpenBLAS threads never compete with Julia's.
+- `slab.jl`: the wide part of quasi-2D slabs. In-plane transforms as in
+  `wide.jl`, exact Gaussian z-kernel matrices between the level-0 z-cells per
+  wide Gaussian, and the ``\dot k = 0`` kernel ``D(z)`` of all wide
+  Gaussians.
 - `periodic.jl`: the u-series SOG, the plan and the solve (narrow Gaussians
   through the free-space machinery, the wide term injected before the
   downward pass, the neutralizing background).
