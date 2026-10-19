@@ -58,7 +58,7 @@ end
 
 """
     bdmk_periodic(f, cell; eps=1e-6, norder=16, rc_factor=0.25, nhalo=1, f_batch=nothing,
-                  skip_negligible=true, interpolate=true, timings=nothing)
+                  skip_negligible=true, interpolate=true, sample_once=true, timings=nothing)
 
 Periodic Coulomb potential
 
@@ -76,10 +76,16 @@ boxes whose density is too small to change the potential by `eps` relative
 are left out of the real-space part (see `_source_boxes`). With `interpolate`
 (cells whose level-0 cubes do not tile the cell) only the boxes meeting the
 cell sample `f`, the others interpolate them at periodic images; `false` gives
-the forest of the C++ builder. `targets` (3 × N
+the forest of the C++ builder. With `sample_once`, `f` is evaluated only by
+the adaptive refinement of the boxes that meet the cell: the boxes added for
+the 2:1 balance take their parent's polynomial and the wide source tree of
+non-tiled cells interpolates the forest (values accurate to `eps` instead of
+to rounding; `false` samples `f` everywhere, as the C++ code). `targets` (3 × N
 points) restricts the computation to the leaves holding them and returns the
 potential there in `target_pot`. `timings` (length ≥ 6)
-receives wall times (s): [1] forest, [2] setup and wide source, [3] local
+receives wall times (s): [1] sampling (the adaptive refinement that evaluates
+`f`; with `sample_once = false` the whole forest), [2] the rest of the forest,
+setup and wide source, [3] local
 expansions + upward pass, [4] wide part, [5] plane waves, [6] near field, and
 if length ≥ 10 the plane-wave split [7] formation, [8] translation,
 [9] evaluation, [10] downward pass.
@@ -91,7 +97,7 @@ function bdmk_periodic(f, cell; f_batch = nothing, timings::Union{Nothing,Vector
     plan = periodic_plan(f, cell; f_batch, kwargs...)
     tb = (time_ns() - t0) / 1e9
     res = periodic_solve!(plan, f; f_batch, timings = tm)
-    tm[1] = plan.tforest; tm[2] += tb - plan.tforest
+    tm[1] = plan.tsample; tm[2] += tb - plan.tsample
     return res
 end
 
@@ -116,6 +122,8 @@ mutable struct PeriodicPlan
     eps::Float64
     istarget::BitVector
     core::BitVector
+    origin::Vector{UInt8}         # where each box's values come from (_SAMPLED, _FROMPARENT, _INTERP, _COPY)
+    sample_once::Bool
     copysrc::Vector{Int}          # tiled cells: box whose samples a box copies (0: sampled)
     s::DMKSetup
     wplan::WidePlan
@@ -127,13 +135,15 @@ mutable struct PeriodicPlan
     pot::Array{Float64,4}
     fresh::Bool                   # fvals hold the samples of the plan's density
     tforest::Float64
+    tsample::Float64              # part of tforest evaluating f
     targets::Union{Nothing,Matrix{Float64}}
     iws::Any                      # interpolation workspaces of `_resample!` (created on first use)
 end
 
 """
     periodic_plan(f, cell; eps=1e-6, norder=16, rc_factor=0.25, nhalo=1, f_batch=nothing,
-                  skip_negligible=true, interpolate=true, targets=nothing, near32=nothing) -> PeriodicPlan
+                  skip_negligible=true, interpolate=true, sample_once=true, targets=nothing,
+                  near32=nothing) -> PeriodicPlan
 
 Forest (adapted to `f`), tables and buffers of [`bdmk_periodic`](@ref), for
 repeated solves with [`periodic_solve!`](@ref); the options are those of
@@ -143,7 +153,7 @@ runs the dense same-level near field in single precision (default: when
 eps ≥ 1e-6).
 """
 function periodic_plan(f, cell; eps::Real = 1e-6, norder::Int = 16, rc_factor::Real = 0.25, nhalo::Int = 1,
-                       f_batch = nothing, skip_negligible::Bool = true, interpolate::Bool = true,
+                       f_batch = nothing, skip_negligible::Bool = true, interpolate::Bool = true, sample_once::Bool = true,
                        targets::Union{Nothing,AbstractMatrix} = nothing, near32::Union{Nothing,Bool} = nothing)
     f_batch === nothing || (f = _BatchDensity(f_batch))
     f === nothing && throw(ArgumentError("provide a density f or a batch density f_batch"))
@@ -151,14 +161,15 @@ function periodic_plan(f, cell; eps::Real = 1e-6, norder::Int = 16, rc_factor::R
     set_zero_subnormals(true)
     try
         return _periodic_plan(f, _cell_matrix(cell), Float64(eps), norder, Float64(rc_factor), nhalo,
-                              skip_negligible, interpolate, targets === nothing ? nothing : Matrix{Float64}(targets), near32)
+                              skip_negligible, interpolate, sample_once, targets === nothing ? nothing : Matrix{Float64}(targets),
+                              near32)
     finally
         set_zero_subnormals(old_ftz)
     end
 end
 
 function _periodic_plan(f, A::Matrix{Float64}, eps::Float64, n::Int, rc_factor::Float64, nhalo::Int,
-                        skip::Bool, interpolate::Bool, targets, near32)
+                        skip::Bool, interpolate::Bool, sample_once::Bool, targets, near32)
     nhalo >= 1 || throw(ArgumentError("nhalo must be ≥ 1"))
     0 < rc_factor < 0.95 || throw(ArgumentError("need 0 < rc_factor < 0.95"))
     size(A) == (3, 3) && abs(det(A)) > 0 || throw(ArgumentError("degenerate cell"))
@@ -169,7 +180,8 @@ function _periodic_plan(f, A::Matrix{Float64}, eps::Float64, n::Int, rc_factor::
     g = PeriodicGrid(A, rc, nhalo)
 
     t0 = time_ns()
-    ft, fvals, istarget, core = build_periodic_forest(f, g; norder = n, eps = eps, min_levels = 1, interpolate)
+    ft, fvals, istarget, core, origin, tsample = build_periodic_forest(f, g; norder = n, eps = eps, min_levels = 1,
+                                                                       interpolate, sample_once)
     tforest = (time_ns() - t0) / 1e9
 
     r0, ws, ts = useries_sog(round(Int, -log10(eps)), rc)
@@ -196,9 +208,10 @@ function _periodic_plan(f, A::Matrix{Float64}, eps::Float64, n::Int, rc_factor::
                  near32 = near32 === nothing ? eps >= 0.99e-6 : near32)
     wplan = WidePlan(g, eps, wide_orders(eps, s.porder, n, rc)..., tsw, wsw)
     copysrc = g.tiled ? _copy_sources(ft, g) : zeros(Int, ft.nboxes)
+    all(b -> origin[b] != _COPY || copysrc[b] > 0, 1:ft.nboxes) || error("copied box without a source")
     pot = Array{Float64}(undef, n, n, n, ft.nboxes)
-    return PeriodicPlan(g, ft, n, eps, istarget, core, copysrc, s, wplan, wn, dn, Tuple(taylor), skip,
-                        fvals, pot, true, tforest, targets, nothing)
+    return PeriodicPlan(g, ft, n, eps, istarget, core, origin, sample_once, copysrc, s, wplan, wn, dn, Tuple(taylor), skip,
+                        fvals, pot, true, tforest, tsample, targets, nothing)
 end
 
 # Tiled cells: for each box below a halo root, the box at the same place
@@ -243,10 +256,11 @@ function _periodic_solve!(plan::PeriodicPlan, f, tm)
     fill!(tm, 0.0)
     g, ft, n, s, eps = plan.g, plan.ft, plan.n, plan.s, plan.eps
     t0 = time_ns()
-    plan.fresh || _resample!(plan, f)
+    tsamp = plan.fresh ? 0.0 : _resample!(plan, f)
     plan.fresh = false
     fvals = plan.fvals
-    tm[1] = (time_ns() - t0) / 1e9
+    tm[1] = tsamp
+    tderive = (time_ns() - t0) / 1e9 - tsamp     # values derived from the samples
 
     t0 = time_ns()
     Sn = sum(plan.wn .* (pi .* plan.dn) .^ 1.5)
@@ -258,9 +272,19 @@ function _periodic_solve!(plan::PeriodicPlan, f, tm)
     if !g.tiled
         w3 = _tensor_weights(n)
         rint0 = sqrt(sum(b -> _box_l2sq(view(fvals, :, :, :, b), w3, g.rc^2 / 8), levelboxes(ft, 0)))
-        Msrc = fractional_moments(f, g, ft, n, plan.wplan.pf, eps * g.rc^-1.5 * rint0)
+        if plan.sample_once
+            ar = Arena()
+            try
+                Msrc = fractional_moments(_ForestSource(ft, g, fvals, n, ar), g, ft, n, plan.wplan.pf,
+                                          eps * g.rc^-1.5 * rint0)
+            finally
+                release!(ar)
+            end
+        else
+            Msrc = fractional_moments(f, g, ft, n, plan.wplan.pf, eps * g.rc^-1.5 * rint0)
+        end
     end
-    tm[2] = (time_ns() - t0) / 1e9
+    tm[2] = tderive + (time_ns() - t0) / 1e9
     try
         pot = plan.pot
         fmean = _periodic_steps!(pot, s, g, fvals, plan.wplan, Msrc, tm)
@@ -283,18 +307,59 @@ function _periodic_solve!(plan::PeriodicPlan, f, tm)
     end
 end
 
-# New density on the plan's forest: sample the boxes that sample, copy the
-# lattice images, interpolate the rest from the core leaves.
+# New density on the plan's forest; returns the time spent evaluating f.
+# sample_once: f on the leaves of the adaptive refinement (and the level-0
+# boxes, whose norm sets the wide-source threshold), then the other boxes
+# from the polynomials as when the forest was built: children of the balance
+# from their parents, lattice images by copy, non-core boxes from the core
+# leaves. Otherwise f on every box that sampled it.
 function _resample!(plan::PeriodicPlan, f)
     g, ft, n = plan.g, plan.ft, plan.n
     x = ortho1d(LegendreBasis(), n).x
     fvals = plan.fvals
-    sampled = [b for b in 1:ft.nboxes if plan.core[b] && plan.copysrc[b] == 0]
-    _sample_flat!(fvals, ft, g, f, sampled, x)
-    parallel_foreach([b for b in 1:ft.nboxes if plan.copysrc[b] > 0], fill(nothing, _nthreads())) do b, _
+    org = plan.origin
+    nb = ft.nboxes
+    nt = fill(nothing, _nthreads())
+    copyboxes(bs) = parallel_foreach(bs, nt) do b, _
         view(fvals, :, :, :, b) .= view(fvals, :, :, :, plan.copysrc[b])
     end
-    others = [b for b in 1:ft.nboxes if !plan.core[b]]
+    if !plan.sample_once
+        t0 = time_ns()
+        _sample_flat!(fvals, ft, g, f, [b for b in 1:nb if plan.core[b] && plan.copysrc[b] == 0], x)
+        tsamp = (time_ns() - t0) / 1e9
+        copyboxes([b for b in 1:nb if plan.copysrc[b] > 0])
+        _resample_noncore!(plan, [b for b in 1:nb if !plan.core[b]], x)
+        return tsamp
+    end
+    sampled = [b for b in 1:nb if org[b] == _SAMPLED &&
+               (ft.nchild[b] == 0 || org[ft.child[1, b]] != _SAMPLED || (ft.level[b] == 0 && !g.tiled))]
+    t0 = time_ns()
+    _sample_flat!(fvals, ft, g, f, sampled, x)
+    tsamp = (time_ns() - t0) / 1e9
+    fp = _FromParent(n)
+    np = n^3
+    ws = [(zeros(np), zeros(np)) for _ in 1:_nthreads()]
+    derive(bs) = parallel_foreach(bs, ws) do b, (w1, w2)
+        P = ft.parent[b]
+        _parent_to_child!(view(fvals, :, :, :, b), view(fvals, :, :, :, P), fp, findfirst(==(b), view(ft.child, :, P)) - 1,
+                          w1, w2)
+    end
+    lev(L, pred) = [b for b in levelboxes(ft, L) if pred(b)]
+    copyboxes(lev(0, b -> org[b] == _COPY))
+    for L in 1:ft.nlevels                   # parents before children, images after their sources
+        derive(lev(L, b -> org[b] == _FROMPARENT && plan.core[b]))
+        copyboxes(lev(L, b -> org[b] == _COPY))
+    end
+    _resample_noncore!(plan, [b for b in 1:nb if org[b] == _INTERP], x)
+    for L in 1:ft.nlevels
+        derive(lev(L, b -> org[b] == _FROMPARENT && !plan.core[b]))
+    end
+    return tsamp
+end
+
+# Non-core boxes `others` from the core leaves at the images of their nodes.
+function _resample_noncore!(plan::PeriodicPlan, others, x)
+    g, ft, n, fvals = plan.g, plan.ft, plan.n, plan.fvals
     isempty(others) && return plan
     ar = Arena()
     try

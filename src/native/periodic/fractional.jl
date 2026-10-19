@@ -23,6 +23,129 @@ function _locate_leaf(ft::FlatTree, g::PeriodicGrid, x)
     return ibox
 end
 
+# The density of the main forest (Legendre polynomials of its central
+# leaves) as the source of the fractional tree, when f is sampled once.
+struct _ForestSource
+    ft::FlatTree
+    g::PeriodicGrid
+    coef::Vector{Vector{Float64}}   # Legendre coefficients of the central leaves
+end
+
+function _ForestSource(ft::FlatTree, g::PeriodicGrid, fvals::Array{Float64,4}, n::Int, ar::Arena)
+    leaves = [b for b in 1:ft.nboxes if ft.nchild[b] == 0 && !_inhalo(g, view(ft.centers, :, b))]
+    cf = _leaf_coefs(ar, n, [view(fvals, :, :, :, b) for b in leaves])
+    coef = Vector{Vector{Float64}}(undef, ft.nboxes)
+    for (i, b) in enumerate(leaves)
+        coef[b] = cf[i]
+    end
+    return _ForestSource(ft, g, coef)
+end
+
+# Values of the fractional boxes `bs` from the forest. The nodes of a box are
+# y = Ur u on its tensor grid u, with Ur upper triangular: y₃ depends on the
+# z index k only, y₂ on (j, k). On each forest leaf the polynomial is thus
+# contracted along z per k, along y per (j, k) and along x per node (≈ 6n⁴
+# flops for a box in one leaf instead of 2n⁶ point by point).
+function _sample!(F::_Forest, fs::_ForestSource, bs, x::Vector{Float64})
+    n = F.n; np = n^3
+    length(F.fvals) < _nbox(F) && resize!(F.fvals, _nbox(F))
+    for b in bs
+        F.fvals[b] = alloc(F.ar, np)
+    end
+    Ur = Matrix(transpose(fs.g.Q)) * F.R                  # u -> rotated frame (upper triangular)
+    ws = [(gid = zeros(Int, np), grp = Int[], y1 = zeros(np), y2 = zeros(n, n), y3 = zeros(n),
+           P = zeros(n, n), D = alloc(F.ar, n * n, n), E = zeros(n, n), ks = zeros(Int, n), js = zeros(Int, n),
+           pv = zeros(n)) for _ in 1:_nthreads()]
+    parallel_foreach(collect(bs), ws) do b, w
+        c = F.centers[b]
+        h = F.boxsize[F.level[b] + 1] / 2
+        _forest_values!(F.fvals[b], c, h, x, Ur, fs, n, w)
+    end
+    return F
+end
+
+function _forest_values!(v, c, h::Float64, x::Vector{Float64}, Ur::Matrix{Float64}, fs::_ForestSource, n::Int, w)
+    ft, g = fs.ft, fs.g
+    y1, y2, y3, gid, grp = w.y1, w.y2, w.y3, w.gid, w.grp
+    @inbounds for k in 1:n
+        u3 = c[3] + h * x[k]
+        y3[k] = Ur[3, 3] * u3
+        for j in 1:n
+            u2 = c[2] + h * x[j]
+            y2[j, k] = Ur[2, 2] * u2 + Ur[2, 3] * u3
+        end
+    end
+    # leaf of each node (the previous node's leaf when it strictly holds it)
+    empty!(grp)
+    Lc = 0; lo = (0.0, 0.0, 0.0); hi = (0.0, 0.0, 0.0); gc = 0
+    q = 0
+    @inbounds for k in 1:n, j in 1:n, i in 1:n
+        q += 1
+        y = (Ur[1, 1] * (c[1] + h * x[i]) + Ur[1, 2] * (c[2] + h * x[j]) + Ur[1, 3] * (c[3] + h * x[k]), y2[j, k], y3[k])
+        y1[q] = y[1]
+        if !(Lc != 0 && lo[1] < y[1] < hi[1] && lo[2] < y[2] < hi[2] && lo[3] < y[3] < hi[3])
+            Lc = _locate_leaf(ft, g, y)
+            hl = ft.boxsize[ft.level[Lc] + 1] / 2
+            lo = (ft.centers[1, Lc] - hl, ft.centers[2, Lc] - hl, ft.centers[3, Lc] - hl)
+            hi = (ft.centers[1, Lc] + hl, ft.centers[2, Lc] + hl, ft.centers[3, Lc] + hl)
+            gc = 0
+            for e in eachindex(grp)
+                grp[e] == Lc && (gc = e; break)
+            end
+            gc == 0 && (push!(grp, Lc); gc = length(grp))
+        end
+        gid[q] = gc
+    end
+    P, D, E, ks, js, pv = w.P, w.D, w.E, w.ks, w.js, w.pv
+    nn = n * n
+    for (gi, L) in enumerate(grp)
+        hl = ft.boxsize[ft.level[L] + 1] / 2
+        cl = (ft.centers[1, L], ft.centers[2, L], ft.centers[3, L])
+        C = fs.coef[L]
+        # z: D[:, r] = C (n² × n) P₃(ξ₃(k_r)) for the k holding nodes of this leaf
+        nk = 0
+        @inbounds for k in 1:n
+            any(q -> gid[q] == gi, (1 + nn * (k - 1)):(nn * k)) || continue
+            ks[nk += 1] = k
+            legepols!(pv, (y3[k] - cl[3]) / hl, n)
+            for a in 1:n
+                P[a, nk] = pv[a]
+            end
+        end
+        GC.@preserve C D P gemm!(pointer(D), nn, pointer(C), nn, pointer(P), n, nn, nk, n, 1.0, false)
+        for r in 1:nk
+            k = ks[r]
+            # y: E[:, s] = D_k (n × n) P₂(ξ₂(j_s, k))
+            nj = 0
+            @inbounds for j in 1:n
+                o = n * (j - 1) + nn * (k - 1)
+                any(i -> gid[o + i] == gi, 1:n) || continue
+                js[nj += 1] = j
+                legepols!(pv, (y2[j, k] - cl[2]) / hl, n)
+                for a in 1:n
+                    P[a, nj] = pv[a]
+                end
+            end
+            GC.@preserve D E P gemm!(pointer(E), n, pointer(D) + 8 * nn * (r - 1), n, pointer(P), n, n, nj, n, 1.0, false)
+            # x: per node
+            @inbounds for s in 1:nj
+                j = js[s]
+                o = n * (j - 1) + nn * (k - 1)
+                for i in 1:n
+                    gid[o + i] == gi || continue
+                    legepols!(pv, (y1[o + i] - cl[1]) / hl, n)
+                    t = 0.0
+                    @simd for a in 1:n
+                        t = muladd(pv[a], E[a, s], t)
+                    end
+                    v[o + i] = t
+                end
+            end
+        end
+    end
+    return v
+end
+
 """
     fractional_moments(f, g, ft, norder, pf, thr) -> M
 

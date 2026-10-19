@@ -62,6 +62,29 @@ All are on by default and change the result by less than `eps`:
 - **Single-precision near field** (`near32`, default for `eps ≥ 1e-6`). The
   dense same-level near field runs in Float32.
 
+## Sampling the density once
+
+With `sample_once = true` (the default), ``f`` is evaluated only by the
+adaptive refinement of the boxes that meet the cell. That is the one stage
+that needs ``f``, to decide the forest. Everything after it works on the
+polynomials, which resolve ``f`` to `eps`:
+
+- the boxes added for the 2:1 balance take their parent's polynomial;
+- the boxes outside the cell copy their lattice images or interpolate the
+  core leaves (see above);
+- the wide source tree of non-tiled cells interpolates the forest leaves
+  instead of sampling ``f`` again. Its nodes are an affine image of a tensor
+  grid, upper triangular in the rotated frame, so on each leaf the polynomial
+  is contracted along z, then y, then x (about 90 ns per node);
+- a plan re-solve evaluates ``f`` on the leaves of the adaptive refinement
+  only and derives the other boxes in the same way.
+
+`timings[1]` is the sampling stage; the rest of the time does not depend on
+the cost of ``f``. Compared with sampling ``f`` everywhere
+(`sample_once = false`, the C++ rules), ``f`` is called 2–4 times less often,
+the potential changes by less than `eps` (at most 0.4 `eps` in the tests),
+and the accuracy against Ewald is unchanged.
+
 ## Fast densities
 
 At high accuracy, evaluating a point-by-point density can take half of the
@@ -70,7 +93,8 @@ single-thread time. A batch density `f_batch!(values, points)` (`values (1, npts
 example, `density_batch!` in `benchmark/periodic_vs_cpp.jl` evaluates a
 periodized Gaussian mixture on 8 points at a time with SIMD.jl and a
 vectorized `exp`. It is about 30 times faster per point than the scalar
-version and makes the full solve 1.7 times faster (see [Performance](@ref)):
+version. With `sample_once` it shortens only the sampling stage, for example
+0.67 → 0.10 s on the hexagonal cell at `eps = 1e-9` (see [Performance](@ref)):
 
 ```julia
 res = bdmk_periodic(nothing, A; eps = 1e-9, f_batch = (v, p) -> density_batch!(v, p, mixture))

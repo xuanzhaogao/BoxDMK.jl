@@ -40,28 +40,55 @@ takes 7.3 s instead of 13.3 s on the workstation; Julia takes 2.0 s.
 ## Periodic against C++
 
 Against the C++ periodic solver (PeriodicDMK `bench_steps <cell> multi`):
-four Gaussians down to width 0.007, `norder = 16`, genoa node, one socket. Both
-codes evaluate the same density point by point, apply the same work-saving
-rules and exact wide transforms, build the same forest, and agree to
-``2\cdot10^{-13}`` at `eps = 1e-9`. The last column of each group uses the
-SIMD.jl batch density of `benchmark/periodic_vs_cpp.jl` (`DENSITY=simd`)
-instead; the C++ code has no counterpart. Log:
-`benchmark/results/periodic/genoa_simd.log`.
+four Gaussians down to width 0.007, `norder = 16`, one socket of a genoa node,
+each case on its own node (`benchmark/periodic_cases.disbatch`, logs in
+`benchmark/results/periodic/cases/`). Both codes evaluate the same density
+point by point, apply the same work-saving rules and exact wide transforms,
+and build the same forest.
 
-| cell | eps | boxes | 1 thread (s): C++ / Julia / Julia + SIMD density | 48 threads (ms): C++ / Julia / Julia + SIMD density |
-|---|---|---|---|---|
-| cubic | 1e-3 | 624 | 0.32 / 0.31 / 0.08 | 57 / 51 / 31 |
-| cubic | 1e-6 | 1416 | 1.00 / 0.87 / 0.40 | 169 / 107 / 75 |
-| cubic | 1e-9 | 2560 | 3.61 / 3.03 / 2.14 | 328 / 256 / 202 |
-| sheared | 1e-3 | 720 | 0.88 / 0.76 / 0.20 | 91 / 91 / 45 |
-| sheared | 1e-6 | 1960 | 2.36 / 1.80 / 0.75 | 311 / 178 / 112 |
-| sheared | 1e-9 | 4048 | 7.06 / 5.23 / 3.20 | 542 / 366 / 241 |
-| hexagonal | 1e-3 | 920 | 0.88 / 0.72 / 0.21 | 105 / 60 / 62 |
-| hexagonal | 1e-6 | 2160 | 2.06 / 1.53 / 0.67 | 299 / 134 / 100 |
-| hexagonal | 1e-9 | 5648 | 7.43 / 5.45 / 3.19 | 657 / 361 / 262 |
+The Julia time is split into the *sampling* stage, the adaptive refinement
+that evaluates the density (its cost depends on how ``f`` is implemented), and
+the *rest*, which does not depend on ``f`` (see
+[Sampling the density once](@ref)). The columns are:
 
-Where the time goes (hexagonal cell, `eps = 1e-9`, SIMD density): at one
-thread, the GEMM-bound stages dominate: plane waves 0.92 s, near field 0.87 s,
-upward pass 0.38 s. Their kernels run at the FP64 peak. At 48 threads the plane
+- *f everywhere*: `sample_once = false`, the C++ rules (the potentials agree
+  with C++ to ``2\cdot10^{-13}`` at `eps = 1e-9`);
+- *sampling + rest*: the default `sample_once = true` (agreement with C++ to
+  about `eps`: ``8\cdot10^{-11}`` at `eps = 1e-9`);
+- *SIMD density*: the same with the SIMD.jl batch density of
+  `benchmark/periodic_vs_cpp.jl` (`DENSITY=simd`), for which the C++ code has
+  no counterpart.
+
+1 thread (s):
+
+| cell | eps | boxes | C++ total | Julia, f everywhere | Julia: sampling + rest | Julia, SIMD density: sampling + rest |
+|---|---|---|---|---|---|---|
+| cubic | 1e-3 | 624 | 0.33 | 0.32 | 0.13 + 0.04 | 0.02 + 0.04 |
+| cubic | 1e-6 | 1416 | 1.00 | 0.89 | 0.21 + 0.32 | 0.03 + 0.32 |
+| cubic | 1e-9 | 2560 | 3.63 | 3.02 | 0.60 + 1.99 | 0.09 + 2.06 |
+| sheared | 1e-3 | 720 | 0.87 | 0.76 | 0.18 + 0.19 | 0.03 + 0.18 |
+| sheared | 1e-6 | 1960 | 2.37 | 1.80 | 0.26 + 0.64 | 0.04 + 0.65 |
+| sheared | 1e-9 | 4048 | 7.05 | 5.25 | 0.74 + 3.02 | 0.12 + 3.01 |
+| hexagonal | 1e-3 | 920 | 0.87 | 0.72 | 0.19 + 0.20 | 0.03 + 0.17 |
+| hexagonal | 1e-6 | 2160 | 2.06 | 1.53 | 0.24 + 0.55 | 0.04 + 0.55 |
+| hexagonal | 1e-9 | 5648 | 7.43 | 5.29 | 0.67 + 2.93 | 0.10 + 2.93 |
+
+48 threads (ms):
+
+| cell | eps | boxes | C++ total | Julia, f everywhere | Julia: sampling + rest | Julia, SIMD density: sampling + rest |
+|---|---|---|---|---|---|---|
+| cubic | 1e-3 | 624 | 57 | 32 | 11 + 25 | 3 + 23 |
+| cubic | 1e-6 | 1416 | 171 | 111 | 11 + 59 | 3 + 77 |
+| cubic | 1e-9 | 2560 | 330 | 222 | 24 + 152 | 9 + 194 |
+| sheared | 1e-3 | 720 | 92 | 79 | 13 + 66 | 5 + 68 |
+| sheared | 1e-6 | 1960 | 311 | 169 | 14 + 102 | 4 + 121 |
+| sheared | 1e-9 | 4048 | 538 | 374 | 49 + 212 | 8 + 224 |
+| hexagonal | 1e-3 | 920 | 105 | 86 | 13 + 66 | 3 + 68 |
+| hexagonal | 1e-6 | 2160 | 297 | 140 | 15 + 121 | 8 + 103 |
+| hexagonal | 1e-9 | 5648 | 654 | 383 | 39 + 241 | 9 + 259 |
+
+Where the rest goes (hexagonal cell, `eps = 1e-9`): at one thread, the
+GEMM-bound stages dominate: plane waves 0.92 s, near field 0.87 s, upward pass
+0.38 s. Their kernels run at the FP64 peak. At 48 threads the plane
 waves (≈ 75 ms) are bound by memory bandwidth: the expansions of a level are
 hundreds of MB.

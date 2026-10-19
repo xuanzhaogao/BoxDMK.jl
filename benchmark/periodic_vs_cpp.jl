@@ -7,6 +7,9 @@
 #
 # DENSITY=simd evaluates the density with `density_batch!` (SIMD.jl, through
 # `f_batch`) instead of point by point; the C++ code evaluates it point by point.
+# "sampling" is the adaptive refinement that evaluates f, "rest" everything
+# else. SAMPLE_ONCE=0 samples f everywhere (the C++ rules: box-by-box parity to
+# rounding); by default the potentials agree with C++ to about eps.
 
 using BoxDMK, Printf, LinearAlgebra
 
@@ -133,8 +136,9 @@ f = CppDensity(A, dist == "multi" ? [20000.0, 200, 300, 400] : [60.0, 120, 180, 
 eps = 10.0^-ndig
 
 simd = get(ENV, "DENSITY", "scalar") == "simd"
-solve() = simd ? bdmk_periodic(nothing, A; eps = eps, timings = tm, f_batch = (v, p) -> density_batch!(v, p, f)) :
-                 bdmk_periodic(f, A; eps = eps, timings = tm)
+sample_once = get(ENV, "SAMPLE_ONCE", "1") == "1"
+solve() = simd ? bdmk_periodic(nothing, A; eps, sample_once, timings = tm, f_batch = (v, p) -> density_batch!(v, p, f)) :
+                 bdmk_periodic(f, A; eps, sample_once, timings = tm)
 tm = zeros(10)
 # compile + warm up; like the C++ solver, later solves reuse the buffers
 res = solve()
@@ -145,8 +149,9 @@ for r in 1:reps
 end
 ft = res.ft
 nleaf = count(i -> ft.nchild[i] == 0 && res.istarget[i], 1:ft.nboxes)
-@printf("[JULIA-PERIODIC%s] threads=%d cell=%s dist=%s n=%d | nboxes=%d depth=%d target leaves=%d | total=%.0f ms : forest=%.0f setup+src=%.0f local+up=%.0f wide=%.0f pw=%.0f near=%.0f\n",
-        simd ? " simd-density" : "", Threads.nthreads(), cell, dist, ndig, ft.nboxes, ft.nlevels, nleaf, 1e3best, (1e3 .* tbest[1:6])...)
+@printf("[JULIA-PERIODIC%s%s] threads=%d cell=%s dist=%s n=%d | nboxes=%d depth=%d target leaves=%d | total=%.0f ms = sampling %.0f + rest %.0f : forest+setup+src=%.0f local+up=%.0f wide=%.0f pw=%.0f near=%.0f\n",
+        simd ? " simd-density" : "", sample_once ? "" : " sample-all", Threads.nthreads(), cell, dist, ndig, ft.nboxes, ft.nlevels, nleaf,
+        1e3best, 1e3tbest[1], 1e3 * (best - tbest[1]), (1e3 .* tbest[2:6])...)
 
 function parity(res, potfile, treefile)
     ft = res.ft

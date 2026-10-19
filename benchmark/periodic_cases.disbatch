@@ -1,0 +1,10 @@
+#DISBATCH PREFIX cd /mnt/home/xgao1/project/dmk_boxcode/BoxDMK.jl && bash -l benchmark/periodic_case.sh 
+cubic 3
+cubic 6
+cubic 9
+sheared 3
+sheared 6
+sheared 9
+hex 3
+hex 6
+hex 9

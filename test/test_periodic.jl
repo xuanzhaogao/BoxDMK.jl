@@ -166,6 +166,26 @@ end
         @test_throws ArgumentError evaluate_periodic(rt, A * [0.5, 0.01, 0.99] .+ 1e-3 .* (1:3))
     end
 
+    @testset "sample once" begin
+        A = [1.0 0.35 0.15; 0 1 -0.2; 0 0 1]
+        xs = [Tuple(A * collect(t)) for t in _PXS]
+        g = GaussMixture(A, xs, [2000.0, 200, 300, 400], [1.0, 0.7, -0.5, 0.9])
+        ncall = Threads.Atomic{Int}(0)
+        gc(x) = (Threads.atomic_add!(ncall, 1); g(x))
+        r0 = bdmk_periodic(gc, A; eps = 1e-6, sample_once = false)
+        n0 = ncall[]; ncall[] = 0
+        plan = periodic_plan(gc, A; eps = 1e-6)
+        r1 = periodic_solve!(plan, gc)
+        @test ncall[] < n0 / 2                      # f only in the adaptive refinement
+        lv = [i for i in 1:r1.ft.nboxes if r1.ft.nchild[i] == 0 && r1.istarget[i]]
+        u = maximum(abs, r0.pot)
+        p1 = copy(r1.pot)
+        @test r1.ft.nboxes == r0.ft.nboxes
+        @test maximum(i -> maximum(abs, view(p1, :, :, :, i) .- view(r0.pot, :, :, :, i)), lv) < 1e-6 * u
+        r2 = periodic_solve!(plan, gc)               # resampled, then derived as when built
+        @test maximum(i -> maximum(abs, view(p1, :, :, :, i) .- view(r2.pot, :, :, :, i)), lv) < 1e-13 * u
+    end
+
     @testset "batch density" begin
         g = neutral_mixture((1.0, 1.0, 1.0), _PXS, [60.0, 120, 180, 240], [1.0, 0.7, -0.5, 0.9])
         gb!(v, pts) = (for i in axes(pts, 2); v[1, i] = g(view(pts, :, i)); end)

@@ -52,9 +52,11 @@ Genoa node (AMD EPYC 9474F), `eps = 1e-9`, `norder = 16`:
 | problem | 1 thread | 48 threads |
 |---|---|---|
 | free space, 2129 boxes: Fortran / Julia | 16.9 / 4.37 s | 1.87 / 0.25 s |
-| periodic hexagonal cell, 5648 boxes: C++ / Julia | 7.43 / 5.45 s | 657 / 361 ms |
+| periodic hexagonal cell, 5648 boxes: C++ / Julia | 7.43 / 3.60 s | 654 / 280 ms |
 
-Full tables in the [docs](https://xuanzhaogao.github.io/BoxDMK.jl/dev/performance/).
+Same point-by-point density callback in both codes; of the Julia periodic time,
+0.67 s / 39 ms is sampling the density. Full tables in the
+[docs](https://xuanzhaogao.github.io/BoxDMK.jl/dev/performance/).
 
 ## License
 
