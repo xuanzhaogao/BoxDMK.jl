@@ -201,7 +201,30 @@ res.ft, res.istarget, res.grid                   # forest (rotated frame x_rot =
 `f` must be defined (periodically) slightly outside the cell; `f_batch!(values, points)`
 may be passed instead, as for `build_tree`. Options: `norder = 16`, `rc_factor = 0.25`
 (level-0 box side `rc = d_min / ⌈1/rc_factor⌉`, `d_min` the smallest distance between
-lattice planes), `timings`.
+lattice planes), `targets` (3 × N points: only the leaves holding them are computed,
+values in `res.target_pot`), `skip_negligible`, `interpolate`, `near32` (below), `timings`.
+
+Repeated solves on a fixed forest (e.g. time stepping) reuse the tree, the tables and
+the buffers:
+
+```julia
+plan = periodic_plan(f0, A; eps = 1e-6)          # forest adapted to f0
+for step in 1:nsteps
+    res = periodic_solve!(plan, f_step)          # resamples f on the plan's forest
+end
+```
+
+Work-saving rules (all on by default):
+
+- **Halo copies / core interpolation**: when the level-0 cubes tile the cell, halo
+  subtrees are copies of their lattice images (only the central forest samples `f`);
+  otherwise only the boxes meeting the cell sample `f` and the rest interpolate their
+  leaf polynomials at periodic images (`interpolate = false` reproduces the C++ forest).
+- **Negligible sources** (`skip_negligible`): boxes whose density cannot change the
+  potential by `eps` relative (bound `max|f| ∫K_narrow` against the potential scale of
+  the strongest box) are left out of the plane-wave and near fields.
+- **Single-precision near field** (`near32`, default for `eps ≥ 1e-6`, as in C++): the
+  dense same-level near-field contractions run in Float32 (16-wide SIMD).
 
 How it works (`src/native/periodic/`, after the C++ `bdmk_laplace3d_pot_periodic`):
 
