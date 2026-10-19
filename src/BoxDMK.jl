@@ -4,6 +4,18 @@ using LinearAlgebra
 using Libdl
 using SIMD
 
+"""
+    build_tree(f, kernel, basis; ndim=3, norder=6, eps=1e-6, boxlen=1.0, nd=1, eta=1.0, f_batch=nothing)
+        -> (tree::BoxTree, fvals)
+
+Adaptive tree on the box `[0, boxlen]^ndim` resolving the density `f` to
+relative tolerance `eps` (the Fortran builder: Legendre/Chebyshev tail test,
+2:1 level restriction, colleague lists). `f(x)` returns the `nd` density
+values at the point `x` (a number when `nd == 1`); alternatively
+`f_batch!(values, points)` fills `values (nd, npts)` at `points (ndim, npts)`
+for a whole box at once, and `f` may then be omitted. `fvals` holds the
+samples, `(nd, norder^ndim, nboxes)`.
+"""
 function build_tree end
 function bdmk end
 

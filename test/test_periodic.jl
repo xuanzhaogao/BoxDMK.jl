@@ -6,17 +6,27 @@ include("periodic_oracle.jl")
 
 const _PXS = [(0.20, 0.25, 0.40), (0.72, 0.65, 0.55), (0.95, 0.30, 0.80), (0.45, 0.85, 0.10)]
 
-# Errors of the solution at `nsamp` random in-cell leaf nodes against Ewald.
-function _periodic_errors(res, g; nsamp = 300)
+# Pseudo-random integers in 1:m, the same on every Julia version (the streams
+# of `rand(rng, range)` are not).
+mutable struct _LCG
+    s::UInt64
+end
+_draw!(r::_LCG, m::Int) = (r.s = r.s * 0x5851f42d4c957f2d + 0x14057b7ef767814f; Int((r.s >> 33) % UInt64(m)) + 1)
+
+# Errors of the solution at `nsamp` pseudo-random in-cell leaf nodes against
+# Ewald: relative L2 over the samples, and max error relative to max|u| over
+# all computed leaf nodes (printed with BOXDMK_TEST_VERBOSE=1).
+function _periodic_errors(res, g; nsamp = parse(Int, get(ENV, "BOXDMK_TEST_NSAMP", "300")))
     ft, n, G = res.ft, res.norder, res.grid
     x = BoxDMK.ortho1d(LegendreBasis(), n).x
     leaves = [i for i in 1:ft.nboxes if ft.nchild[i] == 0 && res.istarget[i]]
-    rng = MersenneTwister(7)
-    e2 = r2 = emax = rmax = 0.0
+    rmax = maximum(i -> maximum(abs, view(res.pot, :, :, :, i)), leaves)
+    rng = _LCG(7)
+    e2 = r2 = emax = 0.0
     k = 0
     while k < nsamp
-        ib = rand(rng, leaves)
-        a, b, c = rand(rng, 1:n, 3)
+        ib = leaves[_draw!(rng, length(leaves))]
+        a, b, c = _draw!(rng, n), _draw!(rng, n), _draw!(rng, n)
         h = ft.boxsize[ft.level[ib] + 1] / 2
         y = [ft.centers[1, ib] + h * x[a], ft.centers[2, ib] + h * x[b], ft.centers[3, ib] + h * x[c]]
         all(0 .<= G.Uinv * y .< 1) || continue          # node in the cell
@@ -24,8 +34,9 @@ function _periodic_errors(res, g; nsamp = 300)
         uref = ewald_potential(g, G.Q * y)
         u = res.pot[a, b, c, ib]
         e2 += (u - uref)^2; r2 += uref^2
-        emax = max(emax, abs(u - uref)); rmax = max(rmax, abs(uref))
+        emax = max(emax, abs(u - uref))
     end
+    get(ENV, "BOXDMK_TEST_VERBOSE", "0") == "1" && println("    rel L2 ", sqrt(e2 / r2), "  max ", emax / rmax)
     return sqrt(e2 / r2), emax / rmax
 end
 

@@ -1,3 +1,9 @@
 [deps]
 BoxDMK = "aa90dc6b-4abc-4be6-a066-74e02c8a8423"
 Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
+
+[sources]
+BoxDMK = {path = ".."}
+
+[compat]
+Documenter = "1"
