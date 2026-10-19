@@ -256,26 +256,27 @@ spike of width 1.4e-3 on a sheared cell (a known failure of the C++ wide source,
 codes build the same forest and the potentials agree to 1.2e-10 at `eps = 1e-9`.
 
 Wall time against the C++ solver (PeriodicDMK `bench_steps <cell> multi`: four
-Gaussians down to width 0.007, `norder = 16`; same forest, same density callback;
-genoa node, one socket, threads pinned; `benchmark/run_periodic_node.sh`,
-`benchmark/results/periodic/genoa_triclinic.log`):
+Gaussians down to width 0.007, `norder = 16`; same density callback; genoa node, one
+socket, threads pinned; `benchmark/run_periodic_node.sh`,
+`benchmark/results/periodic/genoa_optimized.log`). Julia uses the defaults above; on
+the cube both codes build the same forest.
 
-| cell | eps | boxes | 1 thread C++ / Julia | 48 threads C++ / Julia |
+| cell | eps | boxes C++ / Julia | 1 thread C++ / Julia | 48 threads C++ / Julia |
 |---|---|---|---|---|
-| cubic    | 1e-3 | 624  | 0.80 / 0.84 s | 118 / 81 ms |
-| cubic    | 1e-6 | 1416 | 2.38 / 2.33 s | 378 / 259 ms |
-| cubic    | 1e-9 | 2560 | 6.80 / 5.98 s | 452 / 393 ms |
-| sheared  | 1e-3 | 1320 | 2.33 / 2.00 s | 315 / 156 ms |
-| sheared  | 1e-6 | 2096 | 5.25 / 3.78 s | 945 / 326 ms |
-| sheared  | 1e-9 | 4216 | 17.3 / 9.51 s | 863 / 583 ms |
-| hexagonal | 1e-3 | 1632 | 2.67 / 2.35 s | 295 / 156 ms |
-| hexagonal | 1e-6 | 2328 | 4.95 / 3.92 s | 756 / 279 ms |
-| hexagonal | 1e-9 | 5736 | 17.4 / 11.7 s | 928 / 640 ms |
+| cubic     | 1e-3 | 624 / 624   | 0.80 / 0.32 s | 116 / 88 ms |
+| cubic     | 1e-6 | 1416 / 1416 | 2.38 / 0.91 s | 387 / 149 ms |
+| cubic     | 1e-9 | 2560 / 2560 | 6.80 / 3.01 s | 454 / 347 ms |
+| sheared   | 1e-3 | 1320 / 720  | 2.47 / 0.82 s | 312 / 115 ms |
+| sheared   | 1e-6 | 2096 / 1960 | 5.52 / 1.95 s | 942 / 306 ms |
+| sheared   | 1e-9 | 4216 / 4048 | 17.9 / 5.57 s | 882 / 491 ms |
+| hexagonal | 1e-3 | 1632 / 920  | 2.78 / 0.83 s | 305 / 152 ms |
+| hexagonal | 1e-6 | 2328 / 2160 | 5.17 / 1.70 s | 759 / 244 ms |
+| hexagonal | 1e-9 | 5736 / 5648 | 18.0 / 5.88 s | 925 / 551 ms |
 
-Both include the tree build with density sampling, which dominates the
-single-thread times (e.g. 3.1 s of the Julia 6.0 s for the cube at 1e-9); the
-triclinic cells sample the density a second time for the fractional source tree,
-as the C++ code does.
+Both include the tree build with density sampling (about a third of the Julia
+single-thread time); the triclinic cells sample the density a second time for the
+fractional source tree, as the C++ code does. The potentials agree with the C++
+solver to 9e-12 (cube) and 1.2e-10 (triclinic) at `eps = 1e-9`.
 
 ## Kernels And Bases
 
