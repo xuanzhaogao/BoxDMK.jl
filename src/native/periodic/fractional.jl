@@ -188,24 +188,22 @@ function _fractional_tree!(F::_Forest, f, g::PeriodicGrid, ft::FlatTree, Ur::Mat
         parallel_foreach(collect(eachindex(lb)), wss) do i, (c3, w1, w2, y)
             b = lb[i]
             h = F.boxsize[F.level[b] + 1]
-            if _tail_error(_fbox(F, b), leg.U, Ut, tail, c3, w1, w2) > thr
-                flag[i] = true
-                return
-            end
             # finest main-forest leaf at the 27 points of the cell (slightly inside)
             c = F.centers[b]
             hb = edge * h
+            hmin = Inf
             for oz in -1:1, oy in -1:1, ox in -1:1
                 u1 = c[1] + 0.49 * h * ox; u2 = c[2] + 0.49 * h * oy; u3 = c[3] + 0.49 * h * oz
                 for d in 1:3
                     y[d] = Ur[d, 1] * u1 + Ur[d, 2] * u2 + Ur[d, 3] * u3
                 end
-                leaf = _locate_leaf(ft, g, y)
-                if ft.boxsize[ft.level[leaf] + 1] < hb / ratio
-                    flag[i] = true
-                    return
-                end
+                hmin = min(hmin, ft.boxsize[ft.level[_locate_leaf(ft, g, y)] + 1])
             end
+            # finer than the forest around it, the tail test stops: the density
+            # is not known better there (the values interpolated from the
+            # forest jump at its leaf boundaries by its accuracy)
+            flag[i] = hmin < hb / ratio ||
+                      (hb > hmin / 2 && _tail_error(_fbox(F, b), leg.U, Ut, tail, c3, w1, w2) > thr)
         end
         any(flag) || break
         level_boxes = _refine!(F, f, level_boxes[flag], x)
@@ -292,8 +290,7 @@ function period_quadrature(plan; ratio::Real = 1.0)
     F = _Forest(n, 1.0, Arena(), g.Q * Ur)
     ar = Arena()
     try
-        w3 = _tensor_weights(n)
-        rint0 = sqrt(sum(b -> _box_l2sq(view(plan.fvals, :, :, :, b), w3, g.rc^2 / 8), levelboxes(ft, 0)))
+        rint0 = _leaf_norm(ft, plan.fvals, g, n)
         _fractional_tree!(F, _ForestSource(ft, g, plan.fvals, n, ar), g, ft, Ur, mt, plan.eps * g.rc^-1.5 * rint0,
                           Float64(ratio))
         leaves = [b for b in 1:_nbox(F) if _isleaf(F, b)]

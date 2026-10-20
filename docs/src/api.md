@@ -27,6 +27,10 @@ periodic_solve!
 ```@docs
 bdmk_q2d
 q2d_plan
+sample_points
+PeriodQuadrature
+period_quadrature
+period_values!
 ```
 
 ## Kernels and bases

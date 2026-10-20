@@ -315,11 +315,12 @@ function _periodic_solve!(plan::PeriodicPlan, f, tm)
     set_sources!(s, plan.skip ? _source_boxes(ft, fvals, eps, Sn) : trues(ft.nboxes))
     # Source moments of one period: from the level-0 cubes when they tile the
     # cell (after the upward pass), else from a tree in fractional coordinates
-    # refined like the forest (threshold of its level-0 test).
+    # refined like the forest (threshold of its level-0 test, with the norm of
+    # the target leaves: the level-0 samples miss features narrower than their
+    # node spacing).
     Msrc = nothing
     if !g.tiled
-        w3 = _tensor_weights(n)
-        rint0 = sqrt(sum(b -> _box_l2sq(view(fvals, :, :, :, b), w3, g.rc^2 / 8), levelboxes(ft, 0)))
+        rint0 = _leaf_norm(ft, fvals, g, n)
         if plan.sample_once
             ar = Arena()
             try
@@ -607,6 +608,19 @@ function (s::_ZShifted)(p)
 end
 
 _tensor_weights(n::Int) = (w = ortho1d(LegendreBasis(), n).w; vec([w[i] * w[j] * w[k] for i in 1:n, j in 1:n, k in 1:n]))
+
+# L2 norm of the density over the central (non-halo) leaves; independent of
+# the targets of a plan.
+function _leaf_norm(ft::FlatTree, fvals, g::PeriodicGrid, n::Int)
+    w3 = _tensor_weights(n)
+    lv = [b for b in 1:ft.nboxes if ft.nchild[b] == 0 && !_inhalo(g, view(ft.centers, :, b))]
+    s = zeros(length(lv))
+    parallel_foreach(collect(eachindex(lv)), fill(nothing, _nthreads())) do i, _
+        b = lv[i]
+        s[i] = _box_l2sq(view(fvals, :, :, :, b), w3, ft.boxsize[ft.level[b] + 1]^3 / 8)
+    end
+    return sqrt(sum(s))
+end
 
 # Mean of f over the cell from the root-cell moments (u-measure).
 _cell_mean(P::WidePlan, M::Array{Float64,3}) =
