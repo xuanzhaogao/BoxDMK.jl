@@ -71,3 +71,21 @@ end
         @test c2p[:, :, d, ic] ≈ transpose(p2c[:, :, d, ic])
     end
 end
+
+@testset "arena pool stays bounded under varying buffer sizes" begin
+    BoxDMK.release_memory!()
+    big = 0
+    for k in 1:200
+        ar = BoxDMK.Arena()
+        sz = [1000 + 37 * ((k * 7919 + j) % 101) for j in 1:5]     # sizes vary from solve to solve
+        for n in sz
+            BoxDMK.alloc(ar, n)
+        end
+        big = max(big, sum(sz))
+        BoxDMK.release!(ar)
+        @test BoxDMK._POOL_WORDS[] <= 2 * BoxDMK._ARENA_MAX[]
+    end
+    @test BoxDMK._POOL_WORDS[] == sum(n * length(v) for (n, v) in BoxDMK._POOL; init = 0)
+    BoxDMK.release_memory!()
+    @test BoxDMK._POOL_WORDS[] == 0 && isempty(BoxDMK._POOL)
+end

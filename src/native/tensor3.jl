@@ -181,6 +181,10 @@ pzeros(dims::Int...) = pfill!(Array{Float64}(undef, dims...))
 # ends, so they neither trigger nor burden garbage collection. Returned
 # blocks are kept in a pool (by size) and reused by later solves, which then
 # skip the page faults of fresh memory; `release_memory!()` frees the pool.
+# A block is reused only for a request of the same size, and many buffer
+# sizes depend on the density (e.g. the source boxes), so repeated solves of
+# varying densities would grow the pool without bound: it keeps at most twice
+# the largest arena released so far, and frees the blocks beyond that.
 struct Arena
     ptrs::Vector{Tuple{Ptr{Cvoid},Int}}
     lock::ReentrantLock
@@ -189,13 +193,17 @@ Arena() = Arena(Tuple{Ptr{Cvoid},Int}[], ReentrantLock())
 
 const _POOL = Dict{Int,Vector{Ptr{Cvoid}}}()
 const _POOL_LOCK = ReentrantLock()
+const _POOL_WORDS = Ref(0)          # Float64 words held by the pool
+const _ARENA_MAX = Ref(0)           # largest arena released (words)
 
 function alloc(ar::Arena, dims::Int...)
     n = prod(dims)
     n == 0 && return Array{Float64}(undef, dims...)
     p = lock(_POOL_LOCK) do
         blocks = get(_POOL, n, nothing)
-        (blocks === nothing || isempty(blocks)) ? C_NULL : pop!(blocks)
+        (blocks === nothing || isempty(blocks)) && return C_NULL
+        _POOL_WORDS[] -= n
+        return pop!(blocks)
     end
     if p == C_NULL
         p = Libc.malloc(8 * n)
@@ -214,8 +222,15 @@ end
 function release!(ar::Arena)
     lock(ar.lock) do
         lock(_POOL_LOCK) do
+            _ARENA_MAX[] = max(_ARENA_MAX[], sum(last, ar.ptrs; init = 0))
+            cap = 2 * _ARENA_MAX[]
             for (p, n) in ar.ptrs
-                push!(get!(Vector{Ptr{Cvoid}}, _POOL, n), p)
+                if _POOL_WORDS[] + n <= cap
+                    push!(get!(Vector{Ptr{Cvoid}}, _POOL, n), p)
+                    _POOL_WORDS[] += n
+                else
+                    Libc.free(p)
+                end
             end
         end
         empty!(ar.ptrs)
@@ -234,6 +249,7 @@ function release_memory!()
             Libc.free(p)
         end
         empty!(_POOL)
+        _POOL_WORDS[] = 0
     end
     return nothing
 end
