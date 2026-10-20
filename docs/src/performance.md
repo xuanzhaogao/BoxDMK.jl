@@ -110,14 +110,17 @@ and `norder = 16`. Genoa, one socket, one exclusive node per case
 | 1e-9 | 135 M | 2.56 s (0.31 + 2.25) | 73.9 s (7.5 + 66.4) | 364 ms / 12.4 s | 7.5e-12 |
 
 Wide-part transforms alone (random level-0 moments → coefficients, 48
-threads, `benchmark/q2d_widecmp.jl`):
+threads, `benchmark/q2d_widecmp.jl`, logs in `benchmark/results/q2d/cases_fft2/`).
+Sums over many uniform cells (≥ 24 on some axis) run as FFTs (exact; see
+[Quasi-2D (slab) potentials](@ref)); fewer cells keep the dense products,
+which are faster there:
 
-| grid | eps | modes | slab (in-plane FFT + z matrices) | fully periodic, same grid (dense) |
-|---|---|---|---|---|
-| 100 × 100 × 1, rc = 1 (q2d) vs 100 × 100 × 4 (3D) | 1e-6 | 0.39 M / 14.4 M | 74 ms  | 1075 ms |
-| 100 × 100 × 1, rc = 1 (q2d) vs 100 × 100 × 4 (3D) | 1e-9 | 0.87 M / 48.0 M | 277 ms | 5248 ms |
-| 100 × 100 × 1, rc = 0.5 (two z-cells) | 1e-6 | 1.55 M | 538 ms | — |
+| grid | eps | modes | wide transforms |
+|---|---|---|---|
+| fully periodic cube 1 × 1 × 1, rc = 0.25 (dense) | 1e-6 / 1e-9 | 26 k / 85 k | 1.9 / 1.9 ms |
+| fully periodic 100 × 100 × 4, rc = 1 (FFT; dense: 1075 / 5248 ms) | 1e-6 / 1e-9 | 14.4 M / 48 M | 287 / 1041 ms |
+| slab 100 × 100 × 1, rc = 1 | 1e-6 / 1e-9 | 0.39 M / 0.87 M | 81 / 286 ms |
+| slab 100 × 100 × 1, rc = 0.5 (two z-cells) | 1e-6 / 1e-9 | 1.55 M / 3.49 M | 494 / 2069 ms |
 
-The fully periodic solver's in-plane transforms are still dense products,
-O(modes × cells) per axis. They are fine for the cells benchmarked above (4–10
-cells per axis) but would gain from the same FFT factorization on large cells.
+The large-grid transforms are bound by memory traffic: the moments of the
+40 000 level-0 cubes of the 100 × 100 × 4 cell take 5.6 GB at `eps = 1e-9`.
