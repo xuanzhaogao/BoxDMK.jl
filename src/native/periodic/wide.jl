@@ -97,11 +97,16 @@ struct WidePlan
     scale::Float64                  # V / prod(mt) (u-measure -> volume)
     W::Array{Float64,3}             # Ŵ on the half grid m₁ ≥ 0 (Kh₁+1, K₂, K₃), zero outside |k| ≤ kmax and at m = 0
     B::Matrix{Float64}              # k = B m
-    # moments -> modes by FFT over the source cells (fftaxis.jl): per axis
-    # T[l, m] = (2l+1)(-i)^l j_l(π m/mt) e^{-iπm/mt} and the frequencies m mod mt
-    fT::NTuple{3,Matrix{ComplexF64}}
-    fr::NTuple{3,Vector{Int}}
-    # modes -> coefficients by FFT over the level-0 cubes when they tile the cell
+    # moments -> modes. Many cells per axis: FFT over the source cells
+    # (fftaxis.jl), per axis T[l, m] = (2l+1)(-i)^l j_l(π m/mt) e^{-iπm/mt} and the
+    # frequencies m mod mt. Few cells (dense products are faster): (real, imaginary)
+    # parts of F_d[m, l + pf s + 1] = (2l+1)(-i)^l j_l(π m/mt) e^{-2πi m (s+½)/mt}
+    fT::Union{Nothing,NTuple{3,Matrix{ComplexF64}}}
+    fr::Union{Nothing,NTuple{3,Vector{Int}}}
+    F1::Union{Nothing,NTuple{2,Matrix{Float64}}}    # rows m₁ ≥ 0
+    F2t::Union{Nothing,NTuple{2,Matrix{Float64}}}   # transpose(F₂)
+    F3t::Union{Nothing,NTuple{2,Matrix{Float64}}}   # transpose(F₃)
+    # modes -> coefficients by FFT over the level-0 cubes (many cells, cubes tiling the cell)
     iE::Union{Nothing,NTuple{3,Matrix{ComplexF64}}}
     ir::Union{Nothing,NTuple{3,Vector{Int}}}
     # otherwise dense, E_d[m, l + pe s + 1] = (2l+1) i^l j_l(k_d rc/2) e^{ik_d c_s}
@@ -141,11 +146,15 @@ function WidePlan(g::PeriodicGrid, eps::Float64, pf::Int, pe::Int, tsw::Vector{F
     full(d) = (-Kh[d]):Kh[d]
     ms = (0:Kh[1], full(2), full(3))
     wt1 = m -> m == 0 ? 1.0 : 2.0
-    fT = ntuple(d -> _axis_T(ms[d], pf, mt[d]), 3)
-    fr = ntuple(d -> _axis_r(ms[d], mt[d]), 3)
-    iE = g.tiled ? ntuple(d -> _axis_E(ms[d], pe, g.mgrid[d], rc, g.xgrid0[d], d == 1 ? wt1 : (m -> 1.0)), 3) : nothing
-    ir = g.tiled ? ntuple(d -> _axis_r(ms[d], g.mgrid[d]), 3) : nothing
-    return WidePlan(pf, pe, Kh, mt, g.V / prod(mt), W, B, fT, fr, iE, ir,
+    fft = maximum(mt) >= _FFT_CELLS
+    F(d) = _legtable(ms[d], pf, mt[d], m -> pi * m / mt[d], 1.0, -1, (m, s) -> -2pi * m * (s + 0.5) / mt[d])
+    fT = fft ? ntuple(d -> _axis_T(ms[d], pf, mt[d]), 3) : nothing
+    fr = fft ? ntuple(d -> _axis_r(ms[d], mt[d]), 3) : nothing
+    tiledfft = g.tiled && maximum(g.mgrid) >= _FFT_CELLS
+    iE = tiledfft ? ntuple(d -> _axis_E(ms[d], pe, g.mgrid[d], rc, g.xgrid0[d], d == 1 ? wt1 : (m -> 1.0)), 3) : nothing
+    ir = tiledfft ? ntuple(d -> _axis_r(ms[d], g.mgrid[d]), 3) : nothing
+    return WidePlan(pf, pe, Kh, mt, g.V / prod(mt), W, B, fT, fr, fft ? nothing : F(1), fft ? nothing : _tr(F(2)),
+                    fft ? nothing : _tr(F(3)), iE, ir,
                     E(1, 0:Kh[1], wt1),
                     g.diagonal ? E(2, full(2)) : nothing, g.diagonal ? _tr(E(3, full(3))) : nothing,
                     rc, g.xgrid0, g.mgrid)
@@ -233,10 +242,18 @@ function _zgemm_par!(Cr::Array{Float64}, Ci, Ar::Array{Float64}, Ai::Array{Float
     return nothing
 end
 
+# Cells per axis from which the sums over cells run as FFTs (below, dense
+# products at the GEMM peak are faster).
+const _FFT_CELLS = 24
+
 # Modes G = Ŵ ρ̂ on the half grid (Kh₁+1, K₂, K₃) from the root-cell moments
 # M (pf mt₁, pf mt₂, pf mt₃), index l + pf s per axis, u-measure: one FFT axis
-# transform per fractional axis (fftaxis.jl). Buffers come from the arena `ar`.
-function wide_modes(P::WidePlan, M::Array{Float64,3}, ar::Arena)
+# transform per fractional axis (fftaxis.jl), or dense products for few cells
+# (then as (real, imaginary) parts). Buffers come from the arena `ar`.
+wide_modes(P::WidePlan, M::Array{Float64,3}, ar::Arena) =
+    P.fT === nothing ? _wide_modes_dense(P, M, ar) : _wide_modes_fft(P, M, ar)
+
+function _wide_modes_fft(P::WidePlan, M::Array{Float64,3}, ar::Arena)
     Q1, Q2, Q3 = size(M)
     H1, K2, K3 = size(P.W)
     pf, mt = P.pf, P.mt
@@ -250,12 +267,39 @@ function wide_modes(P::WidePlan, M::Array{Float64,3}, ar::Arena)
     return G
 end
 
+# Per source slice q₃, Z[:, :, q₃] = F₁ M[:, :, q₃] F₂ᵀ, then G = Ŵ Z F₃ᵀ.
+function _wide_modes_dense(P::WidePlan, M::Array{Float64,3}, ar::Arena)
+    Q1, Q2, Q3 = size(M)
+    H1, K2, K3 = size(P.W)
+    (F1r, F1i), (F2r, F2i), (F3r, F3i) = P.F1, P.F2t, P.F3t
+    Zr = alloc(ar, H1, K2, Q3); Zi = alloc(ar, H1, K2, Q3)
+    wks = make_workspaces(() -> (alloc(ar, H1, Q2), alloc(ar, H1, Q2)))
+    parallel_foreach(collect(1:Q3), wks) do q3, (Yr, Yi)
+        GC.@preserve M Zr Zi Yr Yi F1r F1i F2r F2i begin
+            pm = pointer(M) + 8 * Q1 * Q2 * (q3 - 1)
+            o = 8 * H1 * K2 * (q3 - 1)
+            gemm!(pointer(Yr), H1, pointer(F1r), H1, pm, Q1, H1, Q2, Q1, 1.0, false)
+            gemm!(pointer(Yi), H1, pointer(F1i), H1, pm, Q1, H1, Q2, Q1, 1.0, false)
+            _zgemm!(pointer(Zr) + o, pointer(Zi) + o, H1, pointer(Yr), pointer(Yi), H1,
+                    pointer(F2r), pointer(F2i), Q2, H1, K2, Q2, false)
+        end
+    end
+    Gr = alloc(ar, H1, K2, K3); Gi = alloc(ar, H1, K2, K3)
+    _zgemm_par!(Gr, Gi, Zr, Zi, F3r, F3i, H1 * K2, K3, Q3)
+    W = P.W; sc = P.scale
+    @inbounds @simd for i in eachindex(Gr)
+        w = sc * W[i]
+        Gr[i] *= w; Gi[i] *= w
+    end
+    return Gr, Gi
+end
+
 """
     wide_coefficients(P, G, ar) -> C
 
 Legendre coefficients (degree < pe) of u_wide on the central level-0 cubes
-from the half-grid modes `G` of `wide_modes`. When the cubes tile the cell
-(FFT over the cubes) in natural order, C[l₁ + pe s₁, l₂ + pe s₂, l₃ + pe s₃];
+from the half-grid modes `G` of `wide_modes`. By FFT over the cubes (many
+cubes tiling the cell) in natural order, C[l₁ + pe s₁, l₂ + pe s₂, l₃ + pe s₃];
 otherwise in reversed order, C[l₃ + pe s₃, l₂ + pe s₂, l₁ + pe s₁].
 """
 function wide_coefficients(P::WidePlan, G::Array{ComplexF64,3}, ar::Arena)
@@ -272,8 +316,10 @@ function wide_coefficients(P::WidePlan, G::Array{ComplexF64,3}, ar::Arena)
     @inbounds for i in eachindex(G)
         Gr[i] = real(G[i]); Gi[i] = imag(G[i])
     end
-    return P.E2 === nothing ? _wide_coefs_triangular(P, Gr, Gi, ar) : _wide_coefs_separable(P, Gr, Gi, ar)
+    return wide_coefficients(P, (Gr, Gi), ar)
 end
+wide_coefficients(P::WidePlan, G::NTuple{2,Array{Float64,3}}, ar::Arena) =
+    P.E2 === nothing ? _wide_coefs_triangular(P, G..., ar) : _wide_coefs_separable(P, G..., ar)
 
 # Ct[r₃, r₂, r₁] = Re Σ_{m₁ ≥ 0} A[r₃, r₂, m₁] E₁[m₁, r₁] (weighted rows of E₁).
 function _wide_coefs_final(P, Ar::Array{Float64,3}, Ai::Array{Float64,3}, ar::Arena)

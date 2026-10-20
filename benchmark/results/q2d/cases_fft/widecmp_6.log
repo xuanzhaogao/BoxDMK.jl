@@ -1,0 +1,6 @@
+# host worker7423 2026-10-19T20:56:00-04:00 widecmp 6
+3D periodic cube 1x1x1, rc=0.25    eps=1e-6 T48 | level-0 cells (4, 4, 4)      modes     26011 | wide transforms      9.8 ms  (plan 0.17 s)
+3D periodic 100x100x4, rc=1        eps=1e-6 T48 | level-0 cells (100, 100, 4)  modes  14375277 | wide transforms    596.6 ms  (plan 0.37 s)
+q2d 100x100x1, rc=1                eps=1e-6 T48 | level-0 cells (100, 100, 1)  modes    388521 | wide transforms    177.8 ms  (plan 0.29 s)
+q2d 100x100x1, rc=0.5              eps=1e-6 T48 | level-0 cells (200, 200, 2)  modes   1551441 | wide transforms   1017.6 ms  (plan 0.20 s)
+CASE_DONE

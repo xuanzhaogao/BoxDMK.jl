@@ -1,0 +1,13 @@
+#DISBATCH PREFIX cd /mnt/home/xgao1/project/dmk_boxcode/BoxDMK.jl && 
+OUT=benchmark/results/periodic/cases_fft2 bash -l benchmark/periodic_case.sh cubic 3
+OUT=benchmark/results/periodic/cases_fft2 bash -l benchmark/periodic_case.sh cubic 6
+OUT=benchmark/results/periodic/cases_fft2 bash -l benchmark/periodic_case.sh cubic 9
+OUT=benchmark/results/periodic/cases_fft2 bash -l benchmark/periodic_case.sh sheared 3
+OUT=benchmark/results/periodic/cases_fft2 bash -l benchmark/periodic_case.sh sheared 6
+OUT=benchmark/results/periodic/cases_fft2 bash -l benchmark/periodic_case.sh sheared 9
+OUT=benchmark/results/periodic/cases_fft2 bash -l benchmark/periodic_case.sh hex 3
+OUT=benchmark/results/periodic/cases_fft2 bash -l benchmark/periodic_case.sh hex 6
+OUT=benchmark/results/periodic/cases_fft2 bash -l benchmark/periodic_case.sh hex 9
+OUT=benchmark/results/q2d/cases_fft2 bash -l benchmark/q2d_case.sh widecmp 6
+OUT=benchmark/results/q2d/cases_fft2 bash -l benchmark/q2d_case.sh widecmp 9
+OUT=benchmark/results/q2d/cases_fft2 bash -l benchmark/q2d_case.sh test
