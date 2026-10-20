@@ -19,7 +19,8 @@ function _q2d_errors(res, g, L, zl; nsamp = 200)
         ib = leaves[ib]
         h = ft.boxsize[ft.level[ib] + 1] / 2
         y = (ft.centers[1, ib] + h * x[a], ft.centers[2, ib] + h * x[b], ft.centers[3, ib] + h * x[c])
-        (0 <= y[1] < L[1] && 0 <= y[2] < L[2] && 0 <= y[3] <= zl[2] - zl[1]) || continue
+        t = g.Ainv * [y[1], y[2]]
+        (all(0 .<= t .< 1) && 0 <= y[3] <= zl[2] - zl[1]) || continue
         k += 1
         uref = q2d_potential(g, [y[1], y[2], y[3] + zl[1]])
         u = res.pot[a, b, c, ib]
@@ -33,6 +34,12 @@ end
         g = neutral_q2d_mixture((2.0, 3.0), [(0.3, 0.5, -0.05), (1.4, 2.1, 0.1)], [800.0, 400], [1.0, 1.0])
         p = [0.6, 2.3, 0.07]
         @test q2d_potential(g, p; xi = 2.0) ≈ q2d_potential(g, p; xi = 4.5) rtol = 1e-13
+        # oblique lattice, charged: still independent of ξ; far field -2πQ|z|/A
+        A = [1.5 0.75; 0.0 1.5 * sqrt(3) / 2]
+        gq = q2d_mixture(A, [(0.3, 0.5, -0.05), (1.4, 0.9, 0.1)], [800.0, 400], [1.0, 0.3]; neutral = false)
+        @test q2d_potential(gq, p; xi = 2.5) ≈ q2d_potential(gq, p; xi = 5.0) rtol = 1e-13
+        uf = -2pi / det(A) * sum(gq.c[j] * (pi / gq.alpha[j])^1.5 * (9.0 - gq.x[j][3]) for j in 1:2)
+        @test q2d_potential(gq, [0.2, 0.1, 9.0]) ≈ uf rtol = 1e-10
     end
 
     @testset "$name, eps=1e-$nd" for (name, L, zl, xs, al) in (
@@ -41,7 +48,11 @@ end
             ("2 × 3 cell", (2.0, 3.0), (-0.5, 0.5),
              [(0.3, 0.5, -0.05), (1.4, 2.1, 0.1), (1.8, 0.4, 0.0), (0.7, 2.7, -0.1)], [800.0, 400, 600, 500]),
             ("thin slab 4 × 4 × 0.5", (4.0, 4.0), (0.0, 0.5),
-             [(0.5, 0.7, 0.25), (2.9, 1.3, 0.22), (1.7, 3.4, 0.28), (3.6, 2.2, 0.25)], [1500.0, 1000, 1200, 2000])),
+             [(0.5, 0.7, 0.25), (2.9, 1.3, 0.22), (1.7, 3.4, 0.28), (3.6, 2.2, 0.25)], [1500.0, 1000, 1200, 2000]),
+            ("hexagonal 2 × 1", [2.0 0.5; 0.0 sqrt(3) / 2], (0.0, 0.8),
+             [(0.3, 0.2, 0.4), (1.6, 0.6, 0.35), (1.0, 0.4, 0.45), (2.1, 0.1, 0.4)], [900.0, 500, 700, 600]),
+            ("rectangle 1 × √2", (1.0, sqrt(2.0)), (0.0, 0.7),
+             [(0.2, 0.3, 0.35), (0.7, 1.1, 0.3), (0.5, 0.6, 0.4), (0.9, 0.2, 0.35)], [1000.0, 600, 800, 500])),
                                                                     nd in (3, 6)
         eps = 10.0^-nd
         g = neutral_q2d_mixture(L, xs, al, [1.0, 0.7, -0.5, 0.9])
@@ -68,9 +79,48 @@ end
         gb!(v, P) = (for j in axes(P, 2); v[1, j] = g(view(P, :, j)); end; v)
         r3 = bdmk_q2d(nothing, L, zl; eps = 1e-6, near32 = false, f_batch = gb!)
         @test maximum(i -> maximum(abs, view(r3.pot, :, :, :, i) .- view(u1, :, :, :, i)), lv) < 1e-12 * maximum(abs, u1)
-        # a charged slab is rejected; sides must be multiples of rc
+        # a charged slab is rejected unless `charged`; rc at most min(spacing, height)
         gq = neutral_q2d_mixture(L, [(0.3, 0.5, 0.0), (1.4, 2.1, 0.1)], [800.0, 400], [1.0, 0.7])
         @test_throws ArgumentError bdmk_q2d(x -> gq(x) + 0.3 * exp(-500 * sum(abs2, x .- [1.0, 1.0, 0.0])), L, zl; eps = 1e-3)
-        @test_throws ArgumentError bdmk_q2d(g, (1.0, sqrt(2.0)), zl; eps = 1e-3)
+        @test_throws ArgumentError bdmk_q2d(g, L, zl; eps = 1e-3, rc = 1.5)
+    end
+
+    @testset "given values, period quadrature ($name)" for (name, L, zl) in (("2 × 3 cell", (2.0, 3.0), (-0.5, 0.5)),
+                                                                          ("hexagonal 2 × 1", [2.0 0.5; 0.0 sqrt(3) / 2], (-0.4, 0.4)))
+        g = q2d_mixture(L, [(0.3, 0.5, -0.05), (1.4, 0.6, 0.1), (1.0, 0.2, 0.0)], [800.0, 400, 600], [1.0, 0.7, -0.2];
+                        neutral = false)
+        plan = q2d_plan(g, L, zl; eps = 1e-8, charged = true)
+        Q = period_quadrature(plan)
+        @test sum(Q.w) ≈ abs(det(g.A)) * (zl[2] - zl[1]) rtol = 1e-12
+        fq = [g(view(Q.x, :, j)) for j in axes(Q.x, 2)]
+        @test sum(Q.w .* fq) ≈ total_charge(g) rtol = 1e-10
+        r1 = periodic_solve!(plan, g)
+        u1 = zeros(size(Q.x, 2))
+        period_values!(u1, Q, r1)
+        e1 = sum(Q.w .* fq .* u1)
+        P = sample_points(plan)
+        r2 = periodic_solve!(plan, [g(view(P, :, j)) for j in axes(P, 2)])
+        u2 = zeros(size(Q.x, 2))
+        period_values!(u2, Q, r2)
+        @test maximum(abs, u2 .- u1) < 1e-13 * maximum(abs, u1)
+        # interpolated potential at the nodes and the energy against the Ewald sum
+        js = 1:max(1, size(Q.x, 2) ÷ 97):size(Q.x, 2)
+        uref = [q2d_potential(g, view(Q.x, :, j)) for j in js]
+        @test maximum(abs, u1[js] .- uref) < 1e-8 * maximum(abs, uref)
+        fv = zeros(size(Q.x, 2))
+        period_values!(fv, Q, r1; field = r1.fvals)
+        @test maximum(abs, fv .- fq) < 1e-7 * maximum(abs, fq)         # forest: L2 tail test at eps
+    end
+
+    @testset "charged, $name, eps=1e-$nd" for (name, L, zl) in (("2 × 3 cell", (2.0, 3.0), (-0.5, 0.5)),
+                                                               ("hexagonal 2 × 1", [2.0 0.5; 0.0 sqrt(3) / 2], (-0.4, 0.4))),
+                                               nd in (3, 6)
+        eps = 10.0^-nd
+        g = q2d_mixture(L, [(0.3, 0.5, -0.05), (1.4, 0.6, 0.1), (1.0, 0.2, 0.0)], [800.0, 400, 600], [1.0, 0.7, -0.2];
+                        neutral = false)
+        res = bdmk_q2d(g, L, zl; eps = eps, charged = true)
+        l2, mx = _q2d_errors(res, g, L, zl)
+        @test l2 < 3eps
+        @test mx < eps
     end
 end

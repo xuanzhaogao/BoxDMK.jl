@@ -102,23 +102,27 @@ function bdmk_periodic(f, cell; f_batch = nothing, timings::Union{Nothing,Vector
 end
 
 """
-    bdmk_q2d(f, L, zlim; eps=1e-6, norder=16, rc=nothing, f_batch=nothing, timings=nothing, ...)
+    bdmk_q2d(f, L, zlim; eps=1e-6, norder=16, rc=nothing, charged=false, f_batch=nothing, timings=nothing, ...)
 
-Quasi-2D (slab) Coulomb potential: periodic in x and y with the rectangular
-cell `L = (L₁, L₂)` (or a number for a square), free in z,
+Quasi-2D (slab) Coulomb potential: periodic in x and y with the in-plane
+lattice `L` (a 2×2 matrix of lattice vectors as columns, a tuple `(L₁, L₂)`
+for a rectangle or a number for a square), free in z,
 
-    u(x) = ∫ Σ_{n ∈ ℤ²} f(y) / |x - y - (n₁L₁, n₂L₂, 0)| dy,
+    u(x) = ∫ Σ_{n ∈ ℤ²} f(y) / |x - y - (Ln, 0)| dy,
 
-for a neutral density `f` that vanishes outside the slab `zlim = (z₀, z₁)`.
-The potential is computed in the slab (`evaluate_periodic(res, x)` for
-z₀ ≤ x₃ ≤ z₁). The level-0 boxes have side `rc ≤ min(L₁, L₂, z₁ - z₀)`,
-which must divide both in-plane sides; by default the largest such value. The real-space (narrow) part is
+for a density `f` that vanishes outside the slab `zlim = (z₀, z₁)`, neutral
+unless `charged = true` (then in the gauge `u + 2πQ|z|/A → 0` far from the
+slab, `Q` the charge per cell, `A` its area). The potential is computed in the
+slab (`evaluate_periodic(res, x)` for z₀ ≤ x₃ ≤ z₁). The level-0 boxes have
+side `rc ≤ min(d, z₁ - z₀)`, `d` the in-plane spacing of the lattice lines; by
+default, for a rectangle the largest such value dividing both sides (the
+cubes then tile the cell), else the bound. The real-space (narrow) part is
 that of [`bdmk_periodic`](@ref) with images in x and y only; the wide part is
-summed in the plane over the modes `k̇ = 2π(m₁/L₁, m₂/L₂)` and applied in z
-through exact Gaussian kernel matrices on the level-0 z-cells, the mode
-`k̇ = 0` through the kernel `-2π|z - z'|/(L₁L₂)` of all wide Gaussians. Other
-options and `timings` as for `bdmk_periodic`; the forest and `res.pot` are
-in the frame `(x, y, z - z₀)`.
+summed in the plane over the modes `k̇ = 2πL⁻ᵀm` and applied in z through
+exact Gaussian kernel matrices on the level-0 z-cells, the mode `k̇ = 0`
+through the kernel `-2π|z - z'|/A` of all wide Gaussians. Other options and
+`timings` as for `bdmk_periodic`; the forest and `res.pot` are in the frame
+`(x, y, z - z₀)` rotated so that the first lattice vector lies along x.
 """
 bdmk_q2d(f, L, zlim; kwargs...) = bdmk_periodic(f, _slab_cell(L, zlim); slab = true, zorg = Float64(zlim[1]), kwargs...)
 
@@ -130,9 +134,14 @@ Plan of [`bdmk_q2d`](@ref) for repeated solves with [`periodic_solve!`](@ref).
 q2d_plan(f, L, zlim; kwargs...) = periodic_plan(f, _slab_cell(L, zlim); slab = true, zorg = Float64(zlim[1]), kwargs...)
 
 function _slab_cell(L, zlim)
-    L1, L2 = L isa Real ? (L, L) : (L[1], L[2])
     H = zlim[2] - zlim[1]
-    (L1 > 0 && L2 > 0 && H > 0) || throw(ArgumentError("need positive sides and z₀ < z₁"))
+    H > 0 || throw(ArgumentError("need z₀ < z₁"))
+    if L isa AbstractMatrix
+        size(L) == (2, 2) && abs(det(L)) > 0 || throw(ArgumentError("the in-plane cell must be a 2×2 matrix of lattice vectors (columns)"))
+        return Float64[L[1, 1] L[1, 2] 0; L[2, 1] L[2, 2] 0; 0 0 H]
+    end
+    L1, L2 = L isa Real ? (L, L) : (L[1], L[2])
+    (L1 > 0 && L2 > 0) || throw(ArgumentError("need positive sides"))
     return Matrix{Float64}(Diagonal([L1, L2, H]))
 end
 
@@ -190,14 +199,14 @@ eps ≥ 1e-6).
 function periodic_plan(f, cell; eps::Real = 1e-6, norder::Int = 16, rc_factor::Real = 0.25, nhalo::Int = 1,
                        f_batch = nothing, skip_negligible::Bool = true, interpolate::Bool = true, sample_once::Bool = true,
                        targets::Union{Nothing,AbstractMatrix} = nothing, near32::Union{Nothing,Bool} = nothing,
-                       slab::Bool = false, zorg::Real = 0.0, rc::Union{Nothing,Real} = nothing)
+                       slab::Bool = false, zorg::Real = 0.0, rc::Union{Nothing,Real} = nothing, charged::Bool = false)
     f = _density(f, f_batch, Float64(zorg))
     old_ftz = get_zero_subnormals()
     set_zero_subnormals(true)
     try
         return _periodic_plan(f, _cell_matrix(cell), Float64(eps), norder, Float64(rc_factor), nhalo,
                               skip_negligible, interpolate, sample_once, targets === nothing ? nothing : Matrix{Float64}(targets),
-                              near32, slab, Float64(zorg), rc)
+                              near32, slab, Float64(zorg), rc, charged)
     finally
         set_zero_subnormals(old_ftz)
     end
@@ -205,17 +214,17 @@ end
 
 function _periodic_plan(f, A::Matrix{Float64}, eps::Float64, n::Int, rc_factor::Float64, nhalo::Int,
                         skip::Bool, interpolate::Bool, sample_once::Bool, targets, near32,
-                        slab::Bool = false, zorg::Float64 = 0.0, rcin = nothing)
+                        slab::Bool = false, zorg::Float64 = 0.0, rcin = nothing, charged::Bool = false)
     nhalo >= 1 || throw(ArgumentError("nhalo must be ≥ 1"))
     0 < rc_factor < 0.95 || throw(ArgumentError("need 0 < rc_factor < 0.95"))
     size(A) == (3, 3) && abs(det(A)) > 0 || throw(ArgumentError("degenerate cell"))
     _, U = _lattice_qr(A)
     Uinv = inv(UpperTriangular(U))
-    dmin = slab ? min(A[1, 1], A[2, 2]) : minimum(1 / norm(Uinv[i, :]) for i in 1:3)
-    rc = rcin !== nothing ? Float64(rcin) : slab ? _slab_rc(A[1, 1], A[2, 2], A[3, 3]) :
-         dmin / ceil(1 / rc_factor * (1 - 1e-12))
-    slab && rc > min(A[1, 1], A[2, 2], A[3, 3]) * (1 + 1e-12) &&
-        throw(ArgumentError("rc = $rc must not exceed min(L₁, L₂, H) = $(min(A[1, 1], A[2, 2], A[3, 3]))"))
+    # (slab: in-plane distance between lattice lines, at most min(|a₁|, |a₂|))
+    dmin = slab ? minimum(1 / norm(view(Uinv, i, 1:2)) for i in 1:2) : minimum(1 / norm(Uinv[i, :]) for i in 1:3)
+    rc = rcin !== nothing ? Float64(rcin) : slab ? _slab_rc(U, dmin) : dmin / ceil(1 / rc_factor * (1 - 1e-12))
+    slab && rc > min(dmin, U[3, 3]) * (1 + 1e-12) &&
+        throw(ArgumentError("rc = $rc must not exceed the in-plane lattice spacing and the slab height, min = $(min(dmin, U[3, 3]))"))
     g = PeriodicGrid(A, rc, nhalo; slab, zorg)
 
     t0 = time_ns()
@@ -245,7 +254,8 @@ function _periodic_plan(f, A::Matrix{Float64}, eps::Float64, n::Int, rc_factor::
     # dense same-level near field in single precision at eps ≥ 1e-6 (as the C++ code)
     s = DMKSetup(ft, LegendreBasis(), n, 1, eps, 1, r0, wn, dn, taylor; asym_safety = 1e-4, istarget,
                  near32 = near32 === nothing ? eps >= 0.99e-6 : near32)
-    wplan = (slab ? SlabWide : WidePlan)(g, eps, wide_orders(eps, s.porder, n, rc)..., tsw, wsw)
+    wplan = slab ? SlabWide(g, eps, wide_orders(eps, s.porder, n, rc)..., tsw, wsw; charged, narrow = (dn, wn)) :
+                   WidePlan(g, eps, wide_orders(eps, s.porder, n, rc)..., tsw, wsw)
     copysrc = g.tiled ? _copy_sources(ft, g) : zeros(Int, ft.nboxes)
     all(b -> origin[b] != _COPY || copysrc[b] > 0, 1:ft.nboxes) || error("copied box without a source")
     pot = Array{Float64}(undef, n, n, n, ft.nboxes)
@@ -325,10 +335,12 @@ function _periodic_solve!(plan::PeriodicPlan, f, tm)
     tm[2] = tderive + (time_ns() - t0) / 1e9
     try
         pot = plan.pot
-        fmean = _periodic_steps!(pot, s, g, fvals, plan.wplan, Msrc, tm)
-        # neutralizing background: remove the k = 0 mode of the real-space parts
-        # (narrow Gaussians and local correction); the wide part has none
-        dc = fmean * (Sn + plan.taylor[1])
+        fq = _periodic_steps!(pot, s, g, fvals, plan.wplan, Msrc, tm)
+        # 3D (fq the mean of f), neutralizing background: remove the k = 0 mode
+        # of the real-space parts (narrow Gaussians and local correction), the
+        # wide part has none. Slab (fq the charge Q): the gauge u + 2πQ|z|/A → 0
+        # (`SlabWide`, the constant of the k̇ = 0 kernel)
+        dc = g.slab ? fq * plan.wplan.qconst : fq * (Sn + plan.taylor[1])
         parallel_foreach(collect(1:ft.nboxes), fill(nothing, _nthreads())) do ibox, _
             (ft.nchild[ibox] == 0 && plan.istarget[ibox]) && (view(pot, :, :, :, ibox) .-= dc)
         end
@@ -363,16 +375,14 @@ function _resample!(plan::PeriodicPlan, f)
     end
     if !plan.sample_once
         t0 = time_ns()
-        _sample_flat!(fvals, ft, g, f, [b for b in 1:nb if plan.core[b] && plan.copysrc[b] == 0], x)
+        _sample_flat!(fvals, ft, g, f, _sampled_boxes(plan), x)
         tsamp = (time_ns() - t0) / 1e9
         copyboxes([b for b in 1:nb if plan.copysrc[b] > 0])
         _resample_noncore!(plan, [b for b in 1:nb if !plan.core[b]], x)
         return tsamp
     end
-    sampled = [b for b in 1:nb if org[b] == _SAMPLED &&
-               (ft.nchild[b] == 0 || org[ft.child[1, b]] != _SAMPLED || (ft.level[b] == 0 && !g.tiled))]
     t0 = time_ns()
-    _sample_flat!(fvals, ft, g, f, sampled, x)
+    _sample_flat!(fvals, ft, g, f, _sampled_boxes(plan), x)
     tsamp = (time_ns() - t0) / 1e9
     fp = _FromParent(n)
     np = n^3
@@ -393,6 +403,71 @@ function _resample!(plan::PeriodicPlan, f)
         derive(lev(L, b -> org[b] == _FROMPARENT && !plan.core[b]))
     end
     return tsamp
+end
+
+# Boxes on which a solve samples f, in the order of `sample_points`.
+function _sampled_boxes(plan::PeriodicPlan)
+    ft, org = plan.ft, plan.origin
+    nb = ft.nboxes
+    plan.sample_once || return [b for b in 1:nb if plan.core[b] && plan.copysrc[b] == 0]
+    return [b for b in 1:nb if org[b] == _SAMPLED &&
+            (ft.nchild[b] == 0 || org[ft.child[1, b]] != _SAMPLED || (ft.level[b] == 0 && !plan.g.tiled))]
+end
+
+"""
+    sample_points(plan) -> P (3 × N)
+
+The points (caller's frame) at which a solve evaluates the density, box by box
+on the Legendre grids. `periodic_solve!(plan, v)` with `v[j] = f(P[:, j])` is
+the solve for `f`; any values on these points define a density on the plan's
+forest (e.g. one known only through a basis, evaluated in batches).
+"""
+function sample_points(plan::PeriodicPlan)
+    ft, g, n = plan.ft, plan.g, plan.n
+    x = ortho1d(LegendreBasis(), n).x
+    bs = _sampled_boxes(plan)
+    np = n^3
+    P = zeros(3, np * length(bs))
+    R = g.Q
+    parallel_foreach(collect(eachindex(bs)), fill(nothing, _nthreads())) do i, _
+        b = bs[i]
+        h = ft.boxsize[ft.level[b] + 1] / 2
+        q = np * (i - 1)
+        @inbounds for iz in 1:n, iy in 1:n, ix in 1:n
+            q += 1
+            y1 = ft.centers[1, b] + h * x[ix]; y2 = ft.centers[2, b] + h * x[iy]; y3 = ft.centers[3, b] + h * x[iz]
+            for d in 1:3
+                P[d, q] = R[d, 1] * y1 + R[d, 2] * y2 + R[d, 3] * y3
+            end
+            P[3, q] += g.zorg
+        end
+    end
+    return P
+end
+
+# Density given by its values at `sample_points`.
+struct _GivenValues{V<:AbstractVector{<:Real}}
+    v::V
+end
+
+"""
+    periodic_solve!(plan, v::AbstractVector; timings=nothing) -> PeriodicResult
+
+Solve for the density with values `v` at `sample_points(plan)` (needs
+`sample_once`, the default).
+"""
+function periodic_solve!(plan::PeriodicPlan, v::AbstractVector{<:Real}; timings::Union{Nothing,Vector{Float64}} = nothing)
+    plan.sample_once || throw(ArgumentError("solving from given values needs a plan with sample_once"))
+    length(v) == plan.n^3 * length(_sampled_boxes(plan)) ||
+        throw(ArgumentError("need one value per sample point ($(plan.n^3 * length(_sampled_boxes(plan))))"))
+    plan.fresh = false
+    old_ftz = get_zero_subnormals()
+    set_zero_subnormals(true)
+    try
+        return _periodic_solve!(plan, _GivenValues(v), timings === nothing ? zeros(10) : timings)
+    finally
+        set_zero_subnormals(old_ftz)
+    end
 end
 
 # Non-core boxes `others` from the core leaves at the images of their nodes.
@@ -421,6 +496,12 @@ end
 function _sample_flat!(fvals, ft::FlatTree, g::PeriodicGrid, f, bs, x::Vector{Float64})
     n = length(x); np = n^3
     R = g.Q
+    if f isa _GivenValues
+        parallel_foreach(collect(eachindex(bs)), fill(nothing, _nthreads())) do i, _
+            copyto!(view(fvals, :, :, :, bs[i]), 1, f.v, 1 + np * (i - 1), np)
+        end
+        return fvals
+    end
     if f isa _BatchDensity
         parallel_foreach(bs, [zeros(3, np) for _ in 1:_nthreads()]) do b, pts
             h = ft.boxsize[ft.level[b] + 1] / 2
@@ -471,15 +552,20 @@ function _source_boxes(ft::FlatTree, fvals, eps::Float64, Sn::Float64)
     return src
 end
 
-# Default level-0 side of a slab: the largest rc ≤ min(L₁, L₂, H) that divides
-# both in-plane sides.
-function _slab_rc(L1::Float64, L2::Float64, H::Float64)
-    rmin = min(L1, L2, H)
-    for m in max(1, ceil(Int, L1 / rmin * (1 - 1e-12))):ceil(Int, 64 * L1 / rmin)
-        rc = L1 / m
-        abs(round(L2 / rc) * rc - L2) <= 1e-9 * L2 && return rc
+# Default level-0 side of a slab (U the rotated cell, dmin the in-plane lattice
+# spacing): rectangular cells, the largest rc ≤ min(L₁, L₂, H) dividing both
+# sides when one is not much smaller (the cubes then tile the cell);
+# otherwise min(dmin, H).
+function _slab_rc(U::AbstractMatrix, dmin::Float64)
+    rmin = min(dmin, U[3, 3])
+    if abs(U[1, 2]) <= 1e-12 * U[1, 1]
+        L1, L2 = U[1, 1], U[2, 2]
+        for m in max(1, ceil(Int, L1 / rmin * (1 - 1e-12))):floor(Int, 2 * L1 / rmin)
+            rc = L1 / m
+            abs(round(L2 / rc) * rc - L2) <= 1e-9 * L2 && return rc
+        end
     end
-    throw(ArgumentError("no level-0 side ≤ min(L₁, L₂, H) divides both in-plane sides; pass rc"))
+    return rmin
 end
 
 # ∫|f| over a box (side h) from its node values; w3 the tensor Gauss-Legendre weights.
@@ -574,7 +660,7 @@ end
 # cubes, added to the proxy potentials of nonleaf boxes (spread by the
 # downward pass) and evaluated directly on leaf boxes. For a tiled cell the
 # moments are those of the central cubes (proxy charges of the upward pass).
-# Returns the mean of f over the cell.
+# Returns the mean of f over the cell (slab: the total charge).
 function _wide_inject!(pot, pp, pc, nodeidx, s::DMKSetup, g::PeriodicGrid, fv, P, Msrc)
     ft, p = s.ft, s.porder
     pe = P.pe
@@ -584,7 +670,7 @@ function _wide_inject!(pot, pp, pc, nodeidx, s::DMKSetup, g::PeriodicGrid, fv, P
     # (M and C are assigned once: the threaded closures capture them, and a
     # variable assigned more than once would be boxed)
     M = Msrc === nothing ? _level0_moments(pc, nodeidx, s, g, fv, P.pf, boxes, wks) : Msrc
-    P isa SlabWide && _check_neutral(P, M, s, g, fv)
+    P isa SlabWide && !P.charged && _check_neutral(P, M, s, g, fv)
     C = _wide_coefs(P, M, s.arena)
     parallel_foreach([b for b in boxes if s.istarget[b[1]]], wks) do (ibox, (i, j, k)), w
         cb = reshape(view(w.w3, 1:p^3), p, p, p)
@@ -596,7 +682,7 @@ function _wide_inject!(pot, pp, pc, nodeidx, s::DMKSetup, g::PeriodicGrid, fv, P
             vec(view(pp, :, 1, 1, nodeidx[ibox])) .+= vec(cb)
         end
     end
-    return P isa SlabWide ? 0.0 : _cell_mean(P, M)
+    return P isa SlabWide ? _slab_charge(P, M) : _cell_mean(P, M)
 end
 
 # Legendre moments (u-measure) of the central level-0 cubes, from their proxy
@@ -625,6 +711,12 @@ _wide_coefs(P::WidePlan, M, ar::Arena) = wide_coefficients(P, wide_modes(P, M, a
 # or reversed Ct[r₃, r₂, r₁].
 function _cube_coefs!(cb, C::Array{Float64,3}, P::SlabWide, i::Int, j::Int, k::Int)
     pe = P.pe
+    if !P.tiled                                    # reversed order (oblique cells)
+        @inbounds for l3 in 1:pe, l2 in 1:pe, l1 in 1:pe
+            cb[l1, l2, l3] = C[pe * k + l3, pe * j + l2, pe * i + l1]
+        end
+        return cb
+    end
     @inbounds for l3 in 1:pe, l2 in 1:pe, l1 in 1:pe
         cb[l1, l2, l3] = C[pe * i + l1, pe * j + l2, pe * k + l3]
     end
@@ -647,7 +739,7 @@ end
 # A slab density must be neutral (the 2-periodic sum diverges otherwise).
 function _check_neutral(P::SlabWide, M, s::DMKSetup, g::PeriodicGrid, fv)
     ft = s.ft
-    qtot = _slab_charge(P, M, g.rc)
+    qtot = _slab_charge(P, M)
     w3 = _tensor_weights(s.n)
     lv = [b for b in 1:ft.nboxes if ft.nchild[b] == 0 && !_inhalo(g, view(ft.centers, :, b))]
     l1 = zeros(length(lv))
@@ -665,7 +757,10 @@ function _wrap_into_cell(g::PeriodicGrid, x::AbstractVector)
     if g.slab                                    # periodic in x, y; z inside the slab
         z = x[3] - g.zorg
         0 <= z <= g.U[3, 3] || throw(ArgumentError("z = $(x[3]) is outside the slab"))
-        return [mod(x[1], g.U[1, 1]), mod(x[2], g.U[2, 2]), z]
+        y = transpose(g.Q) * [x[1], x[2], 0.0]
+        t = [g.Uinv[1, 1] * y[1] + g.Uinv[1, 2] * y[2], g.Uinv[2, 2] * y[2]]
+        t .-= floor.(t)
+        return [g.U[1, 1] * t[1] + g.U[1, 2] * t[2], g.U[2, 2] * t[2], z]
     end
     t = g.Uinv * (transpose(g.Q) * x)            # fractional coordinates
     t .-= floor.(t)

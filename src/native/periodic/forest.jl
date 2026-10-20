@@ -78,18 +78,28 @@ function PeriodicGrid(A::AbstractMatrix, rc::Float64, nhalo::Int; slab::Bool = f
                         mgrid .+ 2nhalo, xgrid0 .- nhalo * rc, diagonal, tiled, (nhalo, nhalo, nhalo), false, 0.0)
 end
 
-# Quasi-2D grid: rectangular in-plane cell L₁ × L₂ tiled by the level-0 cubes,
-# the slab 0 ≤ z ≤ H covered by mgrid[3] cubes from z = 0, images in x and y only.
+# Quasi-2D grid: in-plane cell A₂ = Q₂U₂ (columns a₁, a₂ in the xy plane),
+# covered by the bounding box of rc cubes in the rotated frame (tiled when
+# rectangular with sides multiple of rc), the slab 0 ≤ z ≤ H by mgrid[3] cubes
+# from z = 0, images in x and y only.
 function _slab_grid(A::AbstractMatrix, rc::Float64, nhalo::Int, zorg::Float64)
-    L1, L2, H = A[1, 1], A[2, 2], A[3, 3]
-    m = (round(Int, L1 / rc), round(Int, L2 / rc), max(1, ceil(Int, H / rc * (1 - 1e-12))))
-    all(abs(m[d] * rc - (L1, L2)[d]) <= 1e-9 * (L1, L2)[d] for d in 1:2) ||
-        throw(ArgumentError("the in-plane sides must be multiples of the level-0 box side rc = $rc"))
-    U = Matrix{Float64}(Diagonal([L1, L2, H]))
-    xg = (0.0, 0.0, 0.0)                                  # z-cells from the slab bottom up
+    size(A) == (3, 3) && all(abs(A[3, j]) <= 1e-14 * norm(A) for j in 1:2) && A[1, 3] == A[2, 3] == 0 && A[3, 3] > 0 ||
+        throw(ArgumentError("slab cell: in-plane lattice vectors (x, y) and the slab height"))
+    Q, U = _lattice_qr(A)
+    U[1:2, 3] .= 0.0
+    Uinv = Matrix(inv(UpperTriangular(U)))
+    H = U[3, 3]
+    lo1 = min(0.0, U[1, 2])
+    m = (max(1, ceil(Int, (U[1, 1] + abs(U[1, 2])) / rc * (1 - 1e-12))), max(1, ceil(Int, U[2, 2] / rc * (1 - 1e-12))),
+         max(1, ceil(Int, H / rc * (1 - 1e-12))))
+    diagonal = abs(U[1, 2]) <= 1e-12 * U[1, 1]
+    tiled = diagonal && all(abs(round(U[d, d] / rc) * rc - U[d, d]) <= 1e-9 * U[d, d] for d in 1:2)
+    tiled && (m = (round(Int, U[1, 1] / rc), round(Int, U[2, 2] / rc), m[3]))
+    xg = (lo1, 0.0, 0.0)                                  # z-cells from the slab bottom up
     halo = (nhalo, nhalo, 0)
-    return PeriodicGrid(U, Matrix{Float64}(I, 3, 3), U, inv(U), L1 * L2 * H, min(L1, L2), rc, m, xg, nhalo,
-                        m .+ 2 .* halo, xg .- halo .* rc, true, true, halo, true, zorg)
+    dmin = minimum(1 / norm(view(Uinv, i, 1:2)) for i in 1:2)
+    return PeriodicGrid(Matrix{Float64}(A), Q, U, Uinv, abs(det(U)), dmin, rc, m, xg, nhalo,
+                        m .+ 2 .* halo, xg .- halo .* rc, diagonal, tiled, halo, true, zorg)
 end
 
 PeriodicGrid(L::NTuple{3,Float64}, rc::Float64, nhalo::Int) = PeriodicGrid(Matrix(Diagonal(collect(L))), rc, nhalo)
@@ -611,7 +621,7 @@ _interp_workspaces(n::Int) = [(gid = zeros(Int, n^3), grp = Tuple{Int,NTuple{3,F
 # leaf, which is smaller than the lattice spacing); on each leaf they are a
 # subset of a tensor grid, evaluated by three small products.
 function _interp_values!(v, c, h::Float64, x::Vector{Float64}, g::PeriodicGrid, n::Int, locate, geom, coef, w)
-    Ui, U = g.Uinv, g.U
+    Ui, U, slab = g.Uinv, g.U, g.slab
     gid = w.gid; grp = w.grp
     empty!(grp)
     Lc = 0; lo = (0.0, 0.0, 0.0); hi = (0.0, 0.0, 0.0); gc = 0
@@ -620,6 +630,7 @@ function _interp_values!(v, c, h::Float64, x::Vector{Float64}, g::PeriodicGrid, 
         q += 1
         p = (c[1] + h * x[ix], c[2] + h * x[iy], c[3] + h * x[iz])
         t = ntuple(3) do d
+            d == 3 && slab && return 0.0                              # free in z
             u = Ui[d, 1] * p[1] + Ui[d, 2] * p[2] + Ui[d, 3] * p[3]
             clamp(u - floor(u), 1e-12, 1 - 1e-12) - u                 # wrapped - unwrapped
         end

@@ -20,24 +20,24 @@ end
 
 function BinnedMixture(g::Q2DMixture)
     rcut = sqrt(46 / minimum(g.alpha))
-    nb = (max(1, floor(Int, g.L[1] / rcut)), max(1, floor(Int, g.L[2] / rcut)))
-    h = (g.L[1] / nb[1], g.L[2] / nb[2])
+    nb = (max(1, floor(Int, g.A[1, 1] / rcut)), max(1, floor(Int, g.A[2, 2] / rcut)))
+    h = (g.A[1, 1] / nb[1], g.A[2, 2] / nb[2])
     bins = [Int[] for _ in 1:nb[1], _ in 1:nb[2]]
     for (j, x) in enumerate(g.x)
-        push!(bins[1 + floor(Int, mod(x[1], g.L[1]) / h[1]), 1 + floor(Int, mod(x[2], g.L[2]) / h[2])], j)
+        push!(bins[1 + floor(Int, mod(x[1], g.A[1, 1]) / h[1]), 1 + floor(Int, mod(x[2], g.A[2, 2]) / h[2])], j)
     end
     return BinnedMixture(g, nb, h, bins)
 end
 
 function (m::BinnedMixture)(p::AbstractVector)
     g = m.g
-    i0 = floor(Int, mod(p[1], g.L[1]) / m.h[1]); j0 = floor(Int, mod(p[2], g.L[2]) / m.h[2])
+    i0 = floor(Int, mod(p[1], g.A[1, 1]) / m.h[1]); j0 = floor(Int, mod(p[2], g.A[2, 2]) / m.h[2])
     s = 0.0
     @inbounds for dj in -1:1, di in -1:1
         for j in m.bins[mod(i0 + di, m.nb[1]) + 1, mod(j0 + dj, m.nb[2]) + 1]
             a = g.alpha[j]
             d1 = p[1] - g.x[j][1]; d2 = p[2] - g.x[j][2]; d3 = p[3] - g.x[j][3]
-            d1 -= g.L[1] * round(d1 / g.L[1]); d2 -= g.L[2] * round(d2 / g.L[2])
+            d1 -= g.A[1, 1] * round(d1 / g.A[1, 1]); d2 -= g.A[2, 2] * round(d2 / g.A[2, 2])
             r2 = d1^2 + d2^2 + d3^2
             r2 * a < 46 && (s += g.c[j] * exp(-a * r2))
         end

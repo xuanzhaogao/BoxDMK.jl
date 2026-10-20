@@ -165,7 +165,10 @@ function fractional_moments(f, g::PeriodicGrid, ft::FlatTree, n::Int, pf::Int, t
     end
 end
 
-function _fractional_moments!(F::_Forest, f, g::PeriodicGrid, ft::FlatTree, Ur::Matrix{Float64}, mt, pf::Int, thr::Float64)
+# Root cells of one period refined by the tail test (threshold thr) and while
+# larger than `ratio` times the finest main-forest leaf around them.
+function _fractional_tree!(F::_Forest, f, g::PeriodicGrid, ft::FlatTree, Ur::Matrix{Float64}, mt, thr::Float64,
+                           ratio::Float64 = 2.0)
     n = F.n
     leg = ortho1d(LegendreBasis(), n)
     x = leg.x
@@ -198,7 +201,7 @@ function _fractional_moments!(F::_Forest, f, g::PeriodicGrid, ft::FlatTree, Ur::
                     y[d] = Ur[d, 1] * u1 + Ur[d, 2] * u2 + Ur[d, 3] * u3
                 end
                 leaf = _locate_leaf(ft, g, y)
-                if ft.boxsize[ft.level[leaf] + 1] < hb / 2
+                if ft.boxsize[ft.level[leaf] + 1] < hb / ratio
                     flag[i] = true
                     return
                 end
@@ -207,6 +210,14 @@ function _fractional_moments!(F::_Forest, f, g::PeriodicGrid, ft::FlatTree, Ur::
         any(flag) || break
         level_boxes = _refine!(F, f, level_boxes[flag], x)
     end
+    return F
+end
+
+function _fractional_moments!(F::_Forest, f, g::PeriodicGrid, ft::FlatTree, Ur::Matrix{Float64}, mt, pf::Int, thr::Float64)
+    _fractional_tree!(F, f, g, ft, Ur, mt, thr)
+    n = F.n
+    leg = ortho1d(LegendreBasis(), n)
+    nroot = prod(mt)
 
     # Upward pass. Leaf moments from values: ∫ ℓ_i P_l = 2/(2l+1) U[l, i]
     # (l < n, zero above), times the cell volume / 8.
@@ -246,4 +257,98 @@ function _fractional_moments!(F::_Forest, f, g::PeriodicGrid, ft::FlatTree, Ur::
         M[pf * s1 + 1:pf * (s1 + 1), pf * s2 + 1:pf * (s2 + 1), pf * s3 + 1:pf * (s3 + 1)] .= reshape(mom[b], pf, pf, pf)
     end
     return M
+end
+
+"""
+    PeriodQuadrature
+
+Quadrature over exactly one period of the cell: Gauss–Legendre nodes `x`
+(3 × M, caller's frame) and weights `w` on the leaves of a tree in fractional
+coordinates (parallelepiped cells tiling the period), refined like the wide
+source tree. Made by [`period_quadrature`](@ref); field values on the plan's
+forest are interpolated to its nodes by [`period_values!`](@ref).
+"""
+struct PeriodQuadrature
+    x::Matrix{Float64}
+    w::Vector{Float64}
+    centers::Vector{NTuple{3,Float64}}   # leaves, u coordinates
+    halfsize::Vector{Float64}            # leaves, u half sides
+    Ur::Matrix{Float64}                  # u -> rotated frame
+    n::Int
+end
+
+"""
+    period_quadrature(plan; ratio=1.0) -> PeriodQuadrature
+
+One-period quadrature for the plan's current density (`plan.fvals`): the
+fractional tree is refined by the tail test of the forest and while a cell is
+larger than `ratio` times the finest forest leaf around it, so that products
+of fields resolved by the forest are integrated to its accuracy.
+"""
+function period_quadrature(plan; ratio::Real = 1.0)
+    g, ft, n = plan.g, plan.ft, plan.n
+    mt = source_cells(g)
+    Ur = g.U * Diagonal(1 ./ collect(mt))
+    F = _Forest(n, 1.0, Arena(), g.Q * Ur)
+    ar = Arena()
+    try
+        w3 = _tensor_weights(n)
+        rint0 = sqrt(sum(b -> _box_l2sq(view(plan.fvals, :, :, :, b), w3, g.rc^2 / 8), levelboxes(ft, 0)))
+        _fractional_tree!(F, _ForestSource(ft, g, plan.fvals, n, ar), g, ft, Ur, mt, plan.eps * g.rc^-1.5 * rint0,
+                          Float64(ratio))
+        leaves = [b for b in 1:_nbox(F) if _isleaf(F, b)]
+        leg = ortho1d(LegendreBasis(), n)
+        x, wl = leg.x, leg.w
+        np = n^3
+        X = zeros(3, np * length(leaves)); W = zeros(np * length(leaves))
+        R = g.Q * Ur
+        J = abs(det(Ur))
+        cs = [F.centers[b] for b in leaves]
+        hs = [F.boxsize[F.level[b] + 1] / 2 for b in leaves]
+        parallel_foreach(collect(eachindex(leaves)), fill(nothing, _nthreads())) do i, _
+            c, h = cs[i], hs[i]
+            q = np * (i - 1)
+            @inbounds for k in 1:n, j in 1:n, l in 1:n
+                q += 1
+                u = (c[1] + h * x[l], c[2] + h * x[j], c[3] + h * x[k])
+                for d in 1:3
+                    X[d, q] = R[d, 1] * u[1] + R[d, 2] * u[2] + R[d, 3] * u[3]
+                end
+                X[3, q] += g.zorg
+                W[q] = J * h^3 * wl[l] * wl[j] * wl[k]
+            end
+        end
+        return PeriodQuadrature(X, W, cs, hs, Ur, n)
+    finally
+        release!(ar)
+        release!(F.ar)
+    end
+end
+
+"""
+    period_values!(out, Q::PeriodQuadrature, res::PeriodicResult; field=res.pot) -> out
+
+Values at the nodes of `Q` of a field on the forest of `res` (the potential by
+default; `res.fvals` for the density), from the polynomials of its central leaves.
+"""
+function period_values!(out::AbstractVector{Float64}, Q::PeriodQuadrature, res; field = res.pot)
+    ft, g, n = res.ft, res.grid, res.norder
+    n == Q.n || throw(ArgumentError("quadrature and forest orders differ"))
+    length(out) == size(Q.x, 2) || throw(ArgumentError("need one output per node"))
+    np = n^3
+    x = ortho1d(LegendreBasis(), n).x
+    ar = Arena()
+    try
+        fs = _ForestSource(ft, g, field, n, ar)
+        ws = [(gid = zeros(Int, np), grp = Int[], y1 = zeros(np), y2 = zeros(n, n), y3 = zeros(n),
+               P = zeros(n, n), D = alloc(ar, n * n, n), E = zeros(n, n), ks = zeros(Int, n), js = zeros(Int, n),
+               pv = zeros(n), v = zeros(np)) for _ in 1:_nthreads()]
+        parallel_foreach(collect(eachindex(Q.centers)), ws) do i, w
+            _forest_values!(w.v, Q.centers[i], Q.halfsize[i], x, Q.Ur, fs, n, w)
+            copyto!(out, 1 + np * (i - 1), w.v, 1, np)
+        end
+    finally
+        release!(ar)
+    end
+    return out
 end

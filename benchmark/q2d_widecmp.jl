@@ -13,7 +13,7 @@ function setup(A, rc, nd, slab)
 end
 function run(name, A, rc, nd, slab)
     g, P, tp = setup(A, rc, nd, slab)
-    M = randn(P.pf * g.mgrid[1], P.pf * g.mgrid[2], P.pf * g.mgrid[3])
+    M = randn(P.pf * P.mt[1], P.pf * P.mt[2], P.pf * P.mt[3])
     best = Inf
     for r in 1:3
         ar = BoxDMK.Arena()
