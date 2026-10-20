@@ -632,6 +632,12 @@ function _cube_coefs!(cb, C::Array{Float64,3}, P::SlabWide, i::Int, j::Int, k::I
 end
 function _cube_coefs!(cb, C::Array{Float64,3}, P::WidePlan, i::Int, j::Int, k::Int)
     pe = P.pe
+    if P.iE !== nothing                            # natural order (FFT over the cubes)
+        @inbounds for l3 in 1:pe, l2 in 1:pe, l1 in 1:pe
+            cb[l1, l2, l3] = C[pe * i + l1, pe * j + l2, pe * k + l3]
+        end
+        return cb
+    end
     @inbounds for l3 in 1:pe, l2 in 1:pe, l1 in 1:pe
         cb[l1, l2, l3] = C[pe * k + l3, pe * j + l2, pe * i + l1]
     end

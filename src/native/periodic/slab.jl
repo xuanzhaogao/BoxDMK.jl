@@ -25,8 +25,8 @@ struct SlabWide
     T2t::Matrix{ComplexF64}          # pf × K₂, m₂ = -Kh₂ … Kh₂
     Et1::Matrix{ComplexF64}          # (Kh₁+1) × pe: (2l+1) i^l j_l(k rc/2) e^{iπm/mt} × half-space weight
     Et2::Matrix{ComplexF64}          # K₂ × pe
-    r1::Vector{Int}                  # 1 + (m₁ mod mt₁)
-    r2::Vector{Int}                  # 1 + (m₂ mod mt₂)
+    r1::Vector{Int}                  # m₁ mod mt₁
+    r2::Vector{Int}                  # m₂ mod mt₂
     GzT::Vector{Matrix{Float64}}     # per wide Gaussian: transpose of its z matrix (pf mz × pe mz)
     ord::Vector{Int}                 # modes (index m₁ + H₁ m₂) by increasing |k̇|
     nact::Vector{Int}                # per Gaussian: its modes are ord[1:nact] (weight below eps/1e3 beyond)
@@ -74,9 +74,6 @@ function SlabWide(g::PeriodicGrid, eps::Float64, pf::Int, pe::Int, tsw::Vector{F
     Kh = ntuple(d -> ceil(Int, kmax * L[d] / 2pi), 2)
     mt = g.mgrid
     B = (2pi / L[1], 2pi / L[2])
-    cplx(T) = complex.(T[1], T[2])
-    T(d, ms) = cplx(_legtable(ms, pf, 1, m -> pi * m / mt[d], 1.0, -1, (m, s) -> -pi * m / mt[d]))
-    E(d, ms, wt = m -> 1.0) = cplx(_legtable(ms, pe, 1, m -> B[d] * m, rc / 2, 1, (m, s) -> pi * m / mt[d], wt))
     m1s = 0:Kh[1]; m2s = (-Kh[2]):Kh[2]
     H1, K2 = Kh[1] + 1, 2Kh[2] + 1
     sc = rc^3                                   # u-measure moments -> volume
@@ -104,29 +101,10 @@ function SlabWide(g::PeriodicGrid, eps::Float64, pf::Int, pe::Int, tsw::Vector{F
     wtail = wsw[byw[end]] / (b - 1)
     D(z) = (sum(wsw[s] * pi * tsw[s] * expm1(-z^2 / tsw[s]) for s in eachindex(tsw)) - pi * wtail * z^2) / area
     D0T = Matrix(transpose(sc .* _zkernel_matrix(D, g, pe, pf)))
-    return SlabWide(pf, pe, Kh, Matrix(transpose(T(1, m1s))), Matrix(transpose(T(2, m2s))),
-                    E(1, m1s, m -> m == 0 ? 1.0 : 2.0), E(2, m2s), [mod(m, mt[1]) + 1 for m in m1s],
-                    [mod(m, mt[2]) + 1 for m in m2s], GzT, ord, nact, cm, D0T, mt)
+    return SlabWide(pf, pe, Kh, _axis_T(m1s, pf, mt[1]), _axis_T(m2s, pf, mt[2]),
+                    _axis_E(m1s, pe, mt[1], rc, g.xgrid0[1], m -> m == 0 ? 1.0 : 2.0), _axis_E(m2s, pe, mt[2], rc, g.xgrid0[2]),
+                    _axis_r(m1s, mt[1]), _axis_r(m2s, mt[2]), GzT, ord, nact, cm, D0T, mt)
 end
-
-# FFTs along one dimension on all threads (forward = e^{-2πi rs/n}, inverse
-# unnormalised): complex in place, real -> half spectrum, half spectrum -> real.
-function _with_fftw_threads(f)
-    old = FFTW.get_num_threads()
-    FFTW.set_num_threads(_nthreads())
-    try
-        return f()
-    finally
-        FFTW.set_num_threads(old)
-    end
-end
-_fft_dim!(A::AbstractArray{ComplexF64}, d::Int, forward::Bool) = _with_fftw_threads() do
-    (forward ? FFTW.plan_fft!(A, d; flags = FFTW.ESTIMATE) : FFTW.plan_bfft!(A, d; flags = FFTW.ESTIMATE)) * A
-end
-_rfft_dim!(out, A::AbstractArray{Float64}, d::Int) =
-    _with_fftw_threads(() -> mul!(out, FFTW.plan_rfft(A, d; flags = FFTW.ESTIMATE), A))
-_brfft_dim!(out, A::AbstractArray{ComplexF64}, n::Int, d::Int) =
-    _with_fftw_threads(() -> mul!(out, FFTW.plan_brfft(A, n, d; flags = FFTW.ESTIMATE), A))
 
 """
     slab_coefficients(S::SlabWide, M, ar) -> C
@@ -144,47 +122,9 @@ function slab_coefficients(S::SlabWide, M::Array{Float64,3}, ar::Arena)
     R2, R3 = pe * mt2, pe * mz
     nt = fill(nothing, _nthreads())
     T1t, T2t, Et1, Et2, r1, r2 = S.T1t, S.T2t, S.Et1, S.Et2, S.r1, S.r2
-    # x: real FFT over the cells (half spectrum; frequency r > mt/2 is the
-    # conjugate of mt - r), then the modes m₁ from their frequency: X[m₁, (l₂ s₂), q₃]
-    N1 = Q2 * Q3
-    h1 = mt1 ÷ 2 + 1
-    A1 = allocc(ar, pf, h1, N1)
-    _rfft_dim!(A1, reshape(M, pf, mt1, N1), 2)
-    X = allocc(ar, H1, Q2, Q3)
-    parallel_foreach(collect(1:N1), nt) do n, _
-        @inbounds for m in 1:H1
-            r = r1[m] - 1
-            acc = zero(ComplexF64)
-            if r < h1
-                @simd for l in 1:pf
-                    acc = muladd(T1t[l, m], A1[l, r + 1, n], acc)
-                end
-            else
-                @simd for l in 1:pf
-                    acc = muladd(T1t[l, m], conj(A1[l, mt1 - r + 1, n]), acc)
-                end
-            end
-            X[m + H1 * (n - 1)] = acc
-        end
-    end
-    # y: the same along (l₂, s₂): Z[m₁, m₂, q₃]
-    X4 = reshape(X, H1, pf, mt2, Q3)
-    _fft_dim!(X4, 3, true)
-    Z = allocc(ar, H1, K2, Q3)
-    parallel_foreach([(m2, q3) for q3 in 1:Q3 for m2 in 1:K2], nt) do (m2, q3), _
-        r = r2[m2]
-        @inbounds begin
-            for i in 1:H1
-                Z[i, m2, q3] = 0
-            end
-            for l in 1:pf
-                t = T2t[l, m2]
-                @simd for i in 1:H1
-                    Z[i, m2, q3] = muladd(t, X4[i, l, r, q3], Z[i, m2, q3])
-                end
-            end
-        end
-    end
+    # in plane (x, then y): Z[m₁, m₂, q₃]
+    X = _axis_fwd(M, 1, Q2 * Q3, pf, mt1, T1t, r1, ar)                  # (H₁, Q₂, Q₃)
+    Z = _axis_fwd(X, H1, Q3, pf, mt2, T2t, r2, ar)                        # (H₁, K₂, Q₃)
     # z, per mode: Out = Σ_g (c_g ⊙ Z) G_gᵀ plus the k̇ = 0 kernel, on (re, im)
     # rows of the modes sorted by |k̇|, where Gaussian g acts on the first nact[g]
     ord = S.ord
@@ -225,51 +165,9 @@ function slab_coefficients(S::SlabWide, M::Array{Float64,3}, ar::Arena)
             Out[m + nm * (q - 1)] = complex(Os[2r - 1, q], Os[2r, q])
         end
     end
-    # back along y: W[m₁, l₂, frequency, r₃] = Σ_{m₂} Ẽ₂ Out, inverse FFT over the cells -> (m₁, l₂ + pe s₂, r₃)
-    W2 = allocc(ar, H1, pe, mt2, R3)
-    parallel_foreach([(l, r3) for r3 in 1:R3 for l in 1:pe], nt) do (l, r3), _
-        @inbounds begin
-            for f in 1:mt2, i in 1:H1
-                W2[i, l, f, r3] = 0
-            end
-            for m2 in 1:K2
-                e = Et2[m2, l]; f = r2[m2]
-                @simd for i in 1:H1
-                    W2[i, l, f, r3] = muladd(e, Out[i, m2, r3], W2[i, l, f, r3])
-                end
-            end
-        end
-    end
-    _fft_dim!(W2, 3, false)
-    # back along x, real part: Re Σ_r W_r e^{2πi rs/mt} is the inverse real FFT
-    # of the Hermitian half (W_r + conj W_{mt-r})/2, accumulated directly:
-    # V[l₁, frequency ≤ mt/2, (r₂, r₃)] from Σ_{m₁} Ẽ₁ C₂, then C[l₁ + pe s₁, r₂, r₃]
-    N2 = R2 * R3
-    C2 = reshape(W2, H1, N2)
-    W1 = allocc(ar, pe, h1, N2)
-    parallel_foreach(collect(1:N2), nt) do n, _
-        @inbounds begin
-            for f in 1:h1, l in 1:pe
-                W1[l, f, n] = 0
-            end
-            for m in 1:H1
-                c = C2[m, n] / 2; r = r1[m] - 1; rb = mod(mt1 - r, mt1)
-                if r < h1
-                    @simd for l in 1:pe
-                        W1[l, r + 1, n] = muladd(Et1[m, l], c, W1[l, r + 1, n])
-                    end
-                end
-                if rb < h1
-                    cc = conj(c)
-                    @simd for l in 1:pe
-                        W1[l, rb + 1, n] = muladd(conj(Et1[m, l]), cc, W1[l, rb + 1, n])
-                    end
-                end
-            end
-        end
-    end
-    C = alloc(ar, pe * mt1, R2, R3)
-    _brfft_dim!(reshape(C, pe, mt1, N2), W1, mt1, 2)
+    # back in plane (y, then x with the real part): C[l₁ + pe s₁, r₂, r₃]
+    C2 = _axis_inv(Out, H1, R3, pe, mt2, Et2, r2, ar)                     # (H₁, R₂, R₃)
+    C = reshape(_axis_inv_real(C2, 1, R2 * R3, pe, mt1, Et1, r1, ar), pe * mt1, R2, R3)
     return C
 end
 
