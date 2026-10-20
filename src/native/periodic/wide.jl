@@ -300,7 +300,8 @@ end
 Legendre coefficients (degree < pe) of u_wide on the central level-0 cubes
 from the half-grid modes `G` of `wide_modes`. By FFT over the cubes (many
 cubes tiling the cell) in natural order, C[l₁ + pe s₁, l₂ + pe s₂, l₃ + pe s₃];
-otherwise in reversed order, C[l₃ + pe s₃, l₂ + pe s₂, l₁ + pe s₁].
+otherwise in reversed order, C[l₃ + pe s₃, l₂ + pe s₂, l₁ + pe s₁], by chirp-z
+transforms (very many cubes, chirpz.jl) or dense products.
 """
 function wide_coefficients(P::WidePlan, G::Array{ComplexF64,3}, ar::Arena)
     H1, K2, K3 = size(G)
@@ -312,14 +313,23 @@ function wide_coefficients(P::WidePlan, G::Array{ComplexF64,3}, ar::Arena)
         Y2 = _axis_inv(Y3, H1, R3, pe, mg[2], P.iE[2], P.ir[2], ar)         # (H₁, R₂, R₃)
         return reshape(_axis_inv_real(Y2, 1, R2 * R3, pe, mg[1], P.iE[1], P.ir[1], ar), pe * mg[1], R2, R3)
     end
+    maximum(P.mgrid) >= _CHIRP_MIN_CUBES && return _wide_coefs_chirp(P, G, ar)   # very many cubes, not tiling
     Gr = alloc(ar, H1, K2, K3); Gi = alloc(ar, H1, K2, K3)
     @inbounds for i in eachindex(G)
         Gr[i] = real(G[i]); Gi[i] = imag(G[i])
     end
     return wide_coefficients(P, (Gr, Gi), ar)
 end
-wide_coefficients(P::WidePlan, G::NTuple{2,Array{Float64,3}}, ar::Arena) =
-    P.E2 === nothing ? _wide_coefs_triangular(P, G..., ar) : _wide_coefs_separable(P, G..., ar)
+function wide_coefficients(P::WidePlan, G::NTuple{2,Array{Float64,3}}, ar::Arena)
+    if P.iE === nothing && maximum(P.mgrid) >= _CHIRP_MIN_CUBES
+        Gc = allocc(ar, size(G[1])...)
+        @inbounds for i in eachindex(Gc)
+            Gc[i] = complex(G[1][i], G[2][i])
+        end
+        return _wide_coefs_chirp(P, Gc, ar)
+    end
+    return P.E2 === nothing ? _wide_coefs_triangular(P, G..., ar) : _wide_coefs_separable(P, G..., ar)
+end
 
 # Ct[r₃, r₂, r₁] = Re Σ_{m₁ ≥ 0} A[r₃, r₂, m₁] E₁[m₁, r₁] (weighted rows of E₁).
 function _wide_coefs_final(P, Ar::Array{Float64,3}, Ai::Array{Float64,3}, ar::Arena)

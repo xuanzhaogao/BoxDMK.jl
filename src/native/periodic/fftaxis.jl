@@ -12,23 +12,72 @@
 # exact, O(N log N) instead of O(modes × cells). Arrays are (A, axis, B), the
 # transformed axis in the middle; every routine runs on all threads.
 
-# FFTW on all threads (forward = e^{-2πi rs/n}, inverse unnormalised).
-function _with_fftw_threads(f, n::Int = typemax(Int))
+# FFTs along the cell axis (dimension 3 of (A, p, n, B) arrays; forward =
+# e^{-2πi rs/n}, inverse unnormalised), run as single-threaded FFTW plans on
+# pieces of the batch, in parallel on Julia threads. (FFTW's own threads,
+# through FFTW.jl's spawnloop, crashed with a segfault in the test suite.)
+function _with_fftw_threads(f, n::Int = 1)
     old = FFTW.get_num_threads()
-    FFTW.set_num_threads(n < 1 << 16 ? 1 : _nthreads())     # small transforms: no thread start-up
+    FFTW.set_num_threads(1)
     try
         return f()
     finally
         FFTW.set_num_threads(old)
     end
 end
-_fft_dim!(A::AbstractArray{ComplexF64}, d::Int, forward::Bool) = _with_fftw_threads(length(A)) do
-    (forward ? FFTW.plan_fft!(A, d; flags = FFTW.ESTIMATE) : FFTW.plan_bfft!(A, d; flags = FFTW.ESTIMATE)) * A
+
+const _FFTW_FLAGS = FFTW.ESTIMATE | FFTW.UNALIGNED      # one plan for every piece
+
+# Pieces (row range, batch range) of an (R, n, B) array for the threads.
+function _fft_pieces(R::Int, B::Int)
+    nt = _nthreads()
+    if B >= 2nt
+        cb = cld(B, 4nt)
+        return [(1:R, b0:min(B, b0 + cb - 1)) for b0 in 1:cb:B]
+    end
+    rb = cld(R, max(1, cld(4nt, B)))
+    return [(r0:min(R, r0 + rb - 1), b:b) for b in 1:B for r0 in 1:rb:R]
 end
-_rfft_dim!(out, A::AbstractArray{Float64}, d::Int) =
-    _with_fftw_threads(() -> mul!(out, FFTW.plan_rfft(A, d; flags = FFTW.ESTIMATE), A), length(A))
-_brfft_dim!(out, A::AbstractArray{ComplexF64}, n::Int, d::Int) =
-    _with_fftw_threads(() -> mul!(out, FFTW.plan_brfft(A, n, d; flags = FFTW.ESTIMATE), A), length(out))
+
+# Apply plan(view of in, view of out) piece by piece: `mk(vin, vout)` plans for
+# one piece shape (serially), `run(P, vin, vout)` executes it.
+function _fft_run!(mk, run, inp, out, R::Int, B::Int)
+    pcs = _fft_pieces(R, B)
+    plans = Dict{Tuple{Int,Int},Any}()
+    for (rr, bb) in pcs
+        key = (length(rr), length(bb))
+        haskey(plans, key) || (plans[key] = _with_fftw_threads(() -> mk(view(inp, rr, :, bb), view(out, rr, :, bb))))
+    end
+    parallel_foreach(pcs, fill(nothing, _nthreads())) do (rr, bb), _
+        run(plans[(length(rr), length(bb))], view(inp, rr, :, bb), view(out, rr, :, bb))
+    end
+    return out
+end
+
+function _fft_dim!(X4::AbstractArray{ComplexF64}, d::Int, forward::Bool)
+    d == 3 || throw(ArgumentError("cell axis must be dimension 3"))
+    A, p, n, B = size(X4)
+    X = reshape(X4, A * p, n, B)
+    _fft_run!((vi, _) -> forward ? FFTW.plan_fft!(vi, 2; flags = _FFTW_FLAGS) : FFTW.plan_bfft!(vi, 2; flags = _FFTW_FLAGS),
+              (P, vi, _) -> P * vi, X, X, A * p, B)
+    return X4
+end
+
+function _rfft_dim!(out4, X4::AbstractArray{Float64}, d::Int)
+    d == 3 || throw(ArgumentError("cell axis must be dimension 3"))
+    A, p, n, B = size(X4)
+    _fft_run!((vi, vo) -> FFTW.plan_rfft(vi, 2; flags = _FFTW_FLAGS), (P, vi, vo) -> mul!(vo, P, vi),
+              reshape(X4, A * p, n, B), reshape(out4, A * p, size(out4, 3), B), A * p, B)
+    return out4
+end
+
+function _brfft_dim!(out4, V4::AbstractArray{ComplexF64}, n::Int, d::Int)
+    d == 3 || throw(ArgumentError("cell axis must be dimension 3"))
+    A, p, h, B = size(V4)
+    _fft_run!((vi, vo) -> FFTW.plan_brfft(vi, n, 2; flags = _FFTW_FLAGS), (P, vi, vo) -> mul!(vo, P, vi),
+              reshape(V4, A * p, h, B), reshape(out4, A * p, n, B), A * p, B)
+    return out4
+end
 
 # Work items (first index of a block of `ablk` rows, column b) covering (A, ·, B).
 _axis_items(A::Int, B::Int) = (ablk = A >= 2048 ? 512 : A; ([(a0, b) for b in 1:B for a0 in 1:ablk:A], ablk))

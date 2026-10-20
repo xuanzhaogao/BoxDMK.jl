@@ -1,6 +1,7 @@
 using BoxDMK
 using Test
 using Random
+using LinearAlgebra
 
 include("periodic_oracle.jl")
 
@@ -164,6 +165,27 @@ end
         @test count(rt.istarget) < count(r1.istarget)
         @test rt.target_pot ≈ [evaluate_periodic(r1, T[:, j]) for j in 1:20] rtol = 1e-12
         @test_throws ArgumentError evaluate_periodic(rt, A * [0.5, 0.01, 0.99] .+ 1e-3 .* (1:3))
+    end
+
+    @testset "chirp-z coefficients (non-tiled cubes)" begin
+        # the chirp-z path (used for very many cubes) against the dense products
+        for (A, nd) in (([8.0 1.5 0.5; 0 8 -1; 0 0 1.5], 6), (Matrix(Diagonal([10.3, 9.1, 1.37])), 9))
+            eps = 10.0^-nd
+            rc = BoxDMK.PeriodicGrid(A, 1.0, 1).dmin / 4
+            grid = BoxDMK.PeriodicGrid(A, rc, 1)
+            r0, ws, ts = BoxDMK.useries_sog(nd, rc)
+            iw = [sqrt(t * log(1 / eps)) > rc for t in ts]
+            pf, pe = BoxDMK.wide_orders(eps, BoxDMK.select_porder(eps), 16, rc)
+            P = BoxDMK.WidePlan(grid, eps, pf, pe, ts[iw], ws[iw])
+            ar = BoxDMK.Arena()
+            G = BoxDMK.wide_modes(P, randn(pf .* P.mt...), ar)
+            Gc = G isa Tuple ? complex.(G...) : G
+            Cc = copy(BoxDMK._wide_coefs_chirp(P, Gc, ar))
+            Cd = P.E2 === nothing ? BoxDMK._wide_coefs_triangular(P, real.(Gc), imag.(Gc), ar) :
+                                    BoxDMK._wide_coefs_separable(P, real.(Gc), imag.(Gc), ar)
+            @test maximum(abs, Cc .- Cd) < 1e-11 * maximum(abs, Cd)
+            BoxDMK.release!(ar)
+        end
     end
 
     @testset "sample once" begin
