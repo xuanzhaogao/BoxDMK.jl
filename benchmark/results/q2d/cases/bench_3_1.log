@@ -1,0 +1,4 @@
+# host worker7392 2026-10-19T20:42:32-04:00 bench 3 1
+[Q2D] threads=1 L=100x100x1 K=64 eps=1e-3 rc=1 mgrid=(100, 100, 1) | nboxes=15420 target leaves=14130 points=57.9M | total=4645 ms = sampling 2833 + rest 1812 : forest+setup=193 local+up=265 wide=650 pw=448 near=196 | rest 31 ns/pt, 31.9 Mpts/s
+[Q2D-ERR] 40 points near the charges vs 2P Ewald: rel L2 3.43e-04, max / max|u| 9.28e-05 (eps 1e-03)
+CASE_DONE

@@ -4,11 +4,13 @@ version = "1.0.0-DEV"
 authors = ["Xuanzhao Gao <xgao@flatironinstitute.org> and contributors"]
 
 [deps]
+FFTW = "7a1cc6ca-52ef-59f5-83cd-3a7055c09341"
 Libdl = "8f399da3-3557-5675-b5ff-fb832c97cbdb"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 SIMD = "fdea26ae-647d-5447-a871-4b548cad5224"
 
 [compat]
+FFTW = "1.10.0"
 SIMD = "3.8.0"
 julia = "1.10"
 

@@ -38,7 +38,6 @@ struct PeriodicGrid
     halo::NTuple{3,Int}         # image layers per axis
     slab::Bool                  # periodic in x, y only
     zorg::Float64               # slab: z of the slab bottom in the caller's frame
-    zres::Float64               # slab: boxes meeting the slab are refined to side ≤ zres
 end
 
 # A = Q U with U upper triangular, diag(U) > 0.
@@ -53,9 +52,8 @@ function _lattice_qr(A::AbstractMatrix)
     return Q, Matrix(U)
 end
 
-function PeriodicGrid(A::AbstractMatrix, rc::Float64, nhalo::Int; slab::Bool = false, zorg::Float64 = 0.0,
-                      zres::Union{Nothing,Float64} = nothing)
-    slab && return _slab_grid(A, rc, nhalo, zorg, zres === nothing ? A[3, 3] : zres)
+function PeriodicGrid(A::AbstractMatrix, rc::Float64, nhalo::Int; slab::Bool = false, zorg::Float64 = 0.0)
+    slab && return _slab_grid(A, rc, nhalo, zorg)
     size(A) == (3, 3) || throw(ArgumentError("the cell must be a 3×3 matrix of lattice vectors (columns)"))
     abs(det(A)) > 0 || throw(ArgumentError("degenerate cell"))
     Q, U = _lattice_qr(A)
@@ -77,12 +75,12 @@ function PeriodicGrid(A::AbstractMatrix, rc::Float64, nhalo::Int; slab::Bool = f
     tiled && (mg .= [round(Int, U[d, d] / rc) for d in 1:3])
     mgrid = Tuple(mg); xgrid0 = Tuple(xg)
     return PeriodicGrid(Matrix{Float64}(A), Q, U, Uinv, abs(det(U)), dmin, rc, mgrid, xgrid0, nhalo,
-                        mgrid .+ 2nhalo, xgrid0 .- nhalo * rc, diagonal, tiled, (nhalo, nhalo, nhalo), false, 0.0, Inf)
+                        mgrid .+ 2nhalo, xgrid0 .- nhalo * rc, diagonal, tiled, (nhalo, nhalo, nhalo), false, 0.0)
 end
 
 # Quasi-2D grid: rectangular in-plane cell L₁ × L₂ tiled by the level-0 cubes,
 # the slab 0 ≤ z ≤ H covered by mgrid[3] cubes from z = 0, images in x and y only.
-function _slab_grid(A::AbstractMatrix, rc::Float64, nhalo::Int, zorg::Float64, zres::Float64)
+function _slab_grid(A::AbstractMatrix, rc::Float64, nhalo::Int, zorg::Float64)
     L1, L2, H = A[1, 1], A[2, 2], A[3, 3]
     m = (round(Int, L1 / rc), round(Int, L2 / rc), max(1, ceil(Int, H / rc * (1 - 1e-12))))
     all(abs(m[d] * rc - (L1, L2)[d]) <= 1e-9 * (L1, L2)[d] for d in 1:2) ||
@@ -91,17 +89,7 @@ function _slab_grid(A::AbstractMatrix, rc::Float64, nhalo::Int, zorg::Float64, z
     xg = (0.0, 0.0, 0.0)                                  # z-cells from the slab bottom up
     halo = (nhalo, nhalo, 0)
     return PeriodicGrid(U, Matrix{Float64}(I, 3, 3), U, inv(U), L1 * L2 * H, min(L1, L2), rc, m, xg, nhalo,
-                        m .+ 2 .* halo, xg .- halo .* rc, true, true, halo, true, zorg, zres)
-end
-
-# Slab boxes are refined until their side is at most zres, so that the
-# samples resolve the slab even when rc is much larger than its thickness.
-function _slab_unresolved(F, g::PeriodicGrid, b::Int)
-    g.slab || return false
-    side = F.boxsize[F.level[b] + 1]
-    side > g.zres * (1 + 1e-12) || return false
-    cz = F.centers[b][3]
-    return cz + side / 2 > 0 && cz - side / 2 < g.U[3, 3]
+                        m .+ 2 .* halo, xg .- halo .* rc, true, true, halo, true, zorg)
 end
 
 PeriodicGrid(L::NTuple{3,Float64}, rc::Float64, nhalo::Int) = PeriodicGrid(Matrix(Diagonal(collect(L))), rc, nhalo)
@@ -509,7 +497,7 @@ function _build_forest!(F::_Forest, f, g::PeriodicGrid, eps::Float64, min_levels
         parallel_foreach(collect(eachindex(boxes)), wss) do i, (c, w1, w2)
             errs[i] = _tail_error(_fbox(F, boxes[i]), leg.U, Ut, tail, c, w1, w2)
         end
-        return [boxes[i] for i in eachindex(boxes) if errs[i] > t || _slab_unresolved(F, g, boxes[i])]
+        return [boxes[i] for i in eachindex(boxes) if errs[i] > t]
     end
     nlevels = 0
     while true

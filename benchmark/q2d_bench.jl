@@ -1,5 +1,5 @@
 # Quasi-2D benchmark: a 100 × 100 × 1 slab (periodic in x, y) with a neutral
-# mixture of K Gaussians (centres in the mid-plane band 0.4 ≤ z ≤ 0.6),
+# mixture of K Gaussians (exponents 300–1000, centres in 0.4 ≤ z ≤ 0.6),
 # evaluated through an in-plane cell list. Reports the sampling / rest split,
 # the number of in-slab points and the error against the 2-periodic Ewald sum.
 #
@@ -55,7 +55,7 @@ eps = 10.0^-nd
 seed = Ref(UInt64(12345))
 rnd() = (seed[] = seed[] * 0x5851f42d4c957f2d + 0x14057b7ef767814f; (seed[] >> 11) / 2.0^53)
 xs = [(L[1] * rnd(), L[2] * rnd(), 0.4 + 0.2 * rnd()) for _ in 1:K]
-al = [200.0 * 10^rnd() for _ in 1:K]                       # 200 … 2000
+al = [300.0 * (1000 / 300)^rnd() for _ in 1:K]             # 300 … 1000 (resolved by the default nodes; vanish outside the slab)
 cs = [rnd() < 0.5 ? -1.0 : 1.0 for _ in 1:K]
 g = neutral_q2d_mixture(L, xs, al, cs)
 f = BinnedMixture(g)

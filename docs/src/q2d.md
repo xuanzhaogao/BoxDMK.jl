@@ -20,13 +20,10 @@ plan = q2d_plan(f0, L, (0.0, 1.0); eps = 1e-6)   # repeated solves
 res = periodic_solve!(plan, f1)
 ```
 
-Options are those of [`bdmk_periodic`](@ref), and two more:
-
-- `rc`: side of the level-0 boxes. It must divide both in-plane sides; the
-  default is ``\min(L_1, L_2)/\lceil 1/\text{rc\_factor}\rceil``.
-- `zres`: boxes that meet the slab are refined until their side is at most
-  `zres` (default: the slab thickness), so that the samples resolve the slab
-  even when `rc` is much larger than it.
+Options are those of [`bdmk_periodic`](@ref), and `rc`, the side of the
+level-0 boxes: ``r_c \le \min(L_1, L_2, H)`` (``H = z_1 - z_0``), dividing
+both in-plane sides; by default the largest such value (``r_c = H`` for a thin
+slab, so the slab is one level-0 z-cell).
 
 ## Method
 
@@ -43,8 +40,15 @@ over the in-plane lattice:
 ```
 
 - **In the plane**, the transforms between Legendre moments of the level-0
-  cubes and the modes ``\dot k`` are those of the periodic solver: exact
-  per-axis Legendre–spherical-Bessel expansions, half space ``m_1 \ge 0``.
+  cubes and the modes ``\dot k`` are exact per-axis Legendre–spherical-Bessel
+  expansions (half space ``m_1 \ge 0``), as in the periodic solver. They are
+  factored through the uniform grid of cells: with ``c_s = (s+\tfrac12) r_c``
+  and ``k = 2\pi m/(m_t r_c)``,
+  ``e^{-ikc_s} = e^{-i\pi m/m_t} e^{-2\pi i (m \bmod m_t) s/m_t}``. The sum over
+  cells is then a (real) FFT of length ``m_t`` per Legendre degree, and the
+  modes fold onto its frequencies. This is exact, with no window or
+  oversampling as in a NUFFT, and costs O(N log N) instead of
+  O(modes × cells) per axis.
 - **In z**, there is no Fourier transform and no zero padding. On a level-0
   z-cell (side `rc`) every wide Gaussian is smooth, so its z-convolution is a
   small exact matrix in the Legendre basis of the cells, computed once by
@@ -66,7 +70,5 @@ Against a 2-periodic Ewald sum (`test/q2d_oracle.jl`), the max error is
 tests cover a square cell, a 2 × 3 cell and a thin 4 × 4 × 0.5 slab
 (`test/test_q2d.jl`).
 
-The wide part costs little: about 18 modes per half-axis and 11 Gaussians
-for the 100 × 100 × 1 slab at `eps = 1e-6` (`rc = 25`), 2.6 ms at 48
-threads. Most of the time is in the real-space part. See
-[Performance](@ref) for the 100 × 100 × 1 benchmark.
+For the 100 × 100 × 1 slab at `eps = 1e-6` (`rc = 1`, 389k modes), the wide
+part takes 133 ms of 0.84 s at 48 threads. See [Performance](@ref).

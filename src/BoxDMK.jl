@@ -3,6 +3,7 @@ module BoxDMK
 using LinearAlgebra
 using Libdl
 using SIMD
+using FFTW
 
 """
     build_tree(f, kernel, basis; ndim=3, norder=6, eps=1e-6, boxlen=1.0, nd=1, eta=1.0, f_batch=nothing)

@@ -1,0 +1,11 @@
+#DISBATCH PREFIX cd /mnt/home/xgao1/project/dmk_boxcode/BoxDMK.jl && bash -l benchmark/q2d_case.sh 
+bench 3 48
+bench 3 1
+bench 6 48
+bench 6 1
+bench 9 48
+bench 9 1
+bench 6 48 0.5
+widecmp 6
+widecmp 9
+test

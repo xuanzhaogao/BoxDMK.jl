@@ -96,19 +96,28 @@ hundreds of MB.
 ## Quasi-2D slab
 
 `benchmark/q2d_bench.jl`: a 100 × 100 × 1 slab (periodic in x and y) with a
-neutral mixture of 64 Gaussians (exponents 200–2000) near the mid-plane,
-evaluated through a cell list. The defaults are used (`rc = 25`, so the slab
-boxes are refined to side ≤ 1), `norder = 16`, genoa, one socket. "Points"
-counts the nodes of the leaves in the slab. The error is measured at 40 points
-near the charges against the 2-periodic Ewald sum
-(`benchmark/results/q2d/genoa_100x100x1.log`).
+neutral mixture of 64 Gaussians (exponents 300–1000) near the mid-plane,
+evaluated through a cell list, with the default `rc = 1` (one level-0 z-cell)
+and `norder = 16`. Genoa, one socket, one exclusive node per case
+(`benchmark/q2d_cases.disbatch`, logs in `benchmark/results/q2d/cases/`).
+"Points" counts the nodes of the leaves in the slab. The error is measured at
+40 points near the charges against the 2-periodic Ewald sum.
 
-| eps | points | 48 threads: sampling + rest | 1 thread: sampling + rest | rest, 1 / 48 threads | max error / max\|u\| |
+| eps | points | 48 threads: total (sampling + rest) | 1 thread: total (sampling + rest) | wide part, 48 / 1 threads | max error / max\|u\| |
 |---|---|---|---|---|---|
-| 1e-3 | 169 M | 0.55 + 0.96 s | 11.0 + 5.2 s | 32 / 175 Mpoints/s | 3.5e-6 |
-| 1e-6 | 213 M | 0.59 + 1.74 s | 12.4 + 19.2 s | 11 / 122 Mpoints/s | 3.0e-9 |
-| 1e-9 | 284 M | 0.82 + 4.42 s | 16.1 + 101.6 s | 2.8 / 64 Mpoints/s | 1.8e-10 |
+| 1e-3 | 58 M  | 0.38 s (0.14 + 0.24) | 4.6 s (2.8 + 1.8)   | 43 ms / 0.65 s  | 9.3e-5 |
+| 1e-6 | 89 M  | 0.84 s (0.20 + 0.64) | 16.8 s (4.9 + 11.9) | 133 ms / 3.4 s  | 1.8e-8 |
+| 1e-9 | 135 M | 2.56 s (0.31 + 2.25) | 73.9 s (7.5 + 66.4) | 364 ms / 12.4 s | 7.5e-12 |
 
-The wide part (in-plane modes and z-kernel matrices) takes 13–28 ms of this at
-48 threads. Most leaves are empty slab boxes, which is why the throughput is
-higher than in the 3D benchmarks.
+Wide-part transforms alone (random level-0 moments → coefficients, 48
+threads, `benchmark/q2d_widecmp.jl`):
+
+| grid | eps | modes | slab (in-plane FFT + z matrices) | fully periodic, same grid (dense) |
+|---|---|---|---|---|
+| 100 × 100 × 1, rc = 1 (q2d) vs 100 × 100 × 4 (3D) | 1e-6 | 0.39 M / 14.4 M | 74 ms  | 1075 ms |
+| 100 × 100 × 1, rc = 1 (q2d) vs 100 × 100 × 4 (3D) | 1e-9 | 0.87 M / 48.0 M | 277 ms | 5248 ms |
+| 100 × 100 × 1, rc = 0.5 (two z-cells) | 1e-6 | 1.55 M | 538 ms | — |
+
+The fully periodic solver's in-plane transforms are still dense products,
+O(modes × cells) per axis. They are fine for the cells benchmarked above (4–10
+cells per axis) but would gain from the same FFT factorization on large cells.

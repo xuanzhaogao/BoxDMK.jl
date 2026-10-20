@@ -102,7 +102,7 @@ function bdmk_periodic(f, cell; f_batch = nothing, timings::Union{Nothing,Vector
 end
 
 """
-    bdmk_q2d(f, L, zlim; eps=1e-6, norder=16, rc_factor=0.25, rc=nothing, zres=nothing, f_batch=nothing, timings=nothing, ...)
+    bdmk_q2d(f, L, zlim; eps=1e-6, norder=16, rc=nothing, f_batch=nothing, timings=nothing, ...)
 
 Quasi-2D (slab) Coulomb potential: periodic in x and y with the rectangular
 cell `L = (L₁, L₂)` (or a number for a square), free in z,
@@ -111,10 +111,8 @@ cell `L = (L₁, L₂)` (or a number for a square), free in z,
 
 for a neutral density `f` that vanishes outside the slab `zlim = (z₀, z₁)`.
 The potential is computed in the slab (`evaluate_periodic(res, x)` for
-z₀ ≤ x₃ ≤ z₁). The level-0 boxes have side `rc = min(L₁, L₂) / ⌈1/rc_factor⌉`
-(or `rc`), which must divide both sides; boxes meeting the slab are refined
-to side ≤ `zres` (default: the slab thickness) so that the samples resolve
-it. The real-space (narrow) part is
+z₀ ≤ x₃ ≤ z₁). The level-0 boxes have side `rc ≤ min(L₁, L₂, z₁ - z₀)`,
+which must divide both in-plane sides; by default the largest such value. The real-space (narrow) part is
 that of [`bdmk_periodic`](@ref) with images in x and y only; the wide part is
 summed in the plane over the modes `k̇ = 2π(m₁/L₁, m₂/L₂)` and applied in z
 through exact Gaussian kernel matrices on the level-0 z-cells, the mode
@@ -192,15 +190,14 @@ eps ≥ 1e-6).
 function periodic_plan(f, cell; eps::Real = 1e-6, norder::Int = 16, rc_factor::Real = 0.25, nhalo::Int = 1,
                        f_batch = nothing, skip_negligible::Bool = true, interpolate::Bool = true, sample_once::Bool = true,
                        targets::Union{Nothing,AbstractMatrix} = nothing, near32::Union{Nothing,Bool} = nothing,
-                       slab::Bool = false, zorg::Real = 0.0, rc::Union{Nothing,Real} = nothing,
-                       zres::Union{Nothing,Real} = nothing)
+                       slab::Bool = false, zorg::Real = 0.0, rc::Union{Nothing,Real} = nothing)
     f = _density(f, f_batch, Float64(zorg))
     old_ftz = get_zero_subnormals()
     set_zero_subnormals(true)
     try
         return _periodic_plan(f, _cell_matrix(cell), Float64(eps), norder, Float64(rc_factor), nhalo,
                               skip_negligible, interpolate, sample_once, targets === nothing ? nothing : Matrix{Float64}(targets),
-                              near32, slab, Float64(zorg), rc, zres === nothing ? nothing : Float64(zres))
+                              near32, slab, Float64(zorg), rc)
     finally
         set_zero_subnormals(old_ftz)
     end
@@ -208,15 +205,18 @@ end
 
 function _periodic_plan(f, A::Matrix{Float64}, eps::Float64, n::Int, rc_factor::Float64, nhalo::Int,
                         skip::Bool, interpolate::Bool, sample_once::Bool, targets, near32,
-                        slab::Bool = false, zorg::Float64 = 0.0, rcin = nothing, zres = nothing)
+                        slab::Bool = false, zorg::Float64 = 0.0, rcin = nothing)
     nhalo >= 1 || throw(ArgumentError("nhalo must be ≥ 1"))
     0 < rc_factor < 0.95 || throw(ArgumentError("need 0 < rc_factor < 0.95"))
     size(A) == (3, 3) && abs(det(A)) > 0 || throw(ArgumentError("degenerate cell"))
     _, U = _lattice_qr(A)
     Uinv = inv(UpperTriangular(U))
     dmin = slab ? min(A[1, 1], A[2, 2]) : minimum(1 / norm(Uinv[i, :]) for i in 1:3)
-    rc = rcin === nothing ? dmin / ceil(1 / rc_factor * (1 - 1e-12)) : Float64(rcin)
-    g = PeriodicGrid(A, rc, nhalo; slab, zorg, zres)
+    rc = rcin !== nothing ? Float64(rcin) : slab ? _slab_rc(A[1, 1], A[2, 2], A[3, 3]) :
+         dmin / ceil(1 / rc_factor * (1 - 1e-12))
+    slab && rc > min(A[1, 1], A[2, 2], A[3, 3]) * (1 + 1e-12) &&
+        throw(ArgumentError("rc = $rc must not exceed min(L₁, L₂, H) = $(min(A[1, 1], A[2, 2], A[3, 3]))"))
+    g = PeriodicGrid(A, rc, nhalo; slab, zorg)
 
     t0 = time_ns()
     ft, fvals, istarget, core, origin, tsample = build_periodic_forest(f, g; norder = n, eps = eps, min_levels = 1,
@@ -471,6 +471,17 @@ function _source_boxes(ft::FlatTree, fvals, eps::Float64, Sn::Float64)
     return src
 end
 
+# Default level-0 side of a slab: the largest rc ≤ min(L₁, L₂, H) that divides
+# both in-plane sides.
+function _slab_rc(L1::Float64, L2::Float64, H::Float64)
+    rmin = min(L1, L2, H)
+    for m in max(1, ceil(Int, L1 / rmin * (1 - 1e-12))):ceil(Int, 64 * L1 / rmin)
+        rc = L1 / m
+        abs(round(L2 / rc) * rc - L2) <= 1e-9 * L2 && return rc
+    end
+    throw(ArgumentError("no level-0 side ≤ min(L₁, L₂, H) divides both in-plane sides; pass rc"))
+end
+
 # ∫|f| over a box (side h) from its node values; w3 the tensor Gauss-Legendre weights.
 function _box_l1(fb, w3::Vector{Float64}, h::Float64)
     s = 0.0
@@ -566,48 +577,19 @@ end
 # Returns the mean of f over the cell.
 function _wide_inject!(pot, pp, pc, nodeidx, s::DMKSetup, g::PeriodicGrid, fv, P, Msrc)
     ft, p = s.ft, s.porder
-    pf, pe = P.pf, P.pe
+    pe = P.pe
     boxes = [(ibox, c) for ibox in levelboxes(ft, 0) for c in (_central_index(g, ibox),) if c !== nothing]
     wks = make_workspaces(() -> (w1 = alloc(s.arena, max(p, s.n)^3), w2 = alloc(s.arena, max(p, s.n)^3),
                                   w3 = alloc(s.arena, p^3)))
-    M = Msrc
-    if M === nothing
-        M = alloc(s.arena, pf * g.mgrid[1], pf * g.mgrid[2], pf * g.mgrid[3])
-        rc3 = g.rc^3
-        parallel_foreach(boxes, wks) do (ibox, (i, j, k)), w
-            q, sc = if ft.nchild[ibox] == 0
-                out = reshape(view(w.w3, 1:p^3), p, p, p)
-                tp3!(out, view(fv, :, :, :, 1, ibox), s.den2pc, s.den2pcT, s.den2pcT, w.w1, w.w2, 1 / 8, false)
-                out, 1.0
-            else
-                reshape(view(pc, :, 1, nodeidx[ibox]), p, p, p), 1 / rc3
-            end
-            M[pf * i + 1:pf * (i + 1), pf * j + 1:pf * (j + 1), pf * k + 1:pf * (k + 1)] .= sc .* view(q, 1:pf, 1:pf, 1:pf)
-        end
-    end
-    if P isa SlabWide
-        # (names not shared with the threaded closure above, which would capture them)
-        qtot = _slab_charge(P, M, g.rc)
-        w3 = _tensor_weights(s.n)
-        lv = [b for b in 1:ft.nboxes if ft.nchild[b] == 0 && !_inhalo(g, view(ft.centers, :, b))]
-        l1 = zeros(length(lv))
-        parallel_foreach(collect(eachindex(lv)), fill(nothing, _nthreads())) do i, _
-            l1[i] = _box_l1(view(fv, :, :, :, 1, lv[i]), w3, ft.boxsize[ft.level[lv[i]] + 1])
-        end
-        qabs = sum(l1)
-        abs(qtot) <= max(10 * s.eps, 1e-12) * qabs ||
-            throw(ArgumentError("a quasi-2D density must be neutral (total charge $qtot, ∫|f| ≈ $qabs)"))
-        C = slab_coefficients(P, M, s.arena)
-    else
-        G = wide_modes(P, M, s.arena)
-        C = wide_coefficients(P, G, s.arena)
-    end
+    # (M and C are assigned once: the threaded closures capture them, and a
+    # variable assigned more than once would be boxed)
+    M = Msrc === nothing ? _level0_moments(pc, nodeidx, s, g, fv, P.pf, boxes, wks) : Msrc
+    P isa SlabWide && _check_neutral(P, M, s, g, fv)
+    C = _wide_coefs(P, M, s.arena)
     parallel_foreach([b for b in boxes if s.istarget[b[1]]], wks) do (ibox, (i, j, k)), w
         cb = reshape(view(w.w3, 1:p^3), p, p, p)
         fill!(cb, 0.0)
-        @inbounds for l3 in 1:pe, l2 in 1:pe, l1 in 1:pe
-            cb[l1, l2, l3] = C[pe * k + l3, pe * j + l2, pe * i + l1]
-        end
+        _cube_coefs!(cb, C, P, i, j, k)
         if ft.nchild[ibox] == 0
             tp3!(view(pot, :, :, :, 1, ibox), cb, s.poteval, s.potevalT, s.potevalT, w.w1, w.w2, 1.0, true)
         else
@@ -615,6 +597,61 @@ function _wide_inject!(pot, pp, pc, nodeidx, s::DMKSetup, g::PeriodicGrid, fv, P
         end
     end
     return P isa SlabWide ? 0.0 : _cell_mean(P, M)
+end
+
+# Legendre moments (u-measure) of the central level-0 cubes, from their proxy
+# charges (nonleaf) or grid values (leaf).
+function _level0_moments(pc, nodeidx, s::DMKSetup, g::PeriodicGrid, fv, pf::Int, boxes, wks)
+    ft, p = s.ft, s.porder
+    M = alloc(s.arena, pf * g.mgrid[1], pf * g.mgrid[2], pf * g.mgrid[3])
+    rc3 = g.rc^3
+    parallel_foreach(boxes, wks) do (ibox, (i, j, k)), w
+        q, sc = if ft.nchild[ibox] == 0
+            out = reshape(view(w.w3, 1:p^3), p, p, p)
+            tp3!(out, view(fv, :, :, :, 1, ibox), s.den2pc, s.den2pcT, s.den2pcT, w.w1, w.w2, 1 / 8, false)
+            out, 1.0
+        else
+            reshape(view(pc, :, 1, nodeidx[ibox]), p, p, p), 1 / rc3
+        end
+        M[pf * i + 1:pf * (i + 1), pf * j + 1:pf * (j + 1), pf * k + 1:pf * (k + 1)] .= sc .* view(q, 1:pf, 1:pf, 1:pf)
+    end
+    return M
+end
+
+_wide_coefs(P::SlabWide, M, ar::Arena) = slab_coefficients(P, M, ar)
+_wide_coefs(P::WidePlan, M, ar::Arena) = wide_coefficients(P, wide_modes(P, M, ar), ar)
+
+# Coefficients of the central cube (i, j, k): natural order C[r₁, r₂, r₃] (slab)
+# or reversed Ct[r₃, r₂, r₁].
+function _cube_coefs!(cb, C::Array{Float64,3}, P::SlabWide, i::Int, j::Int, k::Int)
+    pe = P.pe
+    @inbounds for l3 in 1:pe, l2 in 1:pe, l1 in 1:pe
+        cb[l1, l2, l3] = C[pe * i + l1, pe * j + l2, pe * k + l3]
+    end
+    return cb
+end
+function _cube_coefs!(cb, C::Array{Float64,3}, P::WidePlan, i::Int, j::Int, k::Int)
+    pe = P.pe
+    @inbounds for l3 in 1:pe, l2 in 1:pe, l1 in 1:pe
+        cb[l1, l2, l3] = C[pe * k + l3, pe * j + l2, pe * i + l1]
+    end
+    return cb
+end
+
+# A slab density must be neutral (the 2-periodic sum diverges otherwise).
+function _check_neutral(P::SlabWide, M, s::DMKSetup, g::PeriodicGrid, fv)
+    ft = s.ft
+    qtot = _slab_charge(P, M, g.rc)
+    w3 = _tensor_weights(s.n)
+    lv = [b for b in 1:ft.nboxes if ft.nchild[b] == 0 && !_inhalo(g, view(ft.centers, :, b))]
+    l1 = zeros(length(lv))
+    parallel_foreach(collect(eachindex(lv)), fill(nothing, _nthreads())) do i, _
+        l1[i] = _box_l1(view(fv, :, :, :, 1, lv[i]), w3, ft.boxsize[ft.level[lv[i]] + 1])
+    end
+    qabs = sum(l1)
+    abs(qtot) <= max(10 * s.eps, 1e-12) * qabs ||
+        throw(ArgumentError("a quasi-2D density must be neutral (total charge $qtot, ∫|f| ≈ $qabs)"))
+    return nothing
 end
 
 # Rotated-frame image in the cell of the point x (original frame).
