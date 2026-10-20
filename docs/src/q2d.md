@@ -73,9 +73,26 @@ over the in-plane lattice:
   cells is then a (real) FFT of length ``m_t`` per Legendre degree, and the
   modes fold onto its frequencies. This is exact, with no window or
   oversampling as in a NUFFT, and costs O(N log N) instead of
-  O(modes × cells) per axis. For an oblique cell the way back to the
-  Cartesian cubes is the triangular transform of the periodic solver
-  (``k_2`` depends on ``m_1``).
+  O(modes × cells) per axis. For an oblique cell the cubes do not tile the
+  period, and two back-transforms (modes to cube coefficients) are available.
+  - **Dense:** the triangular transform of the periodic solver (``k_2``
+    depends on ``m_1``). It is the exact projection of each plane wave, done
+    with GEMMs, at a cost cubic in the number of cubes per axis.
+  - **NUFFT:** a type-2 NUFFT evaluates each z component of the potential,
+    a real 2D Fourier series in ``\xi = 2\pi A^{-1}x``, at
+    ``q = p_e + 8`` Gauss nodes per axis of each target level-0 cube.
+    - Kernel: exponential of semicircle, fine grid twice the band, tolerance
+      0.01 `eps`.
+    - The values are projected onto the cube's Legendre basis (degree
+      ``< p_e``), the same coefficients the dense path injects into the proxy
+      potentials, so the downward pass and level-0 leaves are unchanged.
+    - The number of targets is proportional to the number of cubes, and the
+      cost is about linear in it.
+  - The option `wide_nufft` (`true`, `false`, or `nothing` = automatic, by a
+    calibrated cost model) chooses between them. The NUFFT pays off from about
+    50 cubes per axis: 4× faster at 192 × 111 cubes and `eps = 1e-6`, with
+    0.6× the memory. The two agree to about 0.1 `eps`
+    (`benchmark/q2d_nufft.jl`, `benchmark/results/q2d_nufft/`).
 - **In z**, there is no Fourier transform and no zero padding. On a level-0
   z-cell (side `rc`) every wide Gaussian is smooth, so its z-convolution is a
   small exact matrix in the Legendre basis of the cells, computed once by

@@ -199,14 +199,15 @@ eps ≥ 1e-6).
 function periodic_plan(f, cell; eps::Real = 1e-6, norder::Int = 16, rc_factor::Real = 0.25, nhalo::Int = 1,
                        f_batch = nothing, skip_negligible::Bool = true, interpolate::Bool = true, sample_once::Bool = true,
                        targets::Union{Nothing,AbstractMatrix} = nothing, near32::Union{Nothing,Bool} = nothing,
-                       slab::Bool = false, zorg::Real = 0.0, rc::Union{Nothing,Real} = nothing, charged::Bool = false)
+                       slab::Bool = false, zorg::Real = 0.0, rc::Union{Nothing,Real} = nothing, charged::Bool = false,
+                       wide_nufft::Union{Nothing,Bool} = nothing)
     f = _density(f, f_batch, Float64(zorg))
     old_ftz = get_zero_subnormals()
     set_zero_subnormals(true)
     try
         return _periodic_plan(f, _cell_matrix(cell), Float64(eps), norder, Float64(rc_factor), nhalo,
                               skip_negligible, interpolate, sample_once, targets === nothing ? nothing : Matrix{Float64}(targets),
-                              near32, slab, Float64(zorg), rc, charged)
+                              near32, slab, Float64(zorg), rc, charged, wide_nufft)
     finally
         set_zero_subnormals(old_ftz)
     end
@@ -214,7 +215,8 @@ end
 
 function _periodic_plan(f, A::Matrix{Float64}, eps::Float64, n::Int, rc_factor::Float64, nhalo::Int,
                         skip::Bool, interpolate::Bool, sample_once::Bool, targets, near32,
-                        slab::Bool = false, zorg::Float64 = 0.0, rcin = nothing, charged::Bool = false)
+                        slab::Bool = false, zorg::Float64 = 0.0, rcin = nothing, charged::Bool = false,
+                        wide_nufft::Union{Nothing,Bool} = nothing)
     nhalo >= 1 || throw(ArgumentError("nhalo must be ≥ 1"))
     0 < rc_factor < 0.95 || throw(ArgumentError("need 0 < rc_factor < 0.95"))
     size(A) == (3, 3) && abs(det(A)) > 0 || throw(ArgumentError("degenerate cell"))
@@ -254,7 +256,10 @@ function _periodic_plan(f, A::Matrix{Float64}, eps::Float64, n::Int, rc_factor::
     # dense same-level near field in single precision at eps ≥ 1e-6 (as the C++ code)
     s = DMKSetup(ft, LegendreBasis(), n, 1, eps, 1, r0, wn, dn, taylor; asym_safety = 1e-4, istarget,
                  near32 = near32 === nothing ? eps >= 0.99e-6 : near32)
-    wplan = slab ? SlabWide(g, eps, wide_orders(eps, s.porder, n, rc)..., tsw, wsw; charged, narrow = (dn, wn)) :
+    # in-plane level-0 cubes whose wide coefficients are used (targets)
+    cubes = unique([(c[1], c[2]) for b in levelboxes(ft, 0) if s.istarget[b] for c in (_central_index(g, b),) if c !== nothing])
+    wplan = slab ? SlabWide(g, eps, wide_orders(eps, s.porder, n, rc)..., tsw, wsw; charged, narrow = (dn, wn),
+                            nufft = wide_nufft, cubes) :
                    WidePlan(g, eps, wide_orders(eps, s.porder, n, rc)..., tsw, wsw)
     copysrc = g.tiled ? _copy_sources(ft, g) : zeros(Int, ft.nboxes)
     all(b -> origin[b] != _COPY || copysrc[b] > 0, 1:ft.nboxes) || error("copied box without a source")

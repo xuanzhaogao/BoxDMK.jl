@@ -47,7 +47,13 @@ struct SlabWide
     D0T::Matrix{Float64}             # transpose of the k̇ = 0 z matrix (times scale)
     charged::Bool                    # nonzero total charge allowed (gauge u + 2πQ|z|/A → 0)
     qconst::Float64                  # potential per unit charge to subtract for that gauge
+    nu::Union{Nothing,_SlabNUFFT}    # oblique: modes -> cube coefficients by NUFFT at cube nodes (else dense)
 end
+
+# Oblique back-transform: NUFFT tolerance relative to eps, and nodes per axis
+# per cube (oversampling of the pe coefficients).
+const _NUFFT_TOL = 1e-2
+_nufft_nodes(pe::Int) = pe + 8
 
 # z matrix of the kernel K(z - z') from source z-cells (side hs from zs) to
 # target z-cells (side ht from zt): entry
@@ -82,7 +88,8 @@ function _zkernel_matrix(K, src::NTuple{3,Any}, tgt::NTuple{3,Any}, pe::Int, pf:
 end
 
 function SlabWide(g::PeriodicGrid, eps::Float64, pf::Int, pe::Int, tsw::Vector{Float64}, wsw::Vector{Float64};
-                  charged::Bool = false, narrow = (Float64[], Float64[]))
+                  charged::Bool = false, narrow = (Float64[], Float64[]), nufft::Union{Nothing,Bool} = nothing,
+                  cubes::Union{Nothing,Vector{NTuple{2,Int}}} = nothing)
     rc = g.rc
     U2 = g.U[1:2, 1:2]
     H = g.U[3, 3]
@@ -130,13 +137,16 @@ function SlabWide(g::PeriodicGrid, eps::Float64, pf::Int, pe::Int, tsw::Vector{F
     tsn, wsn = narrow
     qconst = D(zs) + (sum(wsn[s] * pi * tsn[s] * exp(-zs^2 / tsn[s]) for s in eachindex(tsn); init = 0.0) + 2pi * zs) / area
     wt1 = m -> m == 0 ? 1.0 : 2.0
+    cubs = cubes === nothing ? vec([(i, j) for i in 0:(mg[1] - 1), j in 0:(mg[2] - 1)]) : cubes
     Et1 = g.tiled ? _axis_E(m1s, pe, mg[1], rc, g.xgrid0[1], wt1) : zeros(ComplexF64, 0, 0)
     Et2 = g.tiled ? _axis_E(m2s, pe, mg[2], rc, g.xgrid0[2]) : zeros(ComplexF64, 0, 0)
     E1 = g.tiled ? (zeros(0, 0), zeros(0, 0)) :
          _legtable(m1s, pe, mg[1], m -> B[1, 1] * m, rc / 2, 1, (m, s) -> B[1, 1] * m * (g.xgrid0[1] + (s + 0.5) * rc), wt1)
     return SlabWide(pf, pe, Kh, mt, mg, g.tiled, sc, _axis_T(m1s, pf, mt[1]), _axis_T(m2s, pf, mt[2]),
                     _axis_r(m1s, mt[1]), _axis_r(m2s, mt[2]), Et1, Et2, E1, B, rc, g.xgrid0,
-                    GzT, ord, nact, cm, D0T, charged, qconst)
+                    GzT, ord, nact, cm, D0T, charged, qconst,
+                    _use_nufft(nufft, g, Kh, pe, length(cubs), _NUFFT_TOL * eps) ?
+                    _SlabNUFFT(Kh, pe, cubs, _NUFFT_TOL * eps, _nufft_nodes(pe)) : nothing)
 end
 
 """
@@ -148,6 +158,23 @@ the source moments `M (pf mt₁, pf mt₂, pf mt₃)` (u-measure): in natural or
 reversed order `C[l₃ + pe s₃, l₂ + pe s₂, l₁ + pe s₁]`.
 """
 function slab_coefficients(S::SlabWide, M::Array{Float64,3}, ar::Arena)
+    Out = _slab_modes_z(S, M, ar)
+    S.tiled || return _slab_back_oblique(S, Out, ar)
+    pe = S.pe
+    H1, K2, R3 = size(Out)
+    R2 = pe * S.mgrid[2]
+    # back in plane (y, then x with the real part): C[l₁ + pe s₁, r₂, r₃]
+    C2 = _axis_inv(Out, H1, R3, pe, S.mgrid[2], S.Et2, S.r2, ar)          # (H₁, R₂, R₃)
+    return reshape(_axis_inv_real(C2, 1, R2 * R3, pe, S.mgrid[1], S.Et1, S.r1, ar), pe * S.mgrid[1], R2, R3)
+end
+
+# Oblique cells: NUFFT at the cube nodes when planned, else dense.
+_slab_back_oblique(S::SlabWide, Out, ar::Arena) =
+    S.nu === nothing ? _slab_coefs_oblique(S, Out, ar) : _slab_coefs_nufft(S, Out, ar)
+
+# Source moments -> modes (in plane) -> z kernels: Out[m₁, m₂, r₃], r₃ = l₃ + pe s₃
+# on the target z-cells.
+function _slab_modes_z(S::SlabWide, M::Array{Float64,3}, ar::Arena)
     pf, pe = S.pf, S.pe
     mt1, mt2, mt3 = S.mt
     mg1, mg2, mg3 = S.mgrid
@@ -200,14 +227,20 @@ function slab_coefficients(S::SlabWide, M::Array{Float64,3}, ar::Arena)
             Out[m + nm * (q - 1)] = complex(Os[2r - 1, q], Os[2r, q])
         end
     end
-    S.tiled || return _slab_coefs_oblique(S, Out, ar)
-    # back in plane (y, then x with the real part): C[l₁ + pe s₁, r₂, r₃]
-    C2 = _axis_inv(Out, H1, R3, pe, mg2, Et2, r2, ar)                     # (H₁, R₂, R₃)
-    C = reshape(_axis_inv_real(C2, 1, R2 * R3, pe, mg1, Et1, r1, ar), pe * mg1, R2, R3)
-    return C
+    return Out
 end
 
-# Oblique cells: from Out (H₁, K₂, R₃), per m₁ slice A2[:, :, m₁] = Out[m₁, :, :]ᵀ E₂(m₁)
+# NUFFT back-transform for oblique cells: `nufft` = true / false, or nothing
+# (automatic: when the model cost of the dense transform is more than twice
+# that of the NUFFT, see `_back_costs`).
+function _use_nufft(nufft, g::PeriodicGrid, Kh, pe::Int, ncubes::Int, tol::Float64)
+    g.tiled && return false
+    nufft === nothing || return nufft
+    dense, nu = _back_costs(Kh, pe, g.mgrid, ncubes, tol, _nufft_nodes(pe))
+    return dense > 2 * nu
+end
+
+# Oblique cells (dense reference): from Out (H₁, K₂, R₃), per m₁ slice A2[:, :, m₁] = Out[m₁, :, :]ᵀ E₂(m₁)
 # with k₂ = B₂₁m₁ + B₂₂m₂ (tables per (m₁, m₂)), then one product over m₁ (as the
 # triangular transform of the periodic solver). Reversed order Ct[r₃, r₂, r₁].
 function _slab_coefs_oblique(S::SlabWide, Out::Array{ComplexF64,3}, ar::Arena)

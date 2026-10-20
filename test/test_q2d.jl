@@ -112,6 +112,43 @@ end
         @test maximum(abs, fv .- fq) < 1e-7 * maximum(abs, fq)         # forest: L2 tail test at eps
     end
 
+    @testset "oblique NUFFT back-transform, eps=1e-$nd" for nd in (6, 9)
+        eps = 10.0^-nd
+        # identical modes: NUFFT at the cube nodes vs dense exact projection
+        A = [8.0 4.0 0; 0 4sqrt(3) 0; 0 0 1.0]
+        gr = BoxDMK.PeriodicGrid(A, 1.0, 1; slab = true)
+        r0, ws, ts = BoxDMK.useries_sog(nd, 1.0)
+        iw = [sqrt(t * log(1 / eps)) > 1.0 for t in ts]
+        pf, pe = BoxDMK.wide_orders(eps, BoxDMK.select_porder(eps), 16, 1.0)
+        Sd = BoxDMK.SlabWide(gr, eps, pf, pe, ts[iw], ws[iw]; nufft = false)
+        Sn = BoxDMK.SlabWide(gr, eps, pf, pe, ts[iw], ws[iw]; nufft = true)
+        M = [sin(0.37 * i + 0.11 * j * j - 0.7 * k) for i in 1:(pf * Sd.mt[1]), j in 1:(pf * Sd.mt[2]), k in 1:(pf * Sd.mt[3])]
+        ar = BoxDMK.Arena()
+        Out = copy(BoxDMK._slab_modes_z(Sd, M, ar))
+        Cd = BoxDMK._slab_back_oblique(Sd, Out, ar); Cn = BoxDMK._slab_back_oblique(Sn, Out, ar)
+        blk(C, i, j) = view(C, :, pe * j .+ (1:pe), pe * i .+ (1:pe))
+        cmax = maximum(c -> maximum(abs, blk(Cd, c...)), Sn.nu.cubes)
+        @test maximum(c -> maximum(abs, blk(Cn, c...) .- blk(Cd, c...)), Sn.nu.cubes) < 0.5eps * cmax
+        BoxDMK.release!(ar)
+        # potentials after the downward pass, and against the Ewald sum (thin
+        # hexagonal slab with level-0 target leaves), neutral and charged
+        L = [6.0 3.0; 0.0 3sqrt(3)]; zl = (0.0, 0.5)
+        for charged in (false, true)
+            g = q2d_mixture(L, [(0.5, 0.7, 0.25), (4.9, 1.3, 0.22), (3.7, 3.4, 0.28), (6.6, 2.2, 0.25), (2.0, 4.5, 0.3)],
+                            [1500.0, 1000, 1200, 2000, 800], [1.0, 0.7, -0.5, 0.9, -0.3]; neutral = !charged)
+            rd = bdmk_q2d(g, L, zl; eps, charged, wide_nufft = false)
+            rn = bdmk_q2d(g, L, zl; eps, charged, wide_nufft = true)
+            ft = rn.ft
+            lv = [b for b in 1:ft.nboxes if ft.nchild[b] == 0 && rn.istarget[b]]
+            @test any(b -> ft.level[b] == 0, lv)
+            umax = maximum(b -> maximum(abs, view(rd.pot, :, :, :, b)), lv)
+            @test maximum(b -> maximum(abs, view(rn.pot, :, :, :, b) .- view(rd.pot, :, :, :, b)), lv) < 0.05eps * umax
+            l2, mx = _q2d_errors(rn, g, L, zl)
+            @test l2 < 3eps
+            @test mx < eps
+        end
+    end
+
     @testset "charged, $name, eps=1e-$nd" for (name, L, zl) in (("2 × 3 cell", (2.0, 3.0), (-0.5, 0.5)),
                                                                ("hexagonal 2 × 1", [2.0 0.5; 0.0 sqrt(3) / 2], (-0.4, 0.4))),
                                                nd in (3, 6)
